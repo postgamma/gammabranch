@@ -1,0 +1,481 @@
+/*
+ * overlay_branch_upsert.sql — Pure Delta UPSERT (ON CONFLICT ... DO UPDATE/NOTHING) +
+ *                             apply/discard three-phase dependency chain.
+ *
+ * COVERAGE (formerly overlay_branch_advanced.sql Section S + T + U, order-dependent, must not be interrupted):
+ *   Section S — Pure Delta UPSERT 2-phase MAIN-first conflict detection:
+ *               Phase I pure-delta SPI same-key lookup; Phase II MAIN ctid SPI same-key lookup;
+ *               4-way promo dispatch (0/1/2/3): 0→INSERT, 1→MAIN-conflict,
+ *               2→pure-delta conflict, 3→both-conflict; ON CONFLICT DO NOTHING /
+ *               DO UPDATE SET col=EXCLUDED.col both branches; 9-row UPSERT full matrix
+ *   Section T — apply_branch(bs_S_br) → bs_S_tbl MAIN materializes 9 rows, sum=1424,
+ *               verifies UPSERT loses no rows / duplicates no rows
+ *   Section U — discard_branch(bs_U_disc): T already applied 9 rows, MAIN stays intact,
+ *               bs_U_disc rolls back 0 rows MAIN; sum MAIN=1424, sum bs_U pure del=0
+ *   Section V — pg_branch_delta index layout invariant (WR-1 prereq): the internal delta table must only expose
+ *               the PK (branch_id, relid, key), and must not have a (branch_id, relid) redundant index;
+ *               and verifies, with M=2000 delta rows, that the write-path existence probe (conflict detection)
+ *               resolves both the hit/miss paths correctly.
+ *
+ * ⚠️ Absolutely no DISCARD ALL / RESET between S→T→U: all three sections share the
+ * catalog state of branches bs_S_br and bs_U_disc; if interrupted, Section T cannot find "bs_S_br" (already discarded in a different session).
+ */
+-- ===== 0. Prerequisite guard (same as the other regression files) =====
+DO $$
+DECLARE
+  _s text := current_setting('shared_preload_libraries', true);
+  _msg text;
+BEGIN
+  IF _s NOT LIKE '%overlay_branch%' THEN
+    _msg := 'Postmaster started WITHOUT shared_preload_libraries=''overlay_branch''.  '
+         || 'The 3 correct ways to invoke these tests (DON''T `cd test/` first):'
+         || chr(10)||chr(10)||'  (A) make check                    <- temp-instance, hooks auto-loaded'
+         || chr(10)||'  (B) make installcheck EXTRA_REGRESS_OPTS="--use-existing --host=/tmp --port=15433"'
+         || chr(10)||'  (C) pg_regress overlay_branch_advanced \'
+         || chr(10)||'         --inputdir=./test --outputdir=./test_output \'
+         || chr(10)||'         --temp-config=$(pwd)/test/temp_instance_shared_libs.conf \'
+         || chr(10)||'         --bindir=$(pg_config --bindir)'
+         || chr(10)||chr(10);
+    RAISE EXCEPTION '%', _msg;
+  END IF;
+END $$;
+-- ===== Idempotent cleanup =====
+SET client_min_messages = warning;
+DROP TABLE IF EXISTS public.bs_user;
+DROP TABLE IF EXISTS public.bs_basic;
+DROP EXTENSION IF EXISTS overlay_branch CASCADE;
+RESET client_min_messages;
+CREATE EXTENSION IF NOT EXISTS overlay_branch;
+SET client_min_messages = WARNING;
+/* =========================================================== Section S */
+-- =====================================================================
+-- ===== Section S: Pure Delta UPSERT (ON CONFLICT ... DO UPDATE/NOTHING)
+-- =====            2-phase MAIN-first conflict detection:
+-- =====            Phase I pure-delta SPI, Phase II MAIN ctid SPI,
+-- =====            4-way promo dispatch (0/1/2/3).
+-- =====================================================================
+-- Suppress minor TupleDesc resource-close WARNING (low-priority hygiene)
+SET client_min_messages = error;
+CREATE TABLE public.bs_S_up (id INT4 PRIMARY KEY, v INT4 NOT NULL, t TEXT DEFAULT 'main');
+INSERT INTO public.bs_S_up SELECT g, g*10, 'main' FROM generate_series(1,5) g;
+SELECT overlay_branch.create_branch('bs_S_br');
+ create_branch 
+---------------
+             1
+(1 row)
+
+SELECT overlay_branch.use_branch('bs_S_br');
+ use_branch 
+------------
+ 
+(1 row)
+
+-- Pure seed: id=11 v=1 pure, id=55 v=555 pure (will be updated/preserved by S.2/S.6)
+INSERT INTO public.bs_S_up VALUES (11, 1,   'pure');
+INSERT INTO public.bs_S_up VALUES (55, 555, 'pure');
+-- S.1 Case A promo=2: MAIN-conflict id=2 DO UPDATE SET v=EXCLUDED.v RETURNING
+INSERT INTO public.bs_S_up VALUES (2, 205, 'excluded')
+  ON CONFLICT (id) DO UPDATE SET v = EXCLUDED.v
+  RETURNING id, v, t;
+ id |  v  |  t   
+----+-----+------
+  2 | 205 | main
+(1 row)
+
+-- S.2 Case B promo=3: pure-conflict id=11 DO UPDATE SET v=EXCLUDED.v RETURNING (v 1→101)
+INSERT INTO public.bs_S_up VALUES (11, 101, 'excluded')
+  ON CONFLICT (id) DO UPDATE SET v = EXCLUDED.v
+  RETURNING id, v, t;
+ id |  v  |  t   
+----+-----+------
+ 11 | 101 | pure
+(1 row)
+
+-- S.3 Case C promo=0: MAIN-conflict id=3 DO NOTHING (v=30 preserved)
+INSERT INTO public.bs_S_up VALUES (3, 999, 'excluded')
+  ON CONFLICT (id) DO NOTHING
+  RETURNING id, v, t;
+ id | v | t 
+----+---+---
+(0 rows)
+
+-- S.4 Case D promo=1: NO-conflict id=22 → DO UPDATE path, fresh INSERT v=100
+INSERT INTO public.bs_S_up VALUES (22, 100, 'new')
+  ON CONFLICT (id) DO UPDATE SET v = EXCLUDED.v
+  RETURNING id, v, t;
+ id |  v  |  t  
+----+-----+-----
+ 22 | 100 | new
+(1 row)
+
+-- S.5 Case E promo=1: NO-conflict id=33 → DO NOTHING path, fresh INSERT v=333
+INSERT INTO public.bs_S_up VALUES (33, 333, 'new')
+  ON CONFLICT (id) DO NOTHING
+  RETURNING id, v, t;
+ id |  v  |  t  
+----+-----+-----
+ 33 | 333 | new
+(1 row)
+
+-- S.6 Case F promo=0: pure-conflict id=55 WHERE false → DO UPDATE SKIP, v=555 stay
+INSERT INTO public.bs_S_up VALUES (55, 9999, 'excluded')
+  ON CONFLICT (id) DO UPDATE SET v = EXCLUDED.v WHERE public.bs_S_up.v <> public.bs_S_up.v
+  RETURNING id, v, t;
+ id | v | t 
+----+---+---
+(0 rows)
+
+-- S.7 Case G promo=0: MAIN-conflict id=4 WHERE false → DO UPDATE SKIP, v=40 stay
+INSERT INTO public.bs_S_up VALUES (4, 8888, 'excluded')
+  ON CONFLICT (id) DO UPDATE SET v = EXCLUDED.v WHERE public.bs_S_up.v <> public.bs_S_up.v
+  RETURNING id, v, t;
+ id | v | t 
+----+---+---
+(0 rows)
+
+-- S.8 LIVE VIEW: 9 rows total, sum(v)=1424 (= 10+205+30+40+50+101+100+333+555)
+SELECT CASE WHEN count(*) = 9 THEN 'PASS:S8_COUNT_EQ_9' ELSE 'FAIL_COUNT:'||count(*) END AS s8_cnt
+FROM public.bs_S_up;
+       s8_cnt       
+--------------------
+ PASS:S8_COUNT_EQ_9
+(1 row)
+
+SELECT CASE WHEN v = 205 THEN 'PASS:S8_ID2_V_205' ELSE 'FAIL_V:'||COALESCE(v::text,'NULL') END AS s8_id2
+FROM public.bs_S_up WHERE id = 2;
+      s8_id2       
+-------------------
+ PASS:S8_ID2_V_205
+(1 row)
+
+SELECT CASE WHEN v = 101 THEN 'PASS:S8_ID11_V_101' ELSE 'FAIL_V:'||COALESCE(v::text,'NULL') END AS s8_id11
+FROM public.bs_S_up WHERE id = 11;
+      s8_id11       
+--------------------
+ PASS:S8_ID11_V_101
+(1 row)
+
+SELECT CASE WHEN v = 30  THEN 'PASS:S8_ID3_V_30'  ELSE 'FAIL_V:'||COALESCE(v::text,'NULL') END AS s8_id3
+FROM public.bs_S_up WHERE id = 3;
+      s8_id3      
+------------------
+ PASS:S8_ID3_V_30
+(1 row)
+
+SELECT CASE WHEN v = 100 THEN 'PASS:S8_ID22_V_100' ELSE 'FAIL_V:'||COALESCE(v::text,'NULL') END AS s8_id22
+FROM public.bs_S_up WHERE id = 22;
+      s8_id22       
+--------------------
+ PASS:S8_ID22_V_100
+(1 row)
+
+SELECT CASE WHEN v = 333 THEN 'PASS:S8_ID33_V_333' ELSE 'FAIL_V:'||COALESCE(v::text,'NULL') END AS s8_id33
+FROM public.bs_S_up WHERE id = 33;
+      s8_id33       
+--------------------
+ PASS:S8_ID33_V_333
+(1 row)
+
+SELECT CASE WHEN v = 555 THEN 'PASS:S8_ID55_V_555' ELSE 'FAIL_V:'||COALESCE(v::text,'NULL') END AS s8_id55
+FROM public.bs_S_up WHERE id = 55;
+      s8_id55       
+--------------------
+ PASS:S8_ID55_V_555
+(1 row)
+
+SELECT CASE WHEN v = 40  THEN 'PASS:S8_ID4_V_40'  ELSE 'FAIL_V:'||COALESCE(v::text,'NULL') END AS s8_id4
+FROM public.bs_S_up WHERE id = 4;
+      s8_id4      
+------------------
+ PASS:S8_ID4_V_40
+(1 row)
+
+SELECT CASE WHEN sum(v) = 1424 THEN 'PASS:S8_SUM_EQ_1424' ELSE 'FAIL_SUM:'||COALESCE(sum(v)::text,'NULL') END AS s8_sum
+FROM public.bs_S_up;
+       s8_sum        
+---------------------
+ PASS:S8_SUM_EQ_1424
+(1 row)
+
+-- S.9 RAW MAIN pristine (3-step reset disable planner-merge)
+SELECT overlay_branch.use_branch(NULL);
+ use_branch 
+------------
+ 
+(1 row)
+
+RESET overlay_branch.current;
+SET overlay_branch.current = '';
+SELECT CASE WHEN count(*) = 5 THEN 'PASS:S9_COUNT_EQ_5' ELSE 'FAIL_COUNT:'||count(*) END AS s9_cnt
+FROM public.bs_S_up;
+       s9_cnt       
+--------------------
+ PASS:S9_COUNT_EQ_5
+(1 row)
+
+SELECT CASE WHEN sum(v) = 150 THEN 'PASS:S9_SUM_EQ_150' ELSE 'FAIL_SUM:'||COALESCE(sum(v)::text,'NULL') END AS s9_sum
+FROM public.bs_S_up;
+       s9_sum       
+--------------------
+ PASS:S9_SUM_EQ_150
+(1 row)
+
+SELECT CASE WHEN v = 20 THEN 'PASS:S9_ID2_V_20' ELSE 'FAIL_V:'||COALESCE(v::text,'NULL') END AS s9_id2
+FROM public.bs_S_up WHERE id = 2;
+      s9_id2      
+------------------
+ PASS:S9_ID2_V_20
+(1 row)
+
+SELECT CASE WHEN count(*) = 0 THEN 'PASS:S9_NO_PURE_ROWS' ELSE 'FAIL_PURE:'||count(*) END AS s9_nopure
+FROM public.bs_S_up WHERE id IN (11,22,33,55);
+      s9_nopure       
+----------------------
+ PASS:S9_NO_PURE_ROWS
+(1 row)
+
+/* =========================================================== Section T (shares S branch) */
+-- =====================================================================
+-- ===== Section T: apply_branch(bs_S_br) → MAIN materializes 9 rows
+-- =====================================================================
+SELECT overlay_branch.apply_branch('bs_S_br');
+ apply_branch 
+--------------
+ 
+(1 row)
+
+SELECT CASE WHEN count(*) = 9 THEN 'PASS:T1_COUNT_EQ_9' ELSE 'FAIL_COUNT:'||count(*) END AS t1_cnt
+FROM public.bs_S_up;
+       t1_cnt       
+--------------------
+ PASS:T1_COUNT_EQ_9
+(1 row)
+
+SELECT CASE WHEN sum(v) = 1424 THEN 'PASS:T1_SUM_EQ_1424' ELSE 'FAIL_SUM:'||COALESCE(sum(v)::text,'NULL') END AS t1_sum
+FROM public.bs_S_up;
+       t1_sum        
+---------------------
+ PASS:T1_SUM_EQ_1424
+(1 row)
+
+SELECT CASE WHEN v = 205 THEN 'PASS:T1_ID2_V_205' ELSE 'FAIL_V:'||COALESCE(v::text,'NULL') END AS t1_id2
+FROM public.bs_S_up WHERE id = 2;
+      t1_id2       
+-------------------
+ PASS:T1_ID2_V_205
+(1 row)
+
+SELECT CASE WHEN v = 101 THEN 'PASS:T1_ID11_V_101' ELSE 'FAIL_V:'||COALESCE(v::text,'NULL') END AS t1_id11
+FROM public.bs_S_up WHERE id = 11;
+      t1_id11       
+--------------------
+ PASS:T1_ID11_V_101
+(1 row)
+
+SELECT CASE WHEN v = 100 THEN 'PASS:T1_ID22_V_100' ELSE 'FAIL_V:'||COALESCE(v::text,'NULL') END AS t1_id22
+FROM public.bs_S_up WHERE id = 22;
+      t1_id22       
+--------------------
+ PASS:T1_ID22_V_100
+(1 row)
+
+SELECT CASE WHEN v = 333 THEN 'PASS:T1_ID33_V_333' ELSE 'FAIL_V:'||COALESCE(v::text,'NULL') END AS t1_id33
+FROM public.bs_S_up WHERE id = 33;
+      t1_id33       
+--------------------
+ PASS:T1_ID33_V_333
+(1 row)
+
+SELECT CASE WHEN v = 555 THEN 'PASS:T1_ID55_V_555' ELSE 'FAIL_V:'||COALESCE(v::text,'NULL') END AS t1_id55
+FROM public.bs_S_up WHERE id = 55;
+      t1_id55       
+--------------------
+ PASS:T1_ID55_V_555
+(1 row)
+
+SELECT CASE WHEN v = 30  THEN 'PASS:T1_ID3_V_30'  ELSE 'FAIL_V:'||COALESCE(v::text,'NULL') END AS t1_id3
+FROM public.bs_S_up WHERE id = 3;
+      t1_id3      
+------------------
+ PASS:T1_ID3_V_30
+(1 row)
+
+/* =========================================================== Section U (shares T MAIN state) */
+-- =====================================================================
+-- ===== Section U: discard_branch (rolls back dirty bs_U_disc branch)
+-- =====            → MAIN applied 9 rows (sum 1424) must stay intact.
+-- =====================================================================
+SELECT overlay_branch.create_branch('bs_U_disc');
+ create_branch 
+---------------
+             2
+(1 row)
+
+SELECT overlay_branch.use_branch('bs_U_disc');
+ use_branch 
+------------
+ 
+(1 row)
+
+INSERT INTO public.bs_S_up VALUES (99, 999, 'discard_test');  -- dirty branch, never materialize
+SELECT overlay_branch.use_branch(NULL);
+ use_branch 
+------------
+ 
+(1 row)
+
+RESET overlay_branch.current;
+SET overlay_branch.current = '';
+SELECT overlay_branch.discard_branch('bs_U_disc');
+ discard_branch 
+----------------
+ 
+(1 row)
+
+SELECT CASE WHEN count(*) = 9 THEN 'PASS:U1_COUNT_EQ_9' ELSE 'FAIL_COUNT:'||count(*) END AS u_cnt
+FROM public.bs_S_up;
+       u_cnt        
+--------------------
+ PASS:U1_COUNT_EQ_9
+(1 row)
+
+SELECT CASE WHEN sum(v) = 1424 THEN 'PASS:U1_SUM_EQ_1424' ELSE 'FAIL_SUM:'||COALESCE(sum(v)::text,'NULL') END AS u_sum
+FROM public.bs_S_up;
+        u_sum        
+---------------------
+ PASS:U1_SUM_EQ_1424
+(1 row)
+
+SELECT CASE WHEN count(*) = 0 THEN 'PASS:U1_NO_ID99' ELSE 'FAIL_ID99:'||count(*) END AS u_no99
+FROM public.bs_S_up WHERE id = 99;
+     u_no99      
+-----------------
+ PASS:U1_NO_ID99
+(1 row)
+
+RESET client_min_messages;
+DROP TABLE public.bs_S_up;
+/* =========================================================== Section V */
+-- =====================================================================
+-- ===== Section V: pg_branch_delta index layout invariant (WR-1 prereq)
+-- =====   V.1 catalog: the internal delta table must expose exactly one
+-- =====       index -- the PRIMARY KEY (branch_id, relid, key).  A
+-- =====       separate (branch_id, relid) index is a strict prefix of the
+-- =====       pkey: redundant, and harmful under stale planner stats
+-- =====       (reltuples = -1, the norm for this internal table), where
+-- =====       the planner prefers the narrower index and demotes
+-- =====       `key = ...` to a Filter.  That turns the per-row write-path
+-- =====       delta existence probe from an O(1) pkey lookup into an
+-- =====       O(delta) scan (the M10c INSERT regression).
+-- =====   V.2 behavior: with M = 2000 delta rows the write-path probe
+-- =====       (conflict detection) still resolves both ways -- probe hit
+-- =====       (UPDATE an existing delta key) and conflict (duplicate PK
+-- =====       inside the branch -> 23505).
+-- =====================================================================
+SET client_min_messages = warning;
+-- ----- V.1 index layout invariant -----
+SELECT indexrelid::regclass::text AS delta_index
+  FROM pg_index
+ WHERE indrelid = 'overlay_branch.pg_branch_delta'::regclass
+ ORDER BY 1;
+             delta_index             
+-------------------------------------
+ overlay_branch.pg_branch_delta_pkey
+(1 row)
+
+SELECT CASE WHEN count(*) = 1 AND bool_and(indisprimary)
+            THEN 'PASS:V1_DELTA_ONLY_PKEY'
+            ELSE 'FAIL:V1 index_count=' || count(*) END AS v1
+  FROM pg_index
+ WHERE indrelid = 'overlay_branch.pg_branch_delta'::regclass;
+           v1            
+-------------------------
+ PASS:V1_DELTA_ONLY_PKEY
+(1 row)
+
+-- no 2-column (branch_id, relid) index may exist (name-independent)
+SELECT CASE WHEN count(*) = 0 THEN 'PASS:V1_NO_REDUNDANT_RELID_IDX'
+            ELSE 'FAIL:V1 redundant=' || string_agg(i.indexrelid::regclass::text, ',')
+       END AS v2
+  FROM pg_index i
+  JOIN pg_attribute a1 ON a1.attrelid = i.indrelid AND a1.attnum = i.indkey[0]
+  JOIN pg_attribute a2 ON a2.attrelid = i.indrelid AND a2.attnum = i.indkey[1]
+ WHERE i.indrelid = 'overlay_branch.pg_branch_delta'::regclass
+   AND i.indnatts = 2
+   AND a1.attname = 'branch_id' AND a2.attname = 'relid';
+               v2               
+--------------------------------
+ PASS:V1_NO_REDUNDANT_RELID_IDX
+(1 row)
+
+-- ----- V.2 probe correctness at scale -----
+DROP TABLE IF EXISTS public.bs_V_t;
+CREATE TABLE public.bs_V_t (id INT4 PRIMARY KEY, v INT4 NOT NULL);
+INSERT INTO public.bs_V_t SELECT g, g FROM generate_series(1,100) g;
+SELECT overlay_branch.create_branch('bs_V_br');
+ create_branch 
+---------------
+             3
+(1 row)
+
+SELECT overlay_branch.use_branch('bs_V_br');
+ use_branch 
+------------
+ 
+(1 row)
+
+-- one set-based INSERT builds 2000 delta rows => 2000 per-row probes
+INSERT INTO public.bs_V_t SELECT 1000 + g, g FROM generate_series(1,2000) g;
+SELECT CASE WHEN count(*) = 2100 THEN 'PASS:V2_OVERLAY_COUNT_2100'
+            ELSE 'FAIL:V2 count=' || count(*) END AS v3
+  FROM public.bs_V_t;
+             v3             
+----------------------------
+ PASS:V2_OVERLAY_COUNT_2100
+(1 row)
+
+SELECT CASE WHEN v = 500 THEN 'PASS:V2_PURE_ROW_VISIBLE'
+            ELSE 'FAIL:V2 v=' || COALESCE(v::text,'NULL') END AS v4
+  FROM public.bs_V_t WHERE id = 1500;
+            v4            
+--------------------------
+ PASS:V2_PURE_ROW_VISIBLE
+(1 row)
+
+-- probe hit: UPDATE an existing delta key keeps exactly one delta row
+UPDATE public.bs_V_t SET v = 1501 WHERE id = 1500;
+SELECT CASE WHEN count(*) = 1 AND min(v) = 1501
+            THEN 'PASS:V2_DELTA_UPDATE_ONE_ROW'
+            ELSE 'FAIL:V2 rows=' || count(*) END AS v5
+  FROM public.bs_V_t WHERE id = 1500;
+              v5              
+------------------------------
+ PASS:V2_DELTA_UPDATE_ONE_ROW
+(1 row)
+
+-- probe conflict: duplicate PK inside the branch must still ERROR 23505
+INSERT INTO public.bs_V_t VALUES (1500, 1);
+ERROR:  duplicate key value violates unique constraint on relation "bs_v_t"
+DETAIL:  Key (id)=(1500) already exists in branch delta (R21 pre-check).
+SELECT overlay_branch.use_branch(NULL);
+ use_branch 
+------------
+ 
+(1 row)
+
+SELECT CASE WHEN count(*) = 100 THEN 'PASS:V2_MAIN_PRISTINE_100'
+            ELSE 'FAIL:V2 count=' || count(*) END AS v6
+  FROM public.bs_V_t;
+            v6             
+---------------------------
+ PASS:V2_MAIN_PRISTINE_100
+(1 row)
+
+SELECT overlay_branch.discard_branch('bs_V_br');
+ discard_branch 
+----------------
+ 
+(1 row)
+
+RESET client_min_messages;
+DROP TABLE public.bs_V_t;

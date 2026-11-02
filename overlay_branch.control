@@ -1,0 +1,11 @@
+# overlay_branch extension
+comment = 'Overlay Branch - speculative database state using table overlay and delta store'
+default_version = '0.1'
+module_pathname = '$libdir/overlay_branch'
+relocatable = false
+# NOTE: we pin the extension to a fixed schema so that C code (which uses
+# SPI to read/write our catalog tables) can use a stable qualified name
+# (overlay_branch.pg_branch / .pg_branch_delta).  The extension uses
+# @extschema@ substitution inside the install script and all
+# function bodies use SET search_path = @extschema@, pg_catalog for safety.
+schema = 'overlay_branch'

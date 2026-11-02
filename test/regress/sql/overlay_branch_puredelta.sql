@@ -1,0 +1,303 @@
+-- ==========================================================
+-- Pure-Delta UPDATE/DELETE MAIN-miss regression suite (B1).
+-- 12 PASS assertions covering:
+--   P1  I→U  single chain (pure-delta INSERT→UPDATE MAIN-miss)
+--   P2  I→U  WITH RETURNING projection correctness
+--   P3  I→U→U  multi-chain UPDATE → UPDATE 0-bug fix
+--   P4  I→D  single chain pure-delta DELETE MAIN-miss
+--   P5  MAIN baseline UPDATE → still works (MAIN-hit path)
+--   P6  MAIN baseline U→U  double chain → no double-write
+--   P7  apply_branch  end-to-end: 5 rows applied correctly
+--   P8  discard_branch on pure-delta writes: MAIN unchanged
+--   P9  I→U→D  triple chain (pure-delta multi-op)
+--   P10 apply pure UPDATE (no MAIN baseline) uses insert_pass fallback
+-- ==========================================================
+
+DROP EXTENSION IF EXISTS overlay_branch CASCADE;
+CREATE EXTENSION overlay_branch;
+
+-- ========== PART A: Pure-Delta WRITE scenarios ==========
+CREATE TABLE pd_t1 (
+    id  int PRIMARY KEY,
+    val text,
+    num int
+);
+INSERT INTO pd_t1 (id, val, num) VALUES (1, 'm1', 100), (2, 'm2', 200);
+SELECT create_branch('b1');
+SELECT use_branch('b1');
+
+-- P1: I→U single chain (pure delta)
+INSERT INTO pd_t1 (id, val, num) VALUES (11, 'i1', 101);
+UPDATE pd_t1 SET val = 'u1', num = 111 WHERE id = 11;
+SELECT CASE WHEN (val, num) = ('u1', 111) THEN 'PASS:P1'
+            ELSE 'FAIL:P1(' || val || ',' || num || ')' END
+FROM pd_t1 WHERE id = 11;
+
+-- P2: I→U RETURNING
+INSERT INTO pd_t1 (id, val, num) VALUES (14, 'i4', 104);
+UPDATE pd_t1 SET val = 'u4', num = num + 100 WHERE id = 14 RETURNING (id=14 AND val='u4' AND num=204) AS p2_check;
+SELECT CASE WHEN (val, num) = ('u4', 204) THEN 'PASS:P2'
+            ELSE 'FAIL:P2(' || val || ',' || num || ')' END
+FROM pd_t1 WHERE id = 14;
+
+-- P3: I→U→U multi chain
+INSERT INTO pd_t1 (id, val, num) VALUES (15, 'i5a', 500);
+UPDATE pd_t1 SET val = 'i5b', num = 501 WHERE id = 15;
+UPDATE pd_t1 SET val = 'i5c', num = 502 WHERE id = 15;
+SELECT CASE WHEN (val, num) = ('i5c', 502) THEN 'PASS:P3'
+            ELSE 'FAIL:P3(' || val || ',' || num || ')' END
+FROM pd_t1 WHERE id = 15;
+
+-- P4: I→D single chain
+INSERT INTO pd_t1 (id, val, num) VALUES (12, 'i2', 102);
+DELETE FROM pd_t1 WHERE id = 12;
+SELECT CASE WHEN count(*) = 0 THEN 'PASS:P4'
+            ELSE 'FAIL:P4 count=' || count(*) END
+FROM pd_t1 WHERE id = 12;
+
+-- P5: MAIN baseline UPDATE (id=1) → MAIN-hit
+UPDATE pd_t1 SET val = 'm1u', num = 999 WHERE id = 1;
+SELECT CASE WHEN (val, num) = ('m1u', 999) THEN 'PASS:P5'
+            ELSE 'FAIL:P5(' || val || ',' || num || ')' END
+FROM pd_t1 WHERE id = 1;
+
+-- P6: MAIN baseline U→U double chain → no double UPDATE
+UPDATE pd_t1 SET val = 'm2b', num = 201 WHERE id = 2;
+UPDATE pd_t1 SET val = 'm2c', num = 202 WHERE id = 2;
+SELECT CASE WHEN (val, num) = ('m2c', 202) THEN 'PASS:P6'
+            ELSE 'FAIL:P6(' || val || ',' || num || ')' END
+FROM pd_t1 WHERE id = 2;
+
+-- ========== PART B: apply_branch + discard + multi-op ==========
+
+-- P7: apply_branch full merge: 5 rows (1,2,11,14,15) with correct values
+SELECT overlay_branch.use_branch('');
+SELECT apply_branch('b1');
+SELECT CASE
+    WHEN count(*) = 5 THEN 'PASS:P7-count'
+    ELSE 'FAIL:P7-count=' || count(*)
+END FROM pd_t1;
+SELECT CASE WHEN (val, num) = ('m1u', 999)  THEN 'PASS:P7-r1'
+            ELSE 'FAIL:P7-r1(' || val || ',' || num || ')' END
+FROM pd_t1 WHERE id = 1;
+SELECT CASE WHEN (val, num) = ('m2c', 202)  THEN 'PASS:P7-r2'
+            ELSE 'FAIL:P7-r2(' || val || ',' || num || ')' END
+FROM pd_t1 WHERE id = 2;
+SELECT CASE WHEN (val, num) = ('u1', 111)   THEN 'PASS:P7-r11'
+            ELSE 'FAIL:P7-r11(' || val || ',' || num || ')' END
+FROM pd_t1 WHERE id = 11;
+SELECT CASE WHEN (val, num) = ('u4', 204)   THEN 'PASS:P7-r14'
+            ELSE 'FAIL:P7-r14(' || val || ',' || num || ')' END
+FROM pd_t1 WHERE id = 14;
+SELECT CASE WHEN (val, num) = ('i5c', 502)  THEN 'PASS:P7-r15'
+            ELSE 'FAIL:P7-r15(' || val || ',' || num || ')' END
+FROM pd_t1 WHERE id = 15;
+
+-- P8: discard_branch with pure-delta writes → MAIN unchanged
+CREATE TABLE pd_t2 (id int PRIMARY KEY, v text);
+INSERT INTO pd_t2 VALUES (1, 'm1');
+SELECT create_branch('b2');
+SELECT use_branch('b2');
+INSERT INTO pd_t2 VALUES (10, 'bi10');
+UPDATE pd_t2 SET v = 'bi10u'  WHERE id = 10;
+UPDATE pd_t2 SET v = 'bi10u2' WHERE id = 10;
+SELECT discard_branch('b2');
+SELECT CASE WHEN (array_agg(id ORDER BY id),
+                  array_agg(v  ORDER BY id))
+                 = (ARRAY[1], ARRAY['m1'])
+            THEN 'PASS:P8'
+            ELSE 'FAIL:P8' END
+FROM pd_t2;
+
+-- P9: I→U→D triple chain
+CREATE TABLE pd_t3 (id int PRIMARY KEY, v text);
+SELECT create_branch('b3');
+SELECT use_branch('b3');
+INSERT INTO pd_t3 VALUES (20, 'a');
+UPDATE pd_t3 SET v = 'b' WHERE id = 20;
+DELETE FROM pd_t3 WHERE id = 20;
+SELECT CASE WHEN count(*) = 0 THEN 'PASS:P9'
+            ELSE 'FAIL:P9 count=' || count(*) END
+FROM pd_t3 WHERE id = 20;
+SELECT discard_branch('b3');
+
+-- P10: pure UPDATE (old_version NULL) apply uses insert_pass fallback
+CREATE TABLE pd_t4 (id int PRIMARY KEY, v text);
+SELECT create_branch('b4');
+SELECT use_branch('b4');
+INSERT INTO pd_t4 VALUES (99, 'x');
+UPDATE pd_t4 SET v = 'y' WHERE id = 99;
+UPDATE pd_t4 SET v = 'z' WHERE id = 99;
+SELECT overlay_branch.use_branch('');
+SELECT apply_branch('b4');
+SELECT CASE WHEN v = 'z' THEN 'PASS:P10'
+            ELSE 'FAIL:P10 v=' || v END
+FROM pd_t4 WHERE id = 99;
+
+-- P11: MVP NOP guards (CTID-based writes + multi-table JOIN WR)
+--   These are intentionally out-of-scope for the MVP: WR hook must not
+--   corrupt data by silently performing half-work; instead it must keep
+--   the row untouched so the user can detect the no-op via CASE assertions
+--   (matches the documented MVP scope: only PK-equality quals supported).
+CREATE TABLE pd_t5 (id int PRIMARY KEY, v text, payload text);
+CREATE TABLE pd_t6 (id int PRIMARY KEY, ref int);
+SELECT create_branch('b11');
+SELECT use_branch('b11');
+INSERT INTO pd_t5 VALUES (1, 'orig', 'base');      -- pure delta row
+INSERT INTO pd_t6 VALUES (101, 1);                   -- pure delta row (FK-emulation)
+
+-- P11.1 UPDATE WHERE ctid = ...: ctid refers to MAIN storage only; pure
+--       delta rows have no MAIN ctid.  MVP guard: no PK-equality → NOP.
+UPDATE pd_t5 SET payload = 'WRONG-ctid-upd'
+ WHERE ctid = (SELECT ctid FROM pd_t5 WHERE id = 1 LIMIT 1);
+SELECT CASE WHEN payload = 'base' THEN 'PASS:P11_1_UPD_CTID_NOP'
+            ELSE 'FAIL:P11_1 payload=' || COALESCE(payload,'NULL') END AS p11_1
+  FROM pd_t5 WHERE id = 1;
+
+-- P11.2 DELETE WHERE ctid = ...: same MVP guard → NOP.
+DELETE FROM pd_t5
+ WHERE ctid = (SELECT ctid FROM pd_t5 WHERE id = 1 LIMIT 1);
+SELECT CASE WHEN count(*) = 1 THEN 'PASS:P11_2_DEL_CTID_NOP'
+            ELSE 'FAIL:P11_2 count=' || count(*) END AS p11_2
+  FROM pd_t5 WHERE id = 1;
+
+-- P11.3 UPDATE ... FROM (join): MVP decomposes only single-rel PK-equality
+--       quals; join quals cannot be rewritten into a PK exact-match.  Guard
+--       MUST produce a safe NOP, not a partial or mis-joined write.
+UPDATE pd_t5 SET payload = 'WRONG-join-upd'
+  FROM pd_t6
+ WHERE pd_t5.id = pd_t6.ref
+   AND pd_t6.id = 101;
+SELECT CASE WHEN payload = 'base' THEN 'PASS:P11_3_UPD_JOIN_NOP'
+            ELSE 'FAIL:P11_3 payload=' || COALESCE(payload,'NULL') END AS p11_3
+  FROM pd_t5 WHERE id = 1;
+
+-- P11.4 RETURNING * on pure-delta UPDATE (PK-equality): pure-delta UPDATE
+--       branch must correctly populate RETURNING projection with the
+--       post-SET row (all columns).  Covers V1 RETURNING projection path.
+UPDATE pd_t5 SET v = 'p114', payload = 'ret-upd' WHERE id = 1
+  RETURNING id, v, payload;
+SELECT CASE WHEN v = 'p114' AND payload = 'ret-upd'
+            THEN 'PASS:P11_4_RETURNING_STAR'
+            ELSE 'FAIL:P11_4 v=' || COALESCE(v,'NULL')
+                 || ' payload=' || COALESCE(payload,'NULL') END AS p11_4
+  FROM pd_t5 WHERE id = 1;
+
+SELECT discard_branch('b11');
+
+-- =====================================================================
+-- Section R_SETNULL (REVIEW-260926 / R20): UPDATE SET nullable_col = NULL
+--   must actually NULL-ify the column on both MAIN-based rows and
+--   pure-delta INSERT rows (in the overlay view and after apply).
+--   Prior fix only merged SET values when Datum was non-NULL, so a
+--   deliberate SET NULL was silently ignored by the write-redirect
+--   merge loop.
+-- =====================================================================
+CREATE TABLE pd_t7 (
+    id      integer PRIMARY KEY,
+    v       text,
+    note    text    -- nullable column explicitly used for SET NULL tests
+);
+INSERT INTO pd_t7 VALUES (1, 'main_a', 'not_null_1'),
+                         (2, 'main_b', 'not_null_2');
+SELECT create_branch('b_r20');
+SELECT use_branch('b_r20');
+
+-- R20-1: MAIN baseline row SET note = NULL (overlay view must see NULL).
+UPDATE pd_t7 SET note = NULL WHERE id = 1;
+SELECT CASE WHEN note IS NULL THEN 'PASS:R20_1_MAIN_SET_NULL'
+            ELSE 'FAIL:R20_1 note=' || COALESCE(note,'NULL') END AS r20_1
+  FROM pd_t7 WHERE id = 1;
+
+-- R20-2: Insert a pure-delta row, then UPDATE SET note = NULL.  This
+--         exercises the pure-delta UPDATE pass (S08) R20 jisnull=true
+--         branch (overlay_serialize_tuple MUST still write isnull=true).
+INSERT INTO pd_t7 VALUES (10, 'pure_c', 'still_not_null');
+UPDATE pd_t7 SET note = NULL WHERE id = 10;
+SELECT CASE WHEN note IS NULL THEN 'PASS:R20_2_PURE_UPDATE_SET_NULL'
+            ELSE 'FAIL:R20_2 note=' || COALESCE(note,'NULL') END AS r20_2
+  FROM pd_t7 WHERE id = 10;
+
+-- R20-5: Pure-delta row R20 NULL↔non-NULL toggled multiple times to verify the pure-delta branch
+--        isnull flag state is correct and does not linger.
+UPDATE pd_t7 SET note = 'after_null_1' WHERE id = 10;
+UPDATE pd_t7 SET note = NULL WHERE id = 10;
+UPDATE pd_t7 SET note = 'after_null_2' WHERE id = 10;
+UPDATE pd_t7 SET note = NULL WHERE id = 10;
+SELECT CASE WHEN note IS NULL THEN 'PASS:R20_5_PURE_TOGGLE_FINAL_NULL'
+            ELSE 'FAIL:R20_5 note=' || COALESCE(note,'NULL') END AS r20_5
+  FROM pd_t7 WHERE id = 10;
+
+-- R03 (pure-delta UPDATE SET pk): ensure the pure-delta pass also goes through pk_attnums_set 0A000.
+-- DO block: EXCEPTION WHEN OTHERS → assert SQLSTATE=0A000; MAIN baseline unchanged.
+DO $$
+DECLARE
+  old_cnt int; old_sum_v int;
+BEGIN
+  SELECT count(*), coalesce(sum(id),0) INTO old_cnt, old_sum_v FROM pd_t7;
+  BEGIN
+    UPDATE pd_t7 SET id = 9901 WHERE id = 10;
+    RAISE EXCEPTION 'FAIL_R03_PURE_NO_ERROR';
+  EXCEPTION WHEN OTHERS THEN
+    IF SQLSTATE <> '0A000' THEN
+      RAISE EXCEPTION 'FAIL_R03_PURE_EXPECTED_0A000_GOT_% MSG=%', SQLSTATE, SQLERRM;
+    END IF;
+  END;
+  -- assert baseline
+  IF (SELECT count(*) FROM pd_t7) <> old_cnt OR
+     (SELECT coalesce(sum(id),0) FROM pd_t7) <> old_sum_v THEN
+    RAISE EXCEPTION 'FAIL_R03_PURE_BASELINE_MUTATED_cnt_sum_%,_%',
+      (SELECT count(*) FROM pd_t7), (SELECT coalesce(sum(id),0) FROM pd_t7);
+  END IF;
+END $$;
+
+-- R02: pure-delta row UPDATE v = v + 1 three times in a row → final v = 'pure_c' with the suffix appended three times.
+--      (each pure-delta UPDATE takes the pre-image from the previous delta tuple_data,
+--      guaranteeing the v = v || suffix chain fold is ultimately correct)
+UPDATE pd_t7 SET v = v || '+1' WHERE id = 10;   -- 'pure_c+1'
+UPDATE pd_t7 SET v = v || '+2' WHERE id = 10;   -- 'pure_c+1+2'
+UPDATE pd_t7 SET v = v || '+3' WHERE id = 10;   -- 'pure_c+1+2+3'
+SELECT CASE WHEN v = 'pure_c+1+2+3' THEN 'PASS:R02_PURE_UPDATE_CHAIN_OK'
+            ELSE 'FAIL:R02 v=' || COALESCE(v, 'NULL') END AS r02_pure_chain
+  FROM pd_t7 WHERE id = 10;
+
+-- R20-3: Alternate non-null and NULL assignments on MAIN id=2 to make
+--        sure successive slot merges don't leave stale isnull flags.
+UPDATE pd_t7 SET note = 'n1' WHERE id = 2;          -- non-null first
+UPDATE pd_t7 SET note = NULL WHERE id = 2;          -- then NULL
+UPDATE pd_t7 SET note = 'n3' WHERE id = 2;          -- then non-null again (should be 'n3')
+SELECT CASE WHEN note = 'n3' THEN 'PASS:R20_3_TOGGLE_BACK'
+            ELSE 'FAIL:R20_3 note=' || COALESCE(note,'NULL') END AS r20_3
+  FROM pd_t7 WHERE id = 2;
+UPDATE pd_t7 SET note = NULL WHERE id = 2;          -- finally NULL again
+SELECT CASE WHEN note IS NULL THEN 'PASS:R20_3_FINAL_NULL'
+            ELSE 'FAIL:R20_3_final note=' || COALESCE(note,'NULL') END AS r20_3f
+  FROM pd_t7 WHERE id = 2;
+
+-- R20-4: apply branch → MAIN must reflect NULL note columns for
+--        MAIN-baseline rows id=1/2, AND the pure-delta row id=10 now
+--        HAS a real delta-UPDATE record that applies via insert_pass
+--        fallback for pure rows (P10 rule).  After apply, id=10 must
+--        show: id=10, v='pure_c+1+2+3' (pure UPDATE chain OK) + note=NULL
+--        (R20 pure-path NULL OK).
+SELECT use_branch(NULL);
+SELECT apply_branch('b_r20');
+SELECT CASE WHEN note IS NULL THEN 'PASS:R20_4_APPLY_ID1_NULL'
+            ELSE 'FAIL:R20_4_id1 note=' || COALESCE(note,'NULL') END AS r20_4_id1
+  FROM pd_t7 WHERE id = 1;
+SELECT CASE WHEN note IS NULL THEN 'PASS:R20_4_APPLY_ID2_NULL'
+            ELSE 'FAIL:R20_4_id2 note=' || COALESCE(note,'NULL') END AS r20_4_id2
+  FROM pd_t7 WHERE id = 2;
+SELECT CASE WHEN note IS NULL AND v = 'pure_c+1+2+3'
+            THEN 'PASS:R20_4_PURE_UPDATED_AND_APPLIED'
+            ELSE 'FAIL:R20_4_id10 note=' || COALESCE(note,'NULL')
+                 || ' v=' || COALESCE(v,'NULL')
+       END AS r20_4_id10
+  FROM pd_t7 WHERE id = 10;
+
+-- Cleanup Section R_SETNULL.
+DROP TABLE pd_t7;
+
+-- cleanup
+DROP TABLE pd_t1, pd_t2, pd_t3, pd_t4, pd_t5, pd_t6;
+DROP EXTENSION overlay_branch CASCADE;

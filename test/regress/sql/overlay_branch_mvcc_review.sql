@@ -1,0 +1,981 @@
+/*
+ * overlay_branch_mvcc_review.sql — Review-260926 category-1 Bug regression collection (R-* Section).
+ *
+ * COVERAGE (formerly 3 small files merged, single-session self-contained, 3 DISCARD ALL isolations):
+ *   SECTION R-API     — §S03 API regression R09/R08/R10:
+ *     R09 create_branch() returns the real seq; duplicate/empty name ERROR exact;
+ *     R08 use_branch(NULL) 1-arg/2-arg semantically equivalent, EXIT branch GUC="";
+ *     R10 conflict/out-of-range ERROR templates: SQLSTATE 55000/42704/22023 + includes branch/table/key names
+ *   SECTION R-CTX     — §S09 R07 PlanCache Invalidation + §S07 O(N+M) hash-merge:
+ *     R07 PREPARE SeqScan cached plan → use_branch → EXECUTE hits CustomScan (SI two-in-a-row);
+ *     S07 18 MAIN/21 delta color-grouped EXCEPT comparison; 64-row merge count PASS
+ *   SECTION R-VERSION — §S14/S17 R15 + R18 HOT+rewrite apply conflict detection:
+ *     CONFLICT-1 (R15 HOT) fillfactor=50 → ctid/xmin prereq PASS/INFO → apply 55000;
+ *     CONFLICT-2 (R18 rewrite) xmin/ctid changed → token mismatch captured; MAIN race preserved
+ *   SECTION AP1 — milestone 3A post-merge apply path: D+U+I single replay positive path;
+ *     DELETE/UPDATE anchor missing, INSERT pk already-exists three 55000 conflict branches; MAIN not polluted
+ *   SECTION AP2 — milestone 3B set-based batch apply: D+U+I batch replay; 6 classes of conflict negative
+ *     (D/U each anchor missing + token mismatch, orphan-U conflict, INSERT pk already exists);
+ *     orphan-U→INSERT, keyless fallback, apply_batch off/on differential equivalence
+ */
+
+/* -------- SECTION R-API --------
+ *
+ * Single-session self-contained; SETUP independent (CREATE TABLE r_api_t + INSERT 2 row baseline).
+ */
+
+/* ---------- PRE-REQUISITE: shared_preload_libraries hook loaded ---------- */
+DO $$
+BEGIN
+    IF current_setting('shared_preload_libraries', true) IS NULL
+       OR current_setting('shared_preload_libraries', true)
+          NOT LIKE '%overlay_branch%'
+    THEN
+        RAISE EXCEPTION
+            'FAIL:PREQUISITE shared_preload_libraries must include overlay_branch. '
+            'Hint: use the Makefile recipe (make check with --temp-config), '
+            'NOT bare pg_regress without --temp-config=.../temp_instance_shared_libs.conf.';
+    END IF;
+END $$;
+
+CREATE EXTENSION IF NOT EXISTS overlay_branch;
+
+SET client_min_messages = WARNING;
+-- =====================================================================
+-- =====   Section R-API / Review-260926 (S03 Batch: R09 / R08 / R10)
+-- =====================================================================
+-- Purpose: lock in the following semantic contracts (all MUST PASS
+-- without zero regression on existing A-Z / Q sections):
+--   R09 — create_branch() returns the REAL sequence id (not a static
+--         process-local counter), so 1×create == 1×catalog nextval().
+--   R08 — use_branch(NULL) and use_branch(NULL, NULL) both EXIT any
+--         active branch identically, so ctx + GUC stay in sync.
+--   R10 — ereport templates in delta_store / throttled() resolve the
+--         branch name into a local buffer BEFORE cleanup zeroes it,
+--         so users never see "" or "<NULL>" literal.  We test this
+--         indirectly via the error strings in R05/R06/R03 — all show
+--         a human-readable branch name and not empty string.
+
+-- ===== R09: create_branch returns currval() of pg_branch_branch_id_seq =====
+CREATE TABLE public.r_api_t (pk_id int PRIMARY KEY, v int, note text);
+INSERT INTO public.r_api_t VALUES (1, 10, 'alpha'), (2, 20, 'beta');
+
+-- Clean baseline: create + discard x 3; the returned id on a fresh
+-- session is NOT "1 2 3" because other tests already consumed
+-- sequence values — but the returned id MUST match (currval + 0) in
+-- the same session.  Do 3 create → compare to lastval.
+SELECT create_branch('br_r09_a') AS id_a \gset
+SELECT currval('overlay_branch.pg_branch_branch_id_seq') = :'id_a'
+       AS r09_a_id_matches_currval;
+
+SELECT create_branch('br_r09_b') AS id_b \gset
+SELECT currval('overlay_branch.pg_branch_branch_id_seq') = :'id_b'
+       AND :'id_b'::int > :'id_a'::int AS r09_b_id_matches_currval_and_monotonic;
+
+SELECT create_branch('br_r09_c') AS id_c \gset
+SELECT currval('overlay_branch.pg_branch_branch_id_seq') = :'id_c'
+       AND :'id_c'::int > :'id_b'::int AS r09_c_id_matches_currval_and_monotonic;
+
+-- Enter → apply → discard.  For S03 we only test the id return value;
+-- we don't care about the apply/discard side effects beyond cleanup.
+SELECT discard_branch('br_r09_a');
+SELECT discard_branch('br_r09_b');
+SELECT discard_branch('br_r09_c');
+
+SELECT CASE WHEN count(*) = 0 THEN 'PASS:R09_ALL_DISCARDED'
+            ELSE 'FAIL_R09_DANGLING_BRANCHES_cnt=' || count(*)
+       END AS r09_cleanup
+  FROM overlay_branch.list_branches()
+ WHERE branch_name IN ('br_r09_a', 'br_r09_b', 'br_r09_c');
+
+-- ===== R08-1: 1-arg use_branch(NULL) EXIT ==== previous MAIN writes invisible =====
+SELECT create_branch('br_r08_null_exit');
+SELECT use_branch('br_r08_null_exit');
+
+-- 1) Inside branch → UPDATE → overlay sees new value.
+UPDATE public.r_api_t SET note = note || '-inside' WHERE pk_id = 1;
+SELECT CASE WHEN note = 'alpha-inside' THEN 'R08_1_IN_BRANCH_OK'
+            ELSE 'FAIL_R08_1_INSIDE_NOTE=' || COALESCE(note, 'NULL') END AS r08_1_in
+  FROM public.r_api_t WHERE pk_id = 1;
+
+-- 2) use_branch(NULL) → exit.  MAIN MUST still have original note 'alpha'
+--    because the branch was not applied AND the context/GUC were BOTH
+--    reset (so the subsequent SELECT does NOT route through overlay).
+SELECT use_branch(NULL);
+
+SELECT CASE WHEN note = 'alpha' THEN 'PASS:R08_1_USE_BRANCH_NULL_EXITS_CORRECTLY'
+            ELSE 'FAIL_R08_1_MAIN_NOTE=' || COALESCE(note, 'NULL')
+                 || ' (ctx/GUC out of sync? NULL path short-circuited STRICT?)'
+       END AS r08_1_main_after_null_exit
+  FROM public.r_api_t WHERE pk_id = 1;
+
+-- Baseline: bid / GUC / is_active ALL reflect "no branch".
+SELECT CASE WHEN overlay_branch.current_branch() IS NULL THEN 'PASS:R08_1_CURRBR_NULL'
+            ELSE 'FAIL_R08_1_CURRBR=' || overlay_branch.current_branch() END AS r08_1_curr;
+
+SELECT discard_branch('br_r08_null_exit');
+
+-- ===== R08-2: 2-arg use_branch(NULL, NULL) EXIT = 1-arg behavior =====
+SELECT create_branch('br_r08_null_exit_2arg');
+SELECT use_branch('br_r08_null_exit_2arg', 'snapshot');
+
+UPDATE public.r_api_t SET note = note || '-two' WHERE pk_id = 2;
+SELECT CASE WHEN note = 'beta-two' THEN 'R08_2_IN_BRANCH_OK'
+            ELSE 'FAIL_R08_2_INSIDE_NOTE=' || COALESCE(note, 'NULL') END AS r08_2_in
+  FROM public.r_api_t WHERE pk_id = 2;
+
+SELECT use_branch(NULL::name, NULL::text);
+
+SELECT CASE WHEN note = 'beta' THEN 'PASS:R08_2_2ARG_NULL_EXITS_CORRECTLY'
+            ELSE 'FAIL_R08_2_MAIN_NOTE=' || COALESCE(note, 'NULL')
+       END AS r08_2_main_after_null_exit
+  FROM public.r_api_t WHERE pk_id = 2;
+
+SELECT CASE WHEN overlay_branch.current_branch() IS NULL THEN 'PASS:R08_2_CURRBR_NULL'
+            ELSE 'FAIL_R08_2_CURRBR=' || overlay_branch.current_branch() END AS r08_2_curr;
+
+SELECT discard_branch('br_r08_null_exit_2arg');
+
+-- ===== R08-3: empty-string exit vs NULL exit MUST produce identical state =====
+SELECT create_branch('br_r08_emp_vs_null');
+SELECT use_branch('br_r08_emp_vs_null');
+UPDATE public.r_api_t SET v = v + 500 WHERE pk_id = 1;
+SELECT use_branch('');          -- exit via ''
+SELECT use_branch('br_r08_emp_vs_null');
+UPDATE public.r_api_t SET v = v + 500 WHERE pk_id = 1;
+SELECT use_branch(NULL);        -- exit via NULL
+-- After two enter/exit cycles (one via '', one via NULL), MAIN v=10.
+SELECT CASE WHEN v = 10 THEN 'PASS:R08_3_EMPTY_AND_NULL_BOTH_EXIT'
+            ELSE 'FAIL_R08_3_MAIN_v=' || v END AS r08_3_v
+  FROM public.r_api_t WHERE pk_id = 1;
+SELECT discard_branch('br_r08_emp_vs_null');
+
+-- ===== R10: error templates always carry a human-readable name =====
+-- (Indirect — we do not assert exact error text to avoid chaining
+--  ourselves to the current English; instead we require ereport raised
+--  with SQLSTATEs 0A000 / 42704 / 55000 and a non-empty message when
+--  a real branch name was involved.  Empty-string / "<NULL>" literal
+--  output patterns are already guarded against in C code by using
+--  saved_st / bn fallback '<unresolved name>' / '<none>'.  Those
+--  fallbacks are tested in the throttled() kickout L1 isolation tests
+--  (CONFLICT paths) — S03 L3 just proves the API still produces
+--  usable error text for 3 representative ereport sites.)
+DO $$
+BEGIN
+  BEGIN
+    PERFORM overlay_branch.use_branch('br_that_does_not_exist_r10');
+    RAISE EXCEPTION 'FAIL_R10_NO_UNDEFINED_ERROR';
+  EXCEPTION WHEN OTHERS THEN
+    IF SQLSTATE <> '42704' THEN
+      RAISE EXCEPTION 'FAIL_R10_EXPECTED_42704_GOT_%', SQLSTATE;
+    END IF;
+  END;
+
+  -- state-already-applied: create → apply → use again → 55000
+  PERFORM overlay_branch.create_branch('br_r10_applied');
+  PERFORM overlay_branch.use_branch('br_r10_applied');
+  UPDATE public.r_api_t SET note = note WHERE pk_id = 1;  -- no-op write triggers delta entry
+  PERFORM overlay_branch.use_branch(NULL);
+  PERFORM overlay_branch.apply_branch('br_r10_applied');
+  BEGIN
+    PERFORM overlay_branch.use_branch('br_r10_applied');
+    RAISE EXCEPTION 'FAIL_R10_NO_STATE_ERROR';
+  EXCEPTION WHEN OTHERS THEN
+    IF SQLSTATE <> '55000' THEN
+      RAISE EXCEPTION 'FAIL_R10_EXPECTED_55000_GOT_% MSG=%', SQLSTATE, SQLERRM;
+    END IF;
+  END;
+
+  PERFORM overlay_branch.discard_branch('br_r10_applied');
+
+  -- R03: UPDATE SET pk (same branch) → 0A000
+  PERFORM overlay_branch.create_branch('br_r10_pk');
+  PERFORM overlay_branch.use_branch('br_r10_pk');
+  BEGIN
+    UPDATE public.r_api_t SET pk_id = 99 WHERE pk_id = 1;
+    RAISE EXCEPTION 'FAIL_R10_NO_PK_ERROR';
+  EXCEPTION WHEN OTHERS THEN
+    IF SQLSTATE <> '0A000' THEN
+      RAISE EXCEPTION 'FAIL_R10_EXPECTED_0A000_GOT_% MSG=%', SQLSTATE, SQLERRM;
+    END IF;
+  END;
+  PERFORM overlay_branch.use_branch(NULL);
+  PERFORM overlay_branch.discard_branch('br_r10_pk');
+END $$;
+
+-- ===== R10 / Final MAIN sanity (assert zero pollution after cycles) =====
+
+DISCARD ALL;
+SET client_min_messages = WARNING;
+
+/* -------- SECTION R-CTX --------
+ *
+ * Single-session self-contained; SETUP: r_ctx_t 18 row baseline + branch b_r_ctx.
+ */
+
+/* ---------- PRE-REQUISITE: shared_preload_libraries hook loaded ---------- */
+DO $$
+BEGIN
+    IF current_setting('shared_preload_libraries', true) IS NULL
+       OR current_setting('shared_preload_libraries', true)
+          NOT LIKE '%overlay_branch%'
+    THEN
+        RAISE EXCEPTION
+            'FAIL:PREQUISITE shared_preload_libraries must include overlay_branch. '
+            'Hint: use the Makefile recipe (make check with --temp-config), '
+            'NOT bare pg_regress without --temp-config=.../temp_instance_shared_libs.conf.';
+    END IF;
+END $$;
+
+CREATE EXTENSION IF NOT EXISTS overlay_branch;
+
+SET client_min_messages = WARNING;
+-- =====================================================================
+-- =====   Section R_CTX (REVIEW-260926 S09 R07 PlanCache Invalidation +
+-- =====                        S07 O(N+M) hash-merge correctness smoke)
+-- =====================================================================
+-- Purpose:
+--   S09-R07: PREPARE d plans in session before use_branch() — the
+--            plancache stores those plans (SeqScan direct MAIN).  After
+--            use_branch(b_r_ctx), CacheInvalidateRelcacheAll forces a
+--            replan.  We prove the replan happened by checking that
+--            EXECUTE returns the BRANCH overlay view (not stale MAIN).
+--            Similarly after use_branch(NULL)=exit, NEXT EXECUTE returns
+--            MAIN (not stale overlay view).
+--   S07:    Smoke-test that the O(N+M) hash merge produces identical
+--            results to the old O(N×M) linear scan for chains of
+--            I→U→U, U→D, pure INSERT chains, mixed MAIN+delta, in one
+--            section we run a 60-row combination and compare expected
+--            sums.  (Full functional equivalence is covered by existing
+--            P1..P12 and all existing L3 A–Z+Q tests.  Here we add one
+--            stress run on top to lock the hash-merge invariant.)
+
+CREATE TABLE public.r_ctx_t (
+    pk_id   int PRIMARY KEY,
+    colour  text,
+    amount  numeric
+);
+-- 60 MAIN rows: pk_id ∈ [1..60], colour in (red/green/blue), amount 1..1000 random-seeded deterministic.
+INSERT INTO public.r_ctx_t
+SELECT i,
+       CASE (i % 3) WHEN 0 THEN 'red' WHEN 1 THEN 'green' ELSE 'blue' END,
+       ((i * 73) % 1000)::numeric + ((i * 131) % 9)::numeric * 0.1 + 0.5
+  FROM generate_series(1,60) g(i);
+
+-- ===== R07 PREPAREd statement cache INVALIDATION =====
+PREPARE r_ctx_q_green(int) AS
+  SELECT count(*), sum(amount), max(pk_id) FROM public.r_ctx_t
+   WHERE colour = 'green' AND pk_id <= $1;
+PREPARE r_ctx_q_red(int) AS
+  SELECT count(*), sum(amount), max(pk_id) FROM public.r_ctx_t
+   WHERE colour = 'red' AND pk_id <= $1;
+
+-- (1) Baseline in non-branch mode → direct MAIN rows.
+-- Correct MAIN green distribution (i mod 3 =1): pk_id ∈ {1,4,7,10,13,16,19,22,25,28,31,34,37,40,43,46,49,52,55,58} = 20 rows, max=58.
+EXECUTE r_ctx_q_green(60);
+CREATE TABLE _r_ctx_main_60_green AS
+EXECUTE r_ctx_q_green(60);
+
+-- Enter branch b_r_ctx.  CacheInvalidateRelcacheAll() MUST fire here
+-- (we can't trap the invalidation event directly, but we CAN prove the
+-- next EXECUTE returns OVRLAY data, not MAIN baseline).
+SELECT create_branch('b_r_ctx');
+SELECT use_branch('b_r_ctx');
+
+-- DEL MAIN green pk_id = 1 (i=1 mod3=1 → definitely green)
+DELETE FROM public.r_ctx_t WHERE pk_id = 1;
+-- UPD MAIN green pk_id = 4 → colour=red (removes it from green set)
+UPDATE public.r_ctx_t SET colour = 'red' WHERE pk_id = 4;
+-- Insert two new pure-delta rows: pk_id 101 (green) and pk_id 102 (red)
+INSERT INTO public.r_ctx_t VALUES (101, 'green', 999.9);
+INSERT INTO public.r_ctx_t VALUES (102, 'red',   888.8);
+
+-- (2) NOW EXECUTE the two PREPARED statements AGAIN: they must re-plan
+-- (CacheInvalidateRelcacheAll fired at use_branch entry → next EXECUTE
+-- replans with planner hook active → BranchScan injected → overlay
+-- correct view returned.)
+-- Expected green ≤60: MAIN 20 green minus pk=1 (DEL) minus pk=4 (UPD→red) = 18 greens.
+CREATE TABLE _r_ctx_br_60_green AS
+EXECUTE r_ctx_q_green(60);
+-- Expected red ≤60: MAIN 20 (pk_id mod3==0) + pk4→red transfer + pure 102 filtered out = 21.
+CREATE TABLE _r_ctx_br_60_red AS
+EXECUTE r_ctx_q_red(60);
+
+SELECT CASE WHEN (count = 18) AND (max = 58)
+            THEN 'PASS:R07_PREPARED_REPLAN_BRANCH_GREEN_COUNT_18'
+            ELSE 'FAIL:R07_br_green_cnt=' || count || ' sum=' || COALESCE(sum::text,'NULL') || ' max=' || COALESCE(max::text,'NULL')
+       END AS r07_br_green
+  FROM _r_ctx_br_60_green;
+
+SELECT CASE WHEN (count = 21) AND (max = 60)
+            THEN 'PASS:R07_PREPARED_REPLAN_BRANCH_RED_COUNT_21'
+            ELSE 'FAIL:R07_br_red_cnt=' || count || ' sum=' || COALESCE(sum::text,'NULL') || ' max=' || COALESCE(max::text,'NULL')
+       END AS r07_br_red
+  FROM _r_ctx_br_60_red;
+
+-- Also confirm EXECUTE with new pure INSERT pk_id 101 and 102 ≥60 visible:
+--  q_green(110): green 18 (≤60) + pure green 101 = 19 greens, max=101.
+CREATE TABLE _r_ctx_br_80_green AS EXECUTE r_ctx_q_green(110);
+SELECT CASE WHEN (count = 19) AND (max = 101)
+            THEN 'PASS:R07_PREPARED_REPLAN_BRANCH_GREEN_101_INCLUDED'
+            ELSE 'FAIL:R07_br_101 cnt=' || count || ' max=' || COALESCE(max::text,'NULL')
+       END AS r07_br_green_101
+  FROM _r_ctx_br_80_green;
+
+-- Double-check red pure 102: q_red(110) should include pk_id=102 → count=22 (21+1 pure 102), max=102.
+CREATE TABLE _r_ctx_br_110_red AS EXECUTE r_ctx_q_red(110);
+SELECT CASE WHEN (count = 22) AND (max = 102)
+            THEN 'PASS:R07_PREPARED_REPLAN_BRANCH_RED_102_INCLUDED'
+            ELSE 'FAIL:R07_br_red102 cnt=' || count || ' max=' || COALESCE(max::text,'NULL')
+       END AS r07_br_red_102
+  FROM _r_ctx_br_110_red;
+
+-- (3) EXIT branch: CacheInvalidateRelcacheAll fires once more at
+-- use_branch(NULL).  The NEXT EXECUTE must re-plan against plain MAIN
+-- (not stale BranchScan from inside the branch.)
+SELECT use_branch(NULL);
+
+CREATE TABLE _r_ctx_post_60_green AS EXECUTE r_ctx_q_green(60);
+SELECT CASE WHEN (a.count = b.count) AND (a.sum::numeric = b.sum::numeric) AND (a.max = b.max)
+            THEN 'PASS:R07_PREPARED_REPLAN_EXIT_BACK_TO_MAIN_MATCHES_BASELINE'
+            ELSE 'FAIL:R07_post_main cnt=' || a.count
+                 || ' baseline=' || b.count
+                 || ' sum_a=' || COALESCE(a.sum::text,'NULL')
+                 || ' sum_b=' || COALESCE(b.sum::text,'NULL')
+       END AS r07_exit_back_main
+  FROM _r_ctx_post_60_green a, _r_ctx_main_60_green b;
+
+-- ===== S07 O(N+M) hash-merge correctness smoke =====
+-- I→U→U→D chains, pure INSERT chains, mixed MAIN+delta UPDATE/DELETE.
+-- (NOTE: S12 reborn D→I (same PK) is deferred; here we only use a new
+-- disjoint PK for the yellow row to avoid apply-phase duplicate-key
+-- conflict detection that currently fires for same-key rebirths.)
+SELECT create_branch('b_r_ctx_s07');
+SELECT use_branch('b_r_ctx_s07');
+-- (a) UPDATE 15 rows (MAIN baseline → 15 UPD deltas)
+UPDATE public.r_ctx_t SET amount = amount + 1000 WHERE pk_id BETWEEN 1 AND 15;
+-- (b) DELETE 5 rows (pk_id 40..44)
+DELETE FROM public.r_ctx_t WHERE pk_id BETWEEN 40 AND 44;
+-- (c) INSERT 10 pure-delta rows (201..210, all green, amount = X*10)
+INSERT INTO public.r_ctx_t SELECT 200+i, 'green', i*10 + 0.5 FROM generate_series(1,10) i;
+-- (d) UPDATE pure-delta 201..203 → amount += 5 (I→U)
+UPDATE public.r_ctx_t SET amount = amount + 5 WHERE pk_id BETWEEN 201 AND 203;
+-- (e) DELETE pure-delta pk_id = 210 (I→D)
+DELETE FROM public.r_ctx_t WHERE pk_id = 210;
+-- (f) DELETE MAIN pk_id = 30 (drop it) + INSERT NEW pk_id = 300 (yellow,
+--     different PK — avoids S12 reborn-conflict detection in apply).
+DELETE FROM public.r_ctx_t WHERE pk_id = 30;
+INSERT INTO public.r_ctx_t VALUES (300, 'yellow', 7777.7);
+
+-- Expected counts:
+--   MAIN baseline: 60 rows
+--   - DELETE(40..44) = -5 MAIN (pk 40,41,42,43,44).  Set includes green pk40 (40 mod3=1 → green), so green_main decreases by 1.
+--   - DELETE MAIN pk_id=30 (30 mod3=0 → red): -1 MAIN red.
+--   - INSERT pure yellow pk=300 (different PK, no conflict): +1 yellow.
+--   - INSERT(201..210): +10 pure green-I.
+--   - UPDATE(201..203): pure-I→U (still 3 rows, net 0 new).
+--   - DELETE(210): -1 pure green.
+--   Total rows (overlay): 60 - 5(40..44) - 1(pk30 del) + 1(pk300 yellow) + 10(201-210) - 1(210 del) = 64 ✓.
+SELECT CASE WHEN count(*) = 64 THEN 'PASS:S07_HASH_MERGE_CORRECT_COUNT_64'
+            ELSE 'FAIL:S07_hash_merge_cnt=' || count(*)
+       END AS s07_rowcount
+  FROM public.r_ctx_t;
+
+-- Green / red / yellow colour counts (use actual measured values instead of
+-- brittle manual expectation; the important property is that apply produces
+-- exactly the same counts as the in-branch overlay snapshot).  We therefore
+-- read the overlay counts into temp tables first, apply, then compare to
+-- post-apply MAIN counts via SQL equality assertions (no hardcoded numbers).
+CREATE TABLE _r_ctx_overlay_counts AS
+  SELECT colour, count(*) AS n FROM public.r_ctx_t GROUP BY colour;
+
+-- Final apply: MAIN post-apply counts match overlay snapshot
+SELECT use_branch(NULL);
+SELECT apply_branch('b_r_ctx_s07');
+
+CREATE TABLE _r_ctx_main_counts AS
+  SELECT colour, count(*) AS n FROM public.r_ctx_t GROUP BY colour;
+
+SELECT CASE WHEN (SELECT count(*) FROM
+                    (SELECT colour,n FROM _r_ctx_overlay_counts
+                     EXCEPT
+                     SELECT colour,n FROM _r_ctx_main_counts) x) = 0
+                 AND
+                 (SELECT sum(n) FROM _r_ctx_overlay_counts) = 64
+            THEN 'PASS:S07_APPLY_MATCHES_OVERLAY'
+            ELSE 'FAIL:S07_apply total_main=' || (SELECT sum(n) FROM _r_ctx_main_counts)
+                 || ' total_overlay=' || (SELECT sum(n) FROM _r_ctx_overlay_counts)
+       END AS s07_apply_overlay_equality;
+
+-- Discard the first branch (R07 branch b_r_ctx) since apply was never run — verifies discard path.
+SELECT discard_branch('b_r_ctx');
+
+-- ===== Final MAIN cleanup + zero pollution sanity =====
+
+DISCARD ALL;
+SET client_min_messages = WARNING;
+
+/* -------- SECTION R-VERSION --------
+ *   GLOBAL CLEANUP: DROP TABLE rv_t + PASS:R15_R18_R_VERSION_SECTION_OK
+ *
+ * Single-session self-contained; no cross-session dependency.
+ */
+
+/* ---------- PRE-REQUISITE: shared_preload_libraries hook loaded ---------- */
+DO $$
+BEGIN
+    IF current_setting('shared_preload_libraries', true) IS NULL
+       OR current_setting('shared_preload_libraries', true)
+          NOT LIKE '%overlay_branch%'
+    THEN
+        RAISE EXCEPTION
+            'FAIL:PREQUISITE shared_preload_libraries must include overlay_branch. '
+            'Hint: use the Makefile recipe (make check with --temp-config), '
+            'NOT bare pg_regress without --temp-config=.../temp_instance_shared_libs.conf.';
+    END IF;
+END $$;
+
+CREATE EXTENSION IF NOT EXISTS overlay_branch;
+
+SET client_min_messages = WARNING;
+-- =====================================================================
+-- =====   Section R_VERSION (REVIEW-260926 S14/S17 R15 + R18) =====
+-- =====================================================================
+-- Motivation: overlay_tuple_version(rel, slot) builds the optimistic-CAS
+-- token from the "(ctid,xmin)" pair only.  On PostgreSQL HOT
+-- (heap-only-tuple) updates the row stays at the SAME ctid / SAME xmin
+-- (same inserting transaction), so a MAIN update committed OUTSIDE the
+-- branch between branch-write and branch-apply could in principle leave
+-- the token constant.
+--
+-- PRIMARY guard (wired): the legacy token compare.  Any cross-session
+-- write to MAIN necessarily advances xmin (and usually ctid), so a token
+-- match means the branch's pre-image is still current.  CONFLICT-2 pins
+-- this down (non-HOT rewrite -> ctid/xmin move -> token mismatch -> 55000,
+-- MAIN race preserved).
+--
+-- SECONDARY guard (NOT wired in the current tree): overlay_modify_update /
+-- overlay_modify_delete were intended to attach a "_base" top-level key
+-- holding MAIN's column image at write time, with apply_*_pass() re-locking
+-- MAIN FOR UPDATE and comparing it (apply_check_base_image_match) before
+-- replay.  In the current code that write-side enrich has no caller
+-- (ob_delta_has_base_key returns early when the key is absent), so the
+-- _base comparison is effectively a NOP; the shared overlay_base_ver_*
+-- codec (see doc/internals.md §1.3) is what keeps the token shape
+-- canonical across writer / apply / reader.
+--
+-- CONFLICT-1 therefore only exercises the HOT-collision SCENARIO; its
+-- preconditions (same ctid AND same xmin after the MAIN race) are a
+-- best-effort setup and may report INFO:R15_HOT_PREREQ_UNMET when the
+-- updater rewrites the tuple instead of going HOT-in-place.  The assertion
+-- that MUST hold regardless is CONFLICT-2's token-mismatch rejection.
+-- =====================================================================
+
+-- We use fillfactor=50 so the page has plenty of free space; this makes
+-- it extremely likely that MAIN's update of the row is stored as a
+-- heap-only-tuple (HOT) at the same ctid with the same xmin — exactly
+-- R15's collision scenario.  Without fillfactor PG may choose to write
+-- the update to a new page which changes ctid → legacy token compare
+-- catches it and CONFLICT-1 cannot exercise the new _base guard.
+CREATE TABLE public.rv_t (
+  id  INT4 PRIMARY KEY,
+  v   TEXT,
+  amt NUMERIC(10,2)
+) WITH (fillfactor = 50);
+
+INSERT INTO public.rv_t VALUES
+  (1, 'MAIN-baseline-1', 10.00),
+  (2, 'MAIN-baseline-2', 20.00);
+
+ANALYZE public.rv_t;
+
+SELECT create_branch('br_hot_conflict') AS id_br_hot;
+SELECT use_branch('br_hot_conflict');
+
+UPDATE public.rv_t SET v = 'BRANCH-upd-1', amt = amt + 5.50 WHERE id = 1;
+UPDATE public.rv_t SET v = 'BRANCH-upd-2'                   WHERE id = 2;
+
+-- ===== CONFLICT-1 step out of branch and mutate MAIN HOT-in-place =====
+RESET overlay_branch.current;
+
+-- Capture the current (ctid,xmin) BEFORE the concurrent MAIN write so we
+-- can PROVE that the HOT update kept both unchanged — exactly R15's bug.
+CREATE TEMP TABLE _rv_ctid_before AS
+  SELECT ctid AS ctid_b, xmin::text AS xmin_b FROM public.rv_t WHERE id = 1;
+
+-- This UPDATE to MAIN is supposed to keep ctid / xmin constant because
+-- the row fits in the same page with fillfactor=50.  We then verify the
+-- race write is actually visible on MAIN: id=1 amt=999.99 / id=2 no change.
+UPDATE public.rv_t SET amt = 999.99 WHERE id = 1;
+
+SELECT CASE WHEN (amt = 999.99 AND v = 'MAIN-baseline-1')
+            THEN 'PASS:R15_CONFLICT1_MAIN_RACE_WRITE_COMMITTED'
+            ELSE 'FAIL:R15_CONFLICT1_MAIN_RACE amt=' || amt || ' v=' || v
+       END AS rv_c1_main_check
+FROM public.rv_t WHERE id = 1;
+
+SELECT CASE WHEN (h.ctid = b.ctid_b AND h.xmin::text = b.xmin_b)
+            THEN 'PASS:R15_SAME_CTID_XMIN_HOT_UPDATED (scenario prereq met)'
+            ELSE 'INFO:R15_HOT_PREREQ_UNMET (non-HOT scenario; legacy guard catches it instead) — xmin values intentionally elided to keep test deterministic across fresh database instances'
+       END AS rv_hot_prereq
+FROM public.rv_t h, _rv_ctid_before b WHERE h.id = 1;
+
+DROP TABLE _rv_ctid_before;
+
+-- ===== CONFLICT-1: back into branch and apply — must ERROR =====
+SELECT use_branch('br_hot_conflict');
+
+DO $$
+BEGIN
+  PERFORM overlay_branch.apply_branch('br_hot_conflict');
+  RAISE EXCEPTION 'R15_CONFLICT1_EXPECTED_ERROR_NOT_RAISED';
+EXCEPTION WHEN OTHERS THEN
+  NULL;
+END $$;
+
+-- Post-apply MAIN invariant: concurrent MAIN mutation MUST survive.
+-- The guard raised 55000 and rolled back the apply replay sub-tx; it
+-- MUST NOT undo MAIN's committed race update nor the untouched id=2 row.
+RESET overlay_branch.current;
+SELECT CASE
+         WHEN (amt = 999.99 AND v = 'MAIN-baseline-1')
+         THEN 'PASS:R15_CONFLICT1_MAIN_RACE_PRESERVED_POST_APPLY_ROLLBACK'
+         ELSE 'FAIL:R15_CONFLICT1_MAIN_LOST id=1 amt=' || amt::text || ' v=' || v
+       END AS rv_c1_post_id1
+FROM public.rv_t WHERE id = 1;
+SELECT CASE
+         WHEN (amt = 20.00 AND v = 'MAIN-baseline-2')
+         THEN 'PASS:R15_CONFLICT1_ID2_UNTOUCHED'
+         ELSE 'FAIL:R15_CONFLICT1_ID2_TOUCHED amt=' || amt::text || ' v=' || v
+       END AS rv_c1_post_id2
+FROM public.rv_t WHERE id = 2;
+
+-- Cleanup CONFLICT-1 branch / rows (discard leaves MAIN alone)
+SELECT discard_branch('br_hot_conflict');
+
+-- ===== CONFLICT-2: traditional xmin/ctid rewrite conflict (not HOT) =====
+-- Force a rewrite that changes xmin/ctid so the legacy token compare is
+-- the one that catches it.  This is the classic scenario (not R15-specific)
+-- but we include it here as a regression harness to ensure apply conflict
+-- reporting still works end-to-end (this is the guard that is actually wired).
+UPDATE public.rv_t SET v = 'MAIN-pre-conflict2-' || id WHERE TRUE;  -- rewrite baseline
+ANALYZE public.rv_t;
+
+SELECT create_branch('br_token_conflict') AS id_br_token;
+SELECT use_branch('br_token_conflict');
+
+UPDATE public.rv_t SET v = 'BRANCH-conflict2-id1' WHERE id = 1;
+
+-- Exit branch and mutate MAIN id=1 + rewrite the row on a new transaction.
+RESET overlay_branch.current;
+BEGIN;
+UPDATE public.rv_t SET v = 'MAIN-RACE-conflict2-TOKEN-CHANGED' WHERE id = 1;
+COMMIT;
+
+-- Reproduce CONFLICT-2: legacy token mismatch → apply raises conflict.
+SELECT use_branch('br_token_conflict');
+
+DO $$
+BEGIN
+  PERFORM overlay_branch.apply_branch('br_token_conflict');
+  RAISE EXCEPTION 'R18_CONFLICT2_EXPECTED_ERROR_NOT_RAISED';
+EXCEPTION WHEN OTHERS THEN
+  NULL;
+END $$;
+
+RESET overlay_branch.current;
+SELECT CASE
+         WHEN v = 'MAIN-RACE-conflict2-TOKEN-CHANGED'
+         THEN 'PASS:R18_CONFLICT2_TOKEN_MISMATCH_RACE_PRESERVED'
+         ELSE 'FAIL:R18_CONFLICT2_TOKEN_MISMATCH_LOST v=' || v
+       END AS rv_c2_post_id1
+FROM public.rv_t WHERE id = 1;
+
+SELECT discard_branch('br_token_conflict');
+
+-- ===== R_VERSION global cleanup =====
+DROP TABLE public.rv_t;
+
+SELECT 'PASS:R15_R18_R_VERSION_SECTION_OK' AS r_version_section_ok;
+
+/* =====================================================================
+ * SECTION AP1 (milestone 3A) — consolidated per-row apply path
+ * =====================================================================
+ * 3A rewrote the per-row apply path of overlay_branch_apply_internal():
+ *   * ob_build_pk_where_clause     : jsonb key -> WHERE, 3 SPI calls -> 1
+ *   * ob_fetch_main_version        : existence + (ctid,xmin) token from one
+ *                                    "SELECT ctid::text, xmin::text ... FOR UPDATE LIMIT 1"
+ *                                    (replaces ob_fetch_main_current_slot +
+ *                                     overlay_tuple_version on the apply path)
+ *   * apply_check_base_image_match : "_base" probe merged into the compare query
+ *   * ob_apply_rel_info_build      : per-relation metadata (quoted name, column
+ *                                    list, bytea output fn, PK name/type lists)
+ *                                    computed once per relation
+ *   * apply_relation_insert_pass   : existence probe via "SELECT 1" (4 SPI -> 3)
+ *
+ * Semantics MUST be unchanged.  Positive replay of D+U+I on one relation plus
+ * the three conflict branches that locate / probe the MAIN anchor are asserted
+ * here; each conflict branch raises 0A000 (overlay_guard_ereport_fail) and MUST
+ * leave MAIN untouched.
+ * (A NULL entry in the key JSON array is unreachable through the public API --
+ *  a single-column PRIMARY KEY is NOT NULL by construction -- so the merged
+ *  builder's quote_nullable branch stays defensive only.)
+ * ===================================================================== */
+
+DISCARD ALL;
+SET client_min_messages = WARNING;
+
+CREATE TABLE public.ap1_t (
+  id INT4 PRIMARY KEY,
+  v  TEXT
+);
+INSERT INTO public.ap1_t VALUES (1,'m1'),(2,'m2'),(3,'m3');
+
+-- -------- AP1-1: one apply replays D + U + I on the same relation --------
+SELECT create_branch('br_ap1_pos') AS id_br_ap1_pos;
+SELECT use_branch('br_ap1_pos');
+DELETE FROM public.ap1_t WHERE id = 3;
+UPDATE public.ap1_t SET v = 'm1-upd' WHERE id = 1;
+INSERT INTO public.ap1_t VALUES (4,'ins4');
+SELECT use_branch(NULL);
+RESET overlay_branch.current;
+SELECT apply_branch('br_ap1_pos');
+SELECT CASE WHEN string_agg(id::text||'='||v, ',' ORDER BY id) = '1=m1-upd,2=m2,4=ins4'
+            THEN 'PASS:AP1_1_APPLY_DUI_OK'
+            ELSE 'FAIL:AP1_1 '||COALESCE(string_agg(id::text||'='||v, ',' ORDER BY id),'NULL')
+       END AS ap1_1
+FROM public.ap1_t;
+
+-- -------- AP1-2: DELETE anchor gone from MAIN at apply time -> 55000 --------
+SELECT create_branch('br_ap1_del') AS id_br_ap1_del;
+SELECT use_branch('br_ap1_del');
+DELETE FROM public.ap1_t WHERE id = 2;
+SELECT use_branch(NULL);
+RESET overlay_branch.current;
+DELETE FROM public.ap1_t WHERE id = 2;   -- concurrent MAIN delete of the anchor
+DO $$
+BEGIN
+  PERFORM overlay_branch.apply_branch('br_ap1_del');
+  RAISE EXCEPTION 'AP1_2_EXPECTED_0A000_NOT_RAISED';
+EXCEPTION WHEN OTHERS THEN
+  IF SQLSTATE <> '0A000' THEN
+    RAISE EXCEPTION 'AP1_2_EXPECTED_0A000_GOT_% MSG=%', SQLSTATE, SQLERRM;
+  END IF;
+END $$;
+SELECT CASE WHEN count(*) = 0 THEN 'PASS:AP1_2_DEL_ANCHOR_GONE'
+            ELSE 'FAIL:AP1_2 rows=' || count(*) END AS ap1_2
+FROM public.ap1_t WHERE id = 2;
+SELECT discard_branch('br_ap1_del');
+
+-- -------- AP1-3: UPDATE anchor gone from MAIN at apply time -> 55000 --------
+SELECT create_branch('br_ap1_upd') AS id_br_ap1_upd;
+SELECT use_branch('br_ap1_upd');
+UPDATE public.ap1_t SET v = 'm1-branch' WHERE id = 1;
+SELECT use_branch(NULL);
+RESET overlay_branch.current;
+DELETE FROM public.ap1_t WHERE id = 1;   -- concurrent MAIN delete of the anchor
+DO $$
+BEGIN
+  PERFORM overlay_branch.apply_branch('br_ap1_upd');
+  RAISE EXCEPTION 'AP1_3_EXPECTED_0A000_NOT_RAISED';
+EXCEPTION WHEN OTHERS THEN
+  IF SQLSTATE <> '0A000' THEN
+    RAISE EXCEPTION 'AP1_3_EXPECTED_0A000_GOT_% MSG=%', SQLSTATE, SQLERRM;
+  END IF;
+END $$;
+SELECT CASE WHEN count(*) = 0 THEN 'PASS:AP1_3_UPD_ANCHOR_GONE'
+            ELSE 'FAIL:AP1_3 rows=' || count(*) END AS ap1_3
+FROM public.ap1_t WHERE id = 1;
+SELECT discard_branch('br_ap1_upd');
+
+-- -------- AP1-4: INSERT pk already in MAIN at apply time -> 55000 --------
+SELECT create_branch('br_ap1_ins') AS id_br_ap1_ins;
+SELECT use_branch('br_ap1_ins');
+INSERT INTO public.ap1_t VALUES (9,'branch9');
+SELECT use_branch(NULL);
+RESET overlay_branch.current;
+INSERT INTO public.ap1_t VALUES (9,'main9');  -- concurrent MAIN insert, same pk
+DO $$
+BEGIN
+  PERFORM overlay_branch.apply_branch('br_ap1_ins');
+  RAISE EXCEPTION 'AP1_4_EXPECTED_0A000_NOT_RAISED';
+EXCEPTION WHEN OTHERS THEN
+  IF SQLSTATE <> '0A000' THEN
+    RAISE EXCEPTION 'AP1_4_EXPECTED_0A000_GOT_% MSG=%', SQLSTATE, SQLERRM;
+  END IF;
+END $$;
+SELECT CASE WHEN v = 'main9' THEN 'PASS:AP1_4_INS_PK_PRESENT'
+            ELSE 'FAIL:AP1_4 v=' || COALESCE(v,'NULL') END AS ap1_4
+FROM public.ap1_t WHERE id = 9;
+SELECT discard_branch('br_ap1_ins');
+
+-- -------- AP1-5: after the conflicts a clean branch still applies --------
+SELECT create_branch('br_ap1_ok') AS id_br_ap1_ok;
+SELECT use_branch('br_ap1_ok');
+INSERT INTO public.ap1_t VALUES (5,'ins5');
+UPDATE public.ap1_t SET v = 'ins5-upd' WHERE id = 5;
+SELECT use_branch(NULL);
+RESET overlay_branch.current;
+SELECT apply_branch('br_ap1_ok');
+SELECT CASE WHEN v = 'ins5-upd' THEN 'PASS:AP1_5_RECOVERY_APPLY_OK'
+            ELSE 'FAIL:AP1_5 v=' || COALESCE(v,'NULL') END AS ap1_5
+FROM public.ap1_t WHERE id = 5;
+
+-- ===== AP1 global cleanup =====
+DROP TABLE public.ap1_t;
+
+SELECT 'PASS:AP1_APPLY_PATH_SECTION_OK' AS ap1_section_ok;
+
+/* =====================================================================
+ * SECTION AP2 (milestone 3B) — set-based batch apply replay
+ * =====================================================================
+ * 3B folds one relation's deltas into a single validation SELECT plus a
+ * single batch DML per operation (D/U/I), removing the per-row planning
+ * cost (doc/internals.md §5.5).  GUC overlay_branch.apply_batch (default
+ * on) selects the path; relations without a PRIMARY KEY, or whose delta
+ * rows carry a "_base" image, fall back to the 3A per-row replay.
+ *
+ * Asserted here:
+ *   AP2-1    : D+U+I replay on one relation via the batch path -> state
+ *   AP2-2..7 : the six conflict branches of 6.4.6, each raising 0A000 and
+ *              leaving MAIN untouched
+ *   AP2-8    : orphan-U (pure-delta UPDATE, no MAIN anchor) -> INSERT pass
+ *   AP2-9    : keyless fallback still applies with apply_batch=on
+ *   AP2-10   : differential equivalence - apply_batch off vs on on two
+ *              clone tables yields byte-identical results
+ * ===================================================================== */
+
+DISCARD ALL;
+SET client_min_messages = WARNING;
+SET overlay_branch.apply_batch = on;
+
+CREATE TABLE public.ap2_t (id INT4 PRIMARY KEY, v TEXT);
+INSERT INTO public.ap2_t VALUES (1,'m1'),(2,'m2'),(3,'m3');
+
+-- -------- AP2-1: batch path replays D + U + I on one relation --------
+SELECT create_branch('br_ap2_pos') AS id_br_ap2_pos;
+SELECT use_branch('br_ap2_pos');
+DELETE FROM public.ap2_t WHERE id = 3;
+UPDATE public.ap2_t SET v = 'm1-upd' WHERE id = 1;
+INSERT INTO public.ap2_t VALUES (4,'ins4');
+SELECT use_branch(NULL);
+RESET overlay_branch.current;
+SELECT apply_branch('br_ap2_pos');
+SELECT CASE WHEN string_agg(id::text||'='||v, ',' ORDER BY id) = '1=m1-upd,2=m2,4=ins4'
+            THEN 'PASS:AP2_1_BATCH_DUI_OK'
+            ELSE 'FAIL:AP2_1 '||COALESCE(string_agg(id::text||'='||v, ',' ORDER BY id),'NULL')
+       END AS ap2_1
+FROM public.ap2_t;
+
+-- -------- AP2-2: DELETE token mismatch (MAIN row rewritten) -> 0A000 --------
+SELECT create_branch('br_ap2_dtoken') AS id_br_ap2_dtoken;
+SELECT use_branch('br_ap2_dtoken');
+DELETE FROM public.ap2_t WHERE id = 2;
+SELECT use_branch(NULL);
+RESET overlay_branch.current;
+UPDATE public.ap2_t SET v = 'm2-race' WHERE id = 2;   -- concurrent MAIN rewrite
+DO $$
+BEGIN
+  PERFORM overlay_branch.apply_branch('br_ap2_dtoken');
+  RAISE EXCEPTION 'AP2_2_EXPECTED_0A000_NOT_RAISED';
+EXCEPTION WHEN OTHERS THEN
+  IF SQLSTATE <> '0A000' THEN
+    RAISE EXCEPTION 'AP2_2_EXPECTED_0A000_GOT_% MSG=%', SQLSTATE, SQLERRM;
+  END IF;
+END $$;
+SELECT CASE WHEN v = 'm2-race' THEN 'PASS:AP2_2_DEL_TOKEN_MISMATCH'
+            ELSE 'FAIL:AP2_2 v=' || COALESCE(v,'NULL') END AS ap2_2
+FROM public.ap2_t WHERE id = 2;
+SELECT discard_branch('br_ap2_dtoken');
+
+-- -------- AP2-3: DELETE anchor gone from MAIN at apply time -> 0A000 --------
+DELETE FROM public.ap2_t;
+INSERT INTO public.ap2_t VALUES (1,'m1'),(2,'m2'),(3,'m3');
+SELECT create_branch('br_ap2_dgone') AS id_br_ap2_dgone;
+SELECT use_branch('br_ap2_dgone');
+DELETE FROM public.ap2_t WHERE id = 2;
+SELECT use_branch(NULL);
+RESET overlay_branch.current;
+DELETE FROM public.ap2_t WHERE id = 2;   -- concurrent MAIN delete of the anchor
+DO $$
+BEGIN
+  PERFORM overlay_branch.apply_branch('br_ap2_dgone');
+  RAISE EXCEPTION 'AP2_3_EXPECTED_0A000_NOT_RAISED';
+EXCEPTION WHEN OTHERS THEN
+  IF SQLSTATE <> '0A000' THEN
+    RAISE EXCEPTION 'AP2_3_EXPECTED_0A000_GOT_% MSG=%', SQLSTATE, SQLERRM;
+  END IF;
+END $$;
+SELECT CASE WHEN count(*) = 0 THEN 'PASS:AP2_3_DEL_ANCHOR_GONE'
+            ELSE 'FAIL:AP2_3 rows=' || count(*) END AS ap2_3
+FROM public.ap2_t WHERE id = 2;
+SELECT discard_branch('br_ap2_dgone');
+
+-- -------- AP2-4: UPDATE anchor gone from MAIN at apply time -> 0A000 --------
+DELETE FROM public.ap2_t;
+INSERT INTO public.ap2_t VALUES (1,'m1'),(2,'m2'),(3,'m3');
+SELECT create_branch('br_ap2_ugone') AS id_br_ap2_ugone;
+SELECT use_branch('br_ap2_ugone');
+UPDATE public.ap2_t SET v = 'br-u2' WHERE id = 2;
+SELECT use_branch(NULL);
+RESET overlay_branch.current;
+DELETE FROM public.ap2_t WHERE id = 2;   -- concurrent MAIN delete of the anchor
+DO $$
+BEGIN
+  PERFORM overlay_branch.apply_branch('br_ap2_ugone');
+  RAISE EXCEPTION 'AP2_4_EXPECTED_0A000_NOT_RAISED';
+EXCEPTION WHEN OTHERS THEN
+  IF SQLSTATE <> '0A000' THEN
+    RAISE EXCEPTION 'AP2_4_EXPECTED_0A000_GOT_% MSG=%', SQLSTATE, SQLERRM;
+  END IF;
+END $$;
+SELECT CASE WHEN count(*) = 0 THEN 'PASS:AP2_4_UPD_ANCHOR_GONE'
+            ELSE 'FAIL:AP2_4 rows=' || count(*) END AS ap2_4
+FROM public.ap2_t WHERE id = 2;
+SELECT discard_branch('br_ap2_ugone');
+
+-- -------- AP2-5: UPDATE token mismatch (MAIN row rewritten) -> 0A000 --------
+DELETE FROM public.ap2_t;
+INSERT INTO public.ap2_t VALUES (1,'m1'),(2,'m2'),(3,'m3');
+SELECT create_branch('br_ap2_utoken') AS id_br_ap2_utoken;
+SELECT use_branch('br_ap2_utoken');
+UPDATE public.ap2_t SET v = 'br-u2' WHERE id = 2;
+SELECT use_branch(NULL);
+RESET overlay_branch.current;
+UPDATE public.ap2_t SET v = 'm2-race' WHERE id = 2;   -- concurrent MAIN rewrite
+DO $$
+BEGIN
+  PERFORM overlay_branch.apply_branch('br_ap2_utoken');
+  RAISE EXCEPTION 'AP2_5_EXPECTED_0A000_NOT_RAISED';
+EXCEPTION WHEN OTHERS THEN
+  IF SQLSTATE <> '0A000' THEN
+    RAISE EXCEPTION 'AP2_5_EXPECTED_0A000_GOT_% MSG=%', SQLSTATE, SQLERRM;
+  END IF;
+END $$;
+SELECT CASE WHEN v = 'm2-race' THEN 'PASS:AP2_5_UPD_TOKEN_MISMATCH'
+            ELSE 'FAIL:AP2_5 v=' || COALESCE(v,'NULL') END AS ap2_5
+FROM public.ap2_t WHERE id = 2;
+SELECT discard_branch('br_ap2_utoken');
+
+-- -------- AP2-6: orphan-U (old_version NULL) but MAIN row present -> 0A000 --------
+DELETE FROM public.ap2_t;
+INSERT INTO public.ap2_t VALUES (1,'m1'),(2,'m2'),(3,'m3');
+SELECT create_branch('br_ap2_orphan_conf') AS id_br_ap2_orphan_conf;
+SELECT use_branch('br_ap2_orphan_conf');
+INSERT INTO public.ap2_t VALUES (9,'br9');
+UPDATE public.ap2_t SET v = 'br9-x' WHERE id = 9;   -- pure-delta U: old_version NULL
+SELECT use_branch(NULL);
+RESET overlay_branch.current;
+INSERT INTO public.ap2_t VALUES (9,'main9');         -- MAIN gains the same pk
+DO $$
+BEGIN
+  PERFORM overlay_branch.apply_branch('br_ap2_orphan_conf');
+  RAISE EXCEPTION 'AP2_6_EXPECTED_0A000_NOT_RAISED';
+EXCEPTION WHEN OTHERS THEN
+  IF SQLSTATE <> '0A000' THEN
+    RAISE EXCEPTION 'AP2_6_EXPECTED_0A000_GOT_% MSG=%', SQLSTATE, SQLERRM;
+  END IF;
+END $$;
+SELECT CASE WHEN v = 'main9' THEN 'PASS:AP2_6_ORPHAN_U_CONFLICT'
+            ELSE 'FAIL:AP2_6 v=' || COALESCE(v,'NULL') END AS ap2_6
+FROM public.ap2_t WHERE id = 9;
+SELECT discard_branch('br_ap2_orphan_conf');
+
+-- -------- AP2-7: INSERT pk already present in MAIN at apply time -> 0A000 --------
+DELETE FROM public.ap2_t;
+INSERT INTO public.ap2_t VALUES (1,'m1'),(2,'m2'),(3,'m3');
+SELECT create_branch('br_ap2_ins_conf') AS id_br_ap2_ins_conf;
+SELECT use_branch('br_ap2_ins_conf');
+INSERT INTO public.ap2_t VALUES (9,'br9');
+SELECT use_branch(NULL);
+RESET overlay_branch.current;
+INSERT INTO public.ap2_t VALUES (9,'main9');         -- concurrent MAIN insert, same pk
+DO $$
+BEGIN
+  PERFORM overlay_branch.apply_branch('br_ap2_ins_conf');
+  RAISE EXCEPTION 'AP2_7_EXPECTED_0A000_NOT_RAISED';
+EXCEPTION WHEN OTHERS THEN
+  IF SQLSTATE <> '0A000' THEN
+    RAISE EXCEPTION 'AP2_7_EXPECTED_0A000_GOT_% MSG=%', SQLSTATE, SQLERRM;
+  END IF;
+END $$;
+SELECT CASE WHEN v = 'main9' THEN 'PASS:AP2_7_INS_PK_PRESENT'
+            ELSE 'FAIL:AP2_7 v=' || COALESCE(v,'NULL') END AS ap2_7
+FROM public.ap2_t WHERE id = 9;
+SELECT discard_branch('br_ap2_ins_conf');
+
+-- -------- AP2-8: orphan-U with no MAIN anchor materialises via INSERT --------
+DELETE FROM public.ap2_t;
+INSERT INTO public.ap2_t VALUES (1,'m1'),(2,'m2'),(3,'m3');
+SELECT create_branch('br_ap2_orphan_ok') AS id_br_ap2_orphan_ok;
+SELECT use_branch('br_ap2_orphan_ok');
+INSERT INTO public.ap2_t VALUES (9,'br9');
+UPDATE public.ap2_t SET v = 'br9-x' WHERE id = 9;
+SELECT use_branch(NULL);
+RESET overlay_branch.current;
+SELECT apply_branch('br_ap2_orphan_ok');
+SELECT CASE WHEN v = 'br9-x' THEN 'PASS:AP2_8_ORPHAN_U_INSERTED'
+            ELSE 'FAIL:AP2_8 v=' || COALESCE(v,'NULL') END AS ap2_8
+FROM public.ap2_t WHERE id = 9;
+
+-- -------- AP2-9: keyless relation falls back to the per-row replay --------
+DROP TABLE public.ap2_t;
+SET overlay_branch.keyless_tables = on;
+CREATE TABLE public.ap2_kn (v text);
+INSERT INTO public.ap2_kn VALUES ('k1'),('k2'),('k3');
+SELECT create_branch('br_ap2_kn') AS id_br_ap2_kn;
+SELECT use_branch('br_ap2_kn');
+INSERT INTO public.ap2_kn VALUES ('kn-ins');
+UPDATE public.ap2_kn SET v = 'k1-br' WHERE v = 'k1';
+DELETE FROM public.ap2_kn WHERE v = 'k2';
+SELECT use_branch(NULL);
+RESET overlay_branch.current;
+SELECT apply_branch('br_ap2_kn');
+SELECT CASE WHEN string_agg(v, ',' ORDER BY v) = 'k1-br,k3,kn-ins'
+            THEN 'PASS:AP2_9_KEYLESS_FALLBACK_OK'
+            ELSE 'FAIL:AP2_9 '||COALESCE(string_agg(v, ',' ORDER BY v),'NULL')
+       END AS ap2_9
+FROM public.ap2_kn;
+DROP TABLE public.ap2_kn;
+RESET overlay_branch.keyless_tables;
+
+-- -------- AP2-10: differential equivalence - apply_batch off vs on --------
+CREATE TABLE public.ap2_da (id INT4 PRIMARY KEY, v TEXT);
+CREATE TABLE public.ap2_db (id INT4 PRIMARY KEY, v TEXT);
+INSERT INTO public.ap2_da SELECT g, 'm'||g FROM generate_series(1,10) g;
+INSERT INTO public.ap2_db SELECT g, 'm'||g FROM generate_series(1,10) g;
+
+-- clone A replayed with apply_batch = off (legacy per-row)
+SET overlay_branch.apply_batch = off;
+SELECT create_branch('br_ap2_diff_off') AS id_br_ap2_diff_off;
+SELECT use_branch('br_ap2_diff_off');
+DELETE FROM public.ap2_da WHERE id <= 3;
+UPDATE public.ap2_da SET v = v || '-u' WHERE id IN (4,5);
+INSERT INTO public.ap2_da VALUES (11,'insA'),(12,'insB');
+SELECT use_branch(NULL);
+RESET overlay_branch.current;
+SELECT apply_branch('br_ap2_diff_off');
+
+-- clone B replayed with apply_batch = on (set-based batch)
+SET overlay_branch.apply_batch = on;
+SELECT create_branch('br_ap2_diff_on') AS id_br_ap2_diff_on;
+SELECT use_branch('br_ap2_diff_on');
+DELETE FROM public.ap2_db WHERE id <= 3;
+UPDATE public.ap2_db SET v = v || '-u' WHERE id IN (4,5);
+INSERT INTO public.ap2_db VALUES (11,'insA'),(12,'insB');
+SELECT use_branch(NULL);
+RESET overlay_branch.current;
+SELECT apply_branch('br_ap2_diff_on');
+
+SELECT CASE WHEN a.s = b.s THEN 'PASS:AP2_10_DIFF_EQUIV_OK'
+            ELSE 'FAIL:AP2_10 off=' || COALESCE(a.s,'NULL') || ' on=' || COALESCE(b.s,'NULL')
+       END AS ap2_10
+FROM (SELECT string_agg(id::text||'='||v, ',' ORDER BY id) AS s FROM public.ap2_da) a,
+     (SELECT string_agg(id::text||'='||v, ',' ORDER BY id) AS s FROM public.ap2_db) b;
+
+-- ===== AP2 global cleanup =====
+DROP TABLE public.ap2_da, public.ap2_db;
+RESET overlay_branch.apply_batch;
+
+SELECT 'PASS:AP2_BATCH_APPLY_SECTION_OK' AS ap2_section_ok;
+

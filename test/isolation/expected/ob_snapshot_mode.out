@@ -1,0 +1,73 @@
+Parsed test spec with 4 sessions
+
+starting permutation: ctrl_setup s1_snap_use s1_r1 s2_insert_main s1_r2 s3_insert_delta s1_r3 s1_live_use s1_r_live
+step ctrl_setup: 
+    SELECT overlay_branch.create_branch('bs_snap');
+    SELECT overlay_branch.use_branch('bs_snap', 'live');
+    INSERT INTO public.t8_snap VALUES (101, 'd1'), (102, 'd2');
+    COMMIT;
+    RESET overlay_branch.current;
+
+create_branch
+-------------
+            6
+(1 row)
+
+use_branch
+----------
+          
+(1 row)
+
+ctrl: WARNING:  there is no transaction in progress
+step s1_snap_use: SELECT overlay_branch.use_branch('bs_snap', 'snapshot');
+use_branch
+----------
+          
+(1 row)
+
+step s1_r1: SELECT count(*) AS c1 FROM public.t8_snap;
+ c1
+---
+102
+(1 row)
+
+step s2_insert_main: 
+    RESET overlay_branch.current;
+    INSERT INTO public.t8_snap VALUES (999, 'main_new_after_snap');
+
+step s1_r2: SELECT count(*) AS c2 FROM public.t8_snap;
+ c2
+---
+102
+(1 row)
+
+step s3_insert_delta: 
+    SELECT overlay_branch.use_branch('bs_snap', 'live');
+    INSERT INTO public.t8_snap VALUES (103, 'delta_new_visible');
+    COMMIT;
+    RESET overlay_branch.current;
+
+use_branch
+----------
+          
+(1 row)
+
+s3: WARNING:  there is no transaction in progress
+step s1_r3: SELECT count(*) AS c3 FROM public.t8_snap;
+ c3
+---
+103
+(1 row)
+
+step s1_live_use: SELECT overlay_branch.use_branch('bs_snap', 'live');
+use_branch
+----------
+          
+(1 row)
+
+step s1_r_live: SELECT count(*) AS c4 FROM public.t8_snap;
+ c4
+---
+104
+(1 row)
+

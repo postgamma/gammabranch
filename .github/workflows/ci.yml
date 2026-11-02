@@ -1,0 +1,65 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  build-and-test:
+    name: PG17 build + L3/L1 regression
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Add PostgreSQL APT repository
+        run: |
+          sudo install -d /usr/share/postgresql-common/pgdg
+          sudo curl -fsSL -o /usr/share/postgresql-common/pgdg/apt.postgresql.org.asc \
+            https://www.postgresql.org/media/keys/ACCC4CF8.asc
+          . /etc/os-release
+          echo "deb [signed-by=/usr/share/postgresql-common/pgdg/apt.postgresql.org.asc] \
+            https://apt.postgresql.org/pub/repos/apt ${VERSION_CODENAME}-pgdg main" \
+            | sudo tee /etc/apt/sources.list.d/pgdg.list
+          sudo apt-get update
+
+      - name: Install PostgreSQL 17 and server dev headers
+        run: sudo apt-get install -y postgresql-17 postgresql-server-dev-17
+
+      - name: Build (PGXS, out-of-tree)
+        run: make -j"$(nproc)" USE_PGXS=1 PG_CONFIG=/usr/lib/postgresql/17/bin/pg_config
+
+      - name: Install extension
+        run: sudo make USE_PGXS=1 PG_CONFIG=/usr/lib/postgresql/17/bin/pg_config install
+
+      - name: Init throw-away instance with shared_preload_libraries
+        run: |
+          export PATH="/usr/lib/postgresql/17/bin:$PATH"
+          PGDATA="$RUNNER_TEMP/pgdata"
+          initdb -D "$PGDATA" -U postgres --locale=C.UTF-8 -E UTF8
+          {
+            echo "shared_preload_libraries = 'overlay_branch'"
+            echo "unix_socket_directories = '/tmp'"
+            echo "port = 55432"
+          } >> "$PGDATA/postgresql.conf"
+          pg_ctl -D "$PGDATA" -l "$RUNNER_TEMP/pg.log" -w start
+          echo "PGDATA=$PGDATA" >> "$GITHUB_ENV"
+
+      - name: Run L3 (pg_regress) + L1 (pg_isolation_regress)
+        env:
+          PGHOST: /tmp
+          PGPORT: "55432"
+          PGUSER: postgres
+        run: make USE_PGXS=1 PG_CONFIG=/usr/lib/postgresql/17/bin/pg_config installcheck
+
+      - name: Show regression diffs on failure
+        if: failure()
+        run: |
+          find . -name 'regression.diffs' -o -name 'regression.out' | while read -r f; do
+            echo "===== $f ====="; cat "$f"
+          done || true
+
+      - name: Show server log on failure
+        if: failure()
+        run: tail -n 200 "$RUNNER_TEMP/pg.log" || true

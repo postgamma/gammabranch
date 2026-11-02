@@ -1,0 +1,93 @@
+Parsed test spec with 3 sessions
+
+starting permutation: ctrl_p1_setup s_counter_p1_use s_counter_p1_r1 s_apply_p1 s_counter_p1_r2 s_counter_p1_r3
+step ctrl_p1_setup: 
+    SELECT overlay_branch.create_branch('bs_inval_p1');
+    SELECT overlay_branch.use_branch('bs_inval_p1', 'live');
+    INSERT INTO public.t8_inval VALUES (101, 'd1'), (102, 'd2');
+    COMMIT;
+    RESET overlay_branch.current;
+
+create_branch
+-------------
+            3
+(1 row)
+
+use_branch
+----------
+          
+(1 row)
+
+ctrl: WARNING:  there is no transaction in progress
+step s_counter_p1_use: SELECT overlay_branch.use_branch('bs_inval_p1', 'live');
+use_branch
+----------
+          
+(1 row)
+
+step s_counter_p1_r1: SELECT count(*) AS c FROM public.t8_inval;
+  c
+---
+102
+(1 row)
+
+step s_apply_p1: SELECT overlay_branch.apply_branch('bs_inval_p1');
+apply_branch
+------------
+            
+(1 row)
+
+step s_counter_p1_r2: SELECT count(*) AS c FROM public.t8_inval;
+  c
+---
+102
+(1 row)
+
+step s_counter_p1_r3: INSERT INTO public.t8_inval VALUES (901, 'kick_p1');
+ERROR:  overlay_branch: branch "bs_inval_p1" is no longer active (state=applied); cannot write through it
+
+starting permutation: ctrl_p2_setup s_counter_p2_use s_counter_p2_r1 s_counter_p2_r2 s_apply_p2 s_counter_p2_r3
+step ctrl_p2_setup: 
+    SELECT overlay_branch.create_branch('bs_inval_p2');
+    SELECT overlay_branch.use_branch('bs_inval_p2', 'live');
+    INSERT INTO public.t8_inval VALUES (103, 'd3'), (104, 'd4');
+    COMMIT;
+    RESET overlay_branch.current;
+
+create_branch
+-------------
+            4
+(1 row)
+
+use_branch
+----------
+          
+(1 row)
+
+ctrl: WARNING:  there is no transaction in progress
+step s_counter_p2_use: SELECT overlay_branch.use_branch('bs_inval_p2', 'live');
+use_branch
+----------
+          
+(1 row)
+
+step s_counter_p2_r1: SELECT count(*) AS c FROM public.t8_inval;
+  c
+---
+102
+(1 row)
+
+step s_counter_p2_r2: SELECT count(*) AS c FROM public.t8_inval;
+  c
+---
+102
+(1 row)
+
+step s_apply_p2: SELECT overlay_branch.apply_branch('bs_inval_p2');
+apply_branch
+------------
+            
+(1 row)
+
+step s_counter_p2_r3: INSERT INTO public.t8_inval VALUES (902, 'kick_p2');
+ERROR:  overlay_branch: branch "bs_inval_p2" is no longer active (state=applied); cannot write through it

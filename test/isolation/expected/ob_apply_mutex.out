@@ -1,0 +1,103 @@
+Parsed test spec with 3 sessions
+
+starting permutation: ctrl_p1_setup s1_p1_begin s1_p1_use s2_p1_begin s2_p1_use s1_p1_apply s2_p1_apply s1_p1_commit s2_p1_commit ctrl_p1_state
+step ctrl_p1_setup: 
+    SELECT overlay_branch.create_branch('bs_mutex_p1');
+    SELECT overlay_branch.use_branch('bs_mutex_p1', 'live');
+    INSERT INTO public.t8_mutex VALUES (1001, 'd1'), (1002, 'd2');
+    COMMIT;
+    RESET overlay_branch.current;
+
+create_branch
+-------------
+            1
+(1 row)
+
+use_branch
+----------
+          
+(1 row)
+
+ctrl: WARNING:  there is no transaction in progress
+step s1_p1_begin: BEGIN;
+step s1_p1_use: SELECT overlay_branch.use_branch('bs_mutex_p1', 'live');
+use_branch
+----------
+          
+(1 row)
+
+step s2_p1_begin: BEGIN;
+step s2_p1_use: SELECT overlay_branch.use_branch('bs_mutex_p1', 'live');
+use_branch
+----------
+          
+(1 row)
+
+step s1_p1_apply: SELECT overlay_branch.apply_branch('bs_mutex_p1');
+apply_branch
+------------
+            
+(1 row)
+
+step s2_p1_apply: SELECT overlay_branch.apply_branch('bs_mutex_p1'); <waiting ...>
+step s1_p1_commit: COMMIT;
+step s2_p1_apply: <... completed>
+ERROR:  overlay_branch: apply_branch("bs_mutex_p1") CAS state transition refused (SPI_processed=0 != 1); branch no longer ACTIVE)
+step s2_p1_commit: COMMIT;
+step ctrl_p1_state: SELECT state FROM overlay_branch.pg_branch WHERE branch_name='bs_mutex_p1';
+state  
+-------
+applied
+(1 row)
+
+
+starting permutation: ctrl_p2_setup s1_p2_begin s1_p2_use s1_p2_apply s2_p2_begin s2_p2_use s2_p2_apply s1_p2_commit s2_p2_commit ctrl_p2_state
+step ctrl_p2_setup: 
+    SELECT overlay_branch.create_branch('bs_mutex_p2');
+    SELECT overlay_branch.use_branch('bs_mutex_p2', 'live');
+    INSERT INTO public.t8_mutex VALUES (1003, 'd3'), (1004, 'd4');
+    COMMIT;
+    RESET overlay_branch.current;
+
+create_branch
+-------------
+            2
+(1 row)
+
+use_branch
+----------
+          
+(1 row)
+
+ctrl: WARNING:  there is no transaction in progress
+step s1_p2_begin: BEGIN;
+step s1_p2_use: SELECT overlay_branch.use_branch('bs_mutex_p2', 'live');
+use_branch
+----------
+          
+(1 row)
+
+step s1_p2_apply: SELECT overlay_branch.apply_branch('bs_mutex_p2');
+apply_branch
+------------
+            
+(1 row)
+
+step s2_p2_begin: BEGIN;
+step s2_p2_use: SELECT overlay_branch.use_branch('bs_mutex_p2', 'live');
+use_branch
+----------
+          
+(1 row)
+
+step s2_p2_apply: SELECT overlay_branch.apply_branch('bs_mutex_p2'); <waiting ...>
+step s1_p2_commit: COMMIT;
+step s2_p2_apply: <... completed>
+ERROR:  overlay_branch: apply_branch("bs_mutex_p2") CAS state transition refused (SPI_processed=0 != 1); branch no longer ACTIVE)
+step s2_p2_commit: COMMIT;
+step ctrl_p2_state: SELECT state FROM overlay_branch.pg_branch WHERE branch_name='bs_mutex_p2';
+state  
+-------
+applied
+(1 row)
+

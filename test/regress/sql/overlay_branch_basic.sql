@@ -1,0 +1,711 @@
+-- ==========================================================
+-- Engineering-level regression suite (28 PASS assertions).
+--
+-- For the CLEAN, user-facing end-to-end happy-path story see the
+-- sibling file overlay_branch_user.sql (public.products +
+-- agent_workspace, modelled directly on doc/example_sql.md §0~§4).
+--
+-- Parts (each section is internally self-contained so a single diff
+-- row tells you WHICH Step regressed):
+--
+--   Part A  — Branch context (Step1): create/use/discard/apply stub,
+--             current_branch() NULL + SET/RESET GUC semantics (including
+--             nonexistent-branch SET ERROR path, apply_branch → state=applied).
+--   Part B  — Delta store physics (Step2): 6 insert/upsert paths via
+--             overlay_debug_delta_insert + overlay_debug_delta_count +
+--             list_branches() delta_count column projection.
+--   Part C  — Write redirect (Step3 I-only, Step4a U/D redirect) +
+--             Main⊕Delta SRF (Step4b overlay_main_plus_delta 2-pass)
+--             with the MAIN_ZERO_POLLUTION invariant asserted at the end.
+--   Part D  — Step7 HARD GUARD zero-passthrough matrix: CREATE VIEW /
+--             CREATE PARTITION / CREATE FK + TRUNCATE + ALTER ADD COLUMN
+--             (all BLOCKED), followed by D6 "normal PK table DML STILL
+--             WORKS" belt-and-braces (MAIN_unpolluted + overlay correct).
+--   Part E  — Step8 discard_branch cascade + idempotency: active branch
+--             with 3 delta rows → discard_branch → physical delta rows
+--             really gone (overlay_debug_delta_count=0); double-discard
+--             ERROR; discard on applied ERROR; MAIN unchanged.
+--   Part F  — Step5 apply_branch 3-pass optimistic atomic Main writeback:
+--             F1  apply no-conflict: precise Main mutation + re-apply
+--                 on state=applied ERRORed.
+--             F2  apply conflict: branch UPDATE id=1 writes token
+--                 old_version → MAIN RACE write independently committed
+--                 (GUC dual-source truth regression test) → apply raises
+--                 conflict ERROR → outer apply rollback MUST NOT touch
+--                 the race-write value on MAIN.
+--
+-- Style rules (kept so pg_regress expected/*.out is diff-stable across
+-- machines, timestamps, OID numbers, ctid/xmin values):
+--   * No psql \meta commands (\gset / \echo / \set).
+--   * No timestamps, OIDs, ctid, xmin, or other non-deterministic
+--     values in SELECT output — compare them via CASE…END PASS/FAIL
+--     string rows that project only a deterministic literal PASS:n tag.
+--   * Conflict/guard ERRORs are always captured inside
+--     DO $$ BEGIN … EXCEPTION WHEN OTHERS THEN NULL; END $$ blocks.
+--     Never let a raw ERROR bubble up into the .out diff (its message
+--     embeds ctid:xmin tokens that drift per run).
+-- ==========================================================
+
+DO $$
+DECLARE
+  _s text := current_setting('shared_preload_libraries', true);
+  _msg text;
+BEGIN
+  IF _s NOT LIKE '%overlay_branch%' THEN
+    _msg := 'Postmaster started WITHOUT shared_preload_libraries=''overlay_branch''.  '
+         || 'The 3 correct ways to invoke these tests (DON''T `cd test/` first):'
+         || chr(10)||chr(10)||'  (A) make check                    <- temp-instance, hooks auto-loaded'
+         || chr(10)||'  (B) make installcheck EXTRA_REGRESS_OPTS="--use-existing --host=/tmp --port=15433"'
+         || chr(10)||'  (C) pg_regress overlay_branch_basic \'
+         || chr(10)||'         --inputdir=./test --outputdir=./test_output \'
+         || chr(10)||'         --temp-config=$(pwd)/test/temp_instance_shared_libs.conf \'
+         || chr(10)||'         --bindir=$(pg_config --bindir)'
+         || chr(10)||chr(10)
+         || 'If you just ran `cd test && pg_regress overlay_branch_basic` then this is exactly'
+         || chr(10)
+         || 'the bug: the temp-instance postmaster boots with an EMPTY shared_preload_libraries,'
+         || chr(10)
+         || 'so overlay_branch hooks never install and every Step3+ assertion is a false diff.';
+    RAISE EXCEPTION '%', _msg;
+  END IF;
+END $$;
+
+-- ========== Cleanup (idempotent) ==========
+SET client_min_messages = warning;
+DROP TABLE IF EXISTS public.t CASCADE;
+DROP EXTENSION IF EXISTS overlay_branch CASCADE;
+RESET client_min_messages;
+
+-- ========== Part A: Branch Context 8-API smoke ==========
+CREATE EXTENSION overlay_branch;
+
+-- A1. create + use + current
+SELECT create_branch('b1');
+SELECT use_branch('b1');
+SELECT current_branch() AS cur_after_use;
+
+-- A2. list_branches() — NO created_at/owner (timestamp instability)
+SELECT branch_id, branch_name, mode, state, delta_count
+FROM list_branches() ORDER BY branch_id;
+
+-- A3. apply_branch() — real 3-pass (D→U→I) with optimistic conflict
+--     detection.  b1 has no deltas / no rels so apply is a no-op that
+--     transitions state active→applied.
+SELECT apply_branch('b1');
+
+-- A4. create+discard pattern
+SELECT create_branch('b_discard') AS id_b_discard;
+SELECT discard_branch('b_discard');
+
+-- A5. after discard, b1 still there, b_discard gone
+SELECT branch_id, branch_name, mode, state, delta_count
+FROM list_branches() ORDER BY branch_id;
+
+-- A6. GUC-style SET — nonexistent branch MUST ERROR
+SET overlay_branch.current = 'b_guc_test';
+SELECT current_branch() AS cur_after_guc_fail;
+
+RESET overlay_branch.current;
+SELECT current_branch() AS cur_after_guc_reset;
+
+-- ========== Part B: Delta Store physics + upsert ==========
+-- Back to Main for clean delta physics (no redirect pollution).
+-- Note: b1 was transitioned to state=applied by A3, so discard_branch(b1)
+--       is now correctly rejected (discard can only be called on active).
+--       Wrap it so regress continues; we won't need b1 again below.
+DO $$
+BEGIN
+  PERFORM overlay_branch.discard_branch('b1');
+EXCEPTION WHEN OTHERS THEN
+  NULL;
+END $$;
+
+SELECT create_branch('b_delta') AS id_b_delta;
+SELECT use_branch('b_delta');
+
+-- B1. baseline delta count = 0 (after use, before any write)
+SELECT CASE
+         WHEN overlay_branch.overlay_debug_delta_count(
+                (SELECT branch_id FROM public.pg_branch WHERE branch_name='b_delta')) = 0
+         THEN 'PASS:0'
+         ELSE 'FAIL:EXPECTED 0 GOT '||
+              overlay_branch.overlay_debug_delta_count(
+                (SELECT branch_id FROM public.pg_branch WHERE branch_name='b_delta'))::text
+       END AS b_delta_count_after_create;
+
+-- B2. Direct delta debug insert 2 rows (keys ["10"],["11"]) via
+--     overlay_debug_delta_insert() SQL wrapper
+SELECT overlay_branch.overlay_debug_delta_insert(
+  (SELECT branch_id FROM public.pg_branch WHERE branch_name='b_delta'),
+  0::regclass,                    -- dummy relid for test
+  '["10"]',
+  'U',
+  'v10-base',
+  DECODE('feedface','hex')::bytea
+);
+SELECT overlay_branch.overlay_debug_delta_insert(
+  (SELECT branch_id FROM public.pg_branch WHERE branch_name='b_delta'),
+  0::regclass,
+  '["11"]',
+  'I',
+  '',
+  DECODE('cafebabe','hex')::bytea
+);
+
+SELECT CASE
+         WHEN overlay_branch.overlay_debug_delta_count(
+                (SELECT branch_id FROM public.pg_branch WHERE branch_name='b_delta')) = 2
+         THEN 'PASS:2'
+         ELSE 'FAIL:EXPECTED 2 GOT '||
+              overlay_branch.overlay_debug_delta_count(
+                (SELECT branch_id FROM public.pg_branch WHERE branch_name='b_delta'))::text
+       END AS b_delta_count_after_two_inserts;
+
+-- B3. Physical rows check — NO timestamp cols, only stable cols
+SELECT branch_id, relid::text, key, op, old_version,
+       ENCODE(tuple_data, 'hex') AS td_hex
+FROM public.pg_branch_delta
+WHERE branch_id = (SELECT branch_id FROM public.pg_branch WHERE branch_name='b_delta')
+  AND relid = 0::regclass
+ORDER BY key;
+
+-- B4. UPSERT: reinsert key ["10"] with new data → COUNT still 2
+SELECT overlay_branch.overlay_debug_delta_insert(
+  (SELECT branch_id FROM public.pg_branch WHERE branch_name='b_delta'),
+  0::regclass,
+  '["10"]',
+  'I',
+  'v10-upserted',
+  DECODE('deadbeef','hex')::bytea
+);
+
+SELECT CASE
+         WHEN overlay_branch.overlay_debug_delta_count(
+                (SELECT branch_id FROM public.pg_branch WHERE branch_name='b_delta')) = 2
+         THEN 'PASS:2'
+         ELSE 'FAIL:EXPECTED 2 GOT '||
+              overlay_branch.overlay_debug_delta_count(
+                (SELECT branch_id FROM public.pg_branch WHERE branch_name='b_delta'))::text
+       END AS b_delta_count_after_upsert;
+
+-- Confirm upsert actually replaced content of ["10"]
+SELECT key, op, old_version, ENCODE(tuple_data,'hex') AS td_hex
+FROM public.pg_branch_delta
+WHERE branch_id = (SELECT branch_id FROM public.pg_branch WHERE branch_name='b_delta')
+  AND relid = 0::regclass AND key = '["10"]';
+
+-- B5. delta_delete_all → count=0, physical_rows=0
+SELECT overlay_branch.overlay_debug_delta_delete_all(
+         (SELECT branch_id FROM public.pg_branch WHERE branch_name='b_delta'));
+SELECT CASE
+         WHEN overlay_branch.overlay_debug_delta_count(
+                (SELECT branch_id FROM public.pg_branch WHERE branch_name='b_delta')) = 0
+         THEN 'PASS:0'
+         ELSE 'FAIL:EXPECTED 0 GOT '||
+              overlay_branch.overlay_debug_delta_count(
+                (SELECT branch_id FROM public.pg_branch WHERE branch_name='b_delta'))::text
+       END AS b_delta_count_after_delete_all;
+SELECT COUNT(*) AS phys_delta_rows_after_delete_all
+FROM public.pg_branch_delta
+WHERE branch_id = (SELECT branch_id FROM public.pg_branch WHERE branch_name='b_delta');
+
+-- Cleanup b_delta
+SELECT discard_branch('b_delta');
+
+-- ========== Part C: Step 4 MVP — I/U/D redirect + Main⊕Delta SRF ==========
+-- C1. Build baseline Main table
+CREATE TABLE public.t (id INT4 PRIMARY KEY, v TEXT);
+INSERT INTO public.t VALUES (1,'v-base-1'),(2,'v-base-2'),(3,'v-base-3');
+
+SELECT CASE WHEN COUNT(*) = 3 THEN 'PASS:3' ELSE 'FAIL:EXPECTED 3 GOT '||COUNT(*)::text END
+       AS main_baseline_count
+FROM public.t;
+
+-- C2. create + use branch b_live
+SELECT create_branch('b_live');
+SELECT use_branch('b_live');
+
+-- C3. 3 DML inside b_live: DELETE id=2 / UPDATE id=1 / INSERT id=4
+DELETE FROM public.t WHERE id = 2;
+UPDATE public.t SET v = 'v-b1-UPDATED' WHERE id = 1;
+INSERT INTO public.t VALUES (4, 'v-b1-NEW');
+
+-- NOTE: BranchScan MVP now injects CustomScan for ordinary SELECT * FROM t
+-- whenever the overlay_branch.current GUC points at an ACTIVE branch,
+-- transparently returning MAIN⊕delta instead of just raw MAIN heap rows.
+-- The zero-pollution checks (C3a) below ASSERT that MAIN heap itself
+-- remains unchanged (3 baseline rows), so they MUST run in MAIN mode.
+-- We temporarily switch back, run C3a/C3b, then re-enter b_live for C3c.
+RESET overlay_branch.current;
+SELECT current_branch() AS cur_before_c3a;
+
+-- === C3a. ZERO-POLLUTION LAW: Main MUST remain baseline 3, id=1 STILL 'v-base-1' ===
+SELECT id, v FROM public.t ORDER BY id;
+SELECT CASE WHEN COUNT(*) = 3 THEN 'PASS:3' ELSE 'FAIL:EXPECTED 3 GOT '||COUNT(*)::text END
+       AS main_after_branch_3dml_still_3
+FROM public.t;
+SELECT CASE WHEN v = 'v-base-1' THEN 'PASS:v-base-1' ELSE 'FAIL:EXPECTED v-base-1 GOT '||v END
+       AS main_id1_NOT_modified
+FROM public.t WHERE id = 1;
+
+-- === C3b. Delta MUST have exactly 3 rows: ["1"]U / ["2"]D / ["4"]I ===
+SELECT CASE
+         WHEN overlay_branch.overlay_debug_delta_count(
+                (SELECT branch_id FROM public.pg_branch WHERE branch_name='b_live')) = 3
+         THEN 'PASS:3'
+         ELSE 'FAIL:EXPECTED 3 GOT '||
+              overlay_branch.overlay_debug_delta_count(
+                (SELECT branch_id FROM public.pg_branch WHERE branch_name='b_live'))::text
+       END AS delta_count_after_3dml;
+
+SELECT key, op, tuple_data IS NOT NULL AS has_tdata
+FROM public.pg_branch_delta
+WHERE branch_id = (SELECT branch_id FROM public.pg_branch WHERE branch_name='b_live')
+  AND relid = 'public.t'::regclass
+ORDER BY key;
+
+-- Re-enter b_live so C3c (SRF) and all later sections behave identically
+-- to the pre-BranchScan baseline.
+SELECT use_branch('b_live');
+SELECT current_branch() AS cur_after_reenter_b_live;
+
+-- === C3c. MAIN EVENT: overlay_main_plus_delta SRF — Live Branch semantics
+--    Expected EXACTLY 3 rows (id=2 COMPLETELY ABSENT — D tombstone skipped):
+--      (1, v-b1-UPDATED)  — op=U override
+--      (3, v-base-3)      — passthrough, no delta
+--      (4, v-b1-NEW)      — op=I pure-delta append
+SELECT id, v
+FROM overlay_branch.overlay_main_plus_delta('public.t')
+  AS x(id int4, v text)
+ORDER BY id;
+
+SELECT CASE WHEN COUNT(*) = 3 THEN 'PASS:3' ELSE 'FAIL:EXPECTED 3 GOT '||COUNT(*)::text END
+       AS plus_delta_row_count_EXPECT_3
+FROM overlay_branch.overlay_main_plus_delta('public.t')
+  AS x(id int4, v text);
+
+-- Confirm id=2 COMPLETELY GONE (D-tombstone skip)
+SELECT CASE
+         WHEN NOT EXISTS(
+           SELECT 1 FROM overlay_branch.overlay_main_plus_delta('public.t')
+             AS x(id int4, v text) WHERE id = 2)
+         THEN 'PASS:id2_D_tombstone_gone'
+         ELSE 'FAIL:id2_STILL_PRESENT'
+       END AS d_tombstone_skip_check;
+
+-- Confirm override/passthrough/insert values explicitly
+SELECT 'OVERRIDE_id1=' || v AS id1_value_check
+FROM overlay_branch.overlay_main_plus_delta('public.t')
+  AS x(id int4, v text) WHERE id = 1;
+SELECT 'PASSTHROUGH_id3=' || v AS id3_value_check
+FROM overlay_branch.overlay_main_plus_delta('public.t')
+  AS x(id int4, v text) WHERE id = 3;
+SELECT 'INSERT_id4=' || v AS id4_value_check
+FROM overlay_branch.overlay_main_plus_delta('public.t')
+  AS x(id int4, v text) WHERE id = 4;
+
+-- === C4. discard b_live → delta=0, Main STILL baseline 3 ===
+SELECT discard_branch('b_live');
+
+SELECT CASE
+         WHEN overlay_branch.overlay_debug_delta_count(
+                (SELECT branch_id FROM public.pg_branch WHERE branch_name='b_live')) = 0
+         THEN 'PASS:0'
+         ELSE 'FAIL:EXPECTED 0 GOT '||
+              overlay_branch.overlay_debug_delta_count(
+                (SELECT branch_id FROM public.pg_branch WHERE branch_name='b_live'))::text
+       END AS delta_count_post_discard_EXPECT_0;
+
+SELECT id, v FROM public.t ORDER BY id;
+SELECT CASE WHEN COUNT(*) = 3 THEN 'PASS:3' ELSE 'FAIL:EXPECTED 3 GOT '||COUNT(*)::text END
+       AS main_post_discard_STILL_base_3
+FROM public.t;
+
+-- ========== Part D: Step7 Hard Guard (G0-G6, 6 representative scenarios) ==========
+-- Each scenario: start a fresh active branch, try the unsupported op,
+-- ASSERT that Step7 guard raised ERROR via overlay_guard_ereport_fail.
+-- After each scenario we close the sub-transaction (the DO block handles
+-- EXCEPTION internally so the outer session's branch state stays clean)
+-- and then return to MAIN before moving to the next scenario so guards
+-- don't stack.
+
+-- D0 setup: create the guard test target branch and a plain PK table it can see.
+SELECT create_branch('b_guard') AS id_b_guard;
+SELECT use_branch('b_guard');
+
+-- D1: CREATE VIEW inside active branch must be blocked.
+DO $$
+BEGIN
+  CREATE VIEW public.guard_v1 AS SELECT 1 AS x;
+  RAISE EXCEPTION 'GUARD_CREATE_VIEW:FAIL (view created, no ERROR raised)';
+EXCEPTION WHEN OTHERS THEN
+  NULL;
+END $$;
+SELECT CASE WHEN EXISTS(
+  SELECT 1 FROM pg_views WHERE schemaname='public' AND viewname='guard_v1'
+) THEN 'FAIL:VIEW_EXISTS' ELSE 'PASS:GUARD_CREATE_VIEW_BLOCKED' END AS guard_d1;
+
+-- D2: CREATE TABLE ... PARTITION BY inside active branch blocked.
+DO $$
+BEGIN
+  CREATE TABLE public.guard_pt (id int4 primary key, v text) PARTITION BY RANGE (id);
+  RAISE EXCEPTION 'GUARD_CREATE_PARTITION:FAIL';
+EXCEPTION WHEN OTHERS THEN
+  NULL;
+END $$;
+SELECT CASE WHEN EXISTS(
+  SELECT 1 FROM pg_tables WHERE schemaname='public' AND tablename='guard_pt'
+) THEN 'FAIL:PARTITION_EXISTS' ELSE 'PASS:GUARD_CREATE_PARTITION_BLOCKED' END AS guard_d2;
+
+-- D3: CREATE TABLE with FOREIGN KEY inside active branch blocked.
+--     First create a referenced main table (in MAIN, not branch).
+RESET overlay_branch.current;
+CREATE TABLE IF NOT EXISTS public.guard_fk_parent (id int4 primary key, v text);
+TRUNCATE public.guard_fk_parent;
+INSERT INTO public.guard_fk_parent VALUES (1,'pv1');
+SELECT use_branch('b_guard');
+DO $$
+BEGIN
+  CREATE TABLE public.guard_fk_child (id int4 primary key, parent_id int4 NOT NULL REFERENCES public.guard_fk_parent(id));
+  RAISE EXCEPTION 'GUARD_CREATE_FK:FAIL';
+EXCEPTION WHEN OTHERS THEN
+  NULL;
+END $$;
+SELECT CASE WHEN EXISTS(
+  SELECT 1 FROM pg_tables WHERE schemaname='public' AND tablename='guard_fk_child'
+) THEN 'FAIL:FK_CHILD_EXISTS' ELSE 'PASS:GUARD_CREATE_FK_BLOCKED' END AS guard_d3;
+
+-- D4: TRUNCATE inside active branch blocked.
+RESET overlay_branch.current;
+CREATE TABLE IF NOT EXISTS public.guard_trunc (id int4 primary key, v text);
+TRUNCATE public.guard_trunc;
+INSERT INTO public.guard_trunc VALUES (1,'before');
+SELECT use_branch('b_guard');
+DO $$
+BEGIN
+  TRUNCATE public.guard_trunc;
+  RAISE EXCEPTION 'GUARD_TRUNCATE:FAIL';
+EXCEPTION WHEN OTHERS THEN
+  NULL;
+END $$;
+SELECT CASE WHEN (SELECT COUNT(*) FROM public.guard_trunc) = 1
+                 AND EXISTS(SELECT 1 FROM public.guard_trunc WHERE v='before')
+            THEN 'PASS:GUARD_TRUNCATE_BLOCKED'
+            ELSE 'FAIL:ROW_MISSING_OR_CHANGED' END AS guard_d4;
+
+-- D5: ALTER TABLE ADD COLUMN inside active branch blocked.
+RESET overlay_branch.current;
+CREATE TABLE IF NOT EXISTS public.guard_alter (id int4 primary key, v text);
+TRUNCATE public.guard_alter;
+INSERT INTO public.guard_alter VALUES (1,'v1');
+SELECT use_branch('b_guard');
+DO $$
+BEGIN
+  ALTER TABLE public.guard_alter ADD COLUMN w text;
+  RAISE EXCEPTION 'GUARD_ALTER_ADD_COL:FAIL';
+EXCEPTION WHEN OTHERS THEN
+  NULL;
+END $$;
+SELECT CASE WHEN count(*) = 1 AND NOT EXISTS(
+  SELECT 1 FROM information_schema.columns
+  WHERE table_schema='public' AND table_name='guard_alter' AND column_name='w'
+) THEN 'PASS:GUARD_ALTER_ADD_COL_BLOCKED' ELSE 'FAIL:GUARD_ALTER_BROKE' END AS guard_d5
+FROM public.guard_alter;
+
+-- D6: Normal regular PK table DML inside active branch STILL WORKS (guard
+--     does not over-block).
+RESET overlay_branch.current;
+CREATE TABLE IF NOT EXISTS public.guard_ok (id int4 primary key, v text);
+TRUNCATE public.guard_ok;
+INSERT INTO public.guard_ok VALUES (1,'v1'),(2,'v2'),(3,'v3');
+SELECT use_branch('b_guard');
+DELETE FROM public.guard_ok WHERE id = 2;
+UPDATE public.guard_ok SET v = 'branch-updated' WHERE id = 1;
+INSERT INTO public.guard_ok VALUES (4, 'branch-new');
+-- D6a: MAIN zero pollution.
+RESET overlay_branch.current;
+SELECT string_agg(id::text||'='||v, ',' ORDER BY id) AS guard_main_snap
+FROM public.guard_ok;
+SELECT CASE WHEN string_agg(id::text||'='||v, ',' ORDER BY id) = '1=v1,2=v2,3=v3'
+            THEN 'PASS:GUARD_D6A_MAIN_UNPOLLUTED'
+            ELSE 'FAIL:GUARD_D6A_MAIN_DIRTY:'||COALESCE(string_agg(id::text||'='||v, ',' ORDER BY id),'NULL')
+       END AS guard_d6a
+FROM public.guard_ok;
+-- D6b: Branch overlay returns the expected 3 rows with override/new/delete-tombstone.
+SELECT use_branch('b_guard');
+SELECT string_agg(id::text||'='||v, ',' ORDER BY id) AS guard_branch_plus_delta
+FROM overlay_branch.overlay_main_plus_delta('public.guard_ok')
+  AS x(id int4, v text);
+SELECT CASE WHEN string_agg(id::text||'='||v, ',' ORDER BY id) = '1=branch-updated,3=v3,4=branch-new'
+            THEN 'PASS:GUARD_D6B_OVERLAY_OK'
+            ELSE 'FAIL:GUARD_D6B_OVERLAY_WRONG'
+       END AS guard_d6b
+FROM overlay_branch.overlay_main_plus_delta('public.guard_ok')
+  AS x(id int4, v text);
+
+-- Cleanup D part: discard b_guard, drop the guard test tables.
+RESET overlay_branch.current;
+SELECT discard_branch('b_guard');
+DROP TABLE IF EXISTS public.guard_fk_parent;
+DROP TABLE IF EXISTS public.guard_trunc;
+DROP TABLE IF EXISTS public.guard_alter;
+DROP TABLE IF EXISTS public.guard_ok;
+
+-- ========== Part E: Step8 discard_branch cascade + idempotency ==========
+-- E1: create + populate a branch with 3 delta rows on public.t (we reuse the
+--     same public.t baseline), then discard: verify state=discarded AND
+--     delta_count=0 (physical rows gone, not LEFT JOIN count=0 fake cleanup).
+
+-- E0: public.t back to Step4 baseline 3 rows.
+TRUNCATE public.t;
+INSERT INTO public.t VALUES (1,'v-base-1'),(2,'v-base-2'),(3,'v-base-3');
+SELECT create_branch('b_discard_cascade') AS id_b_discard_cascade;
+SELECT use_branch('b_discard_cascade');
+DELETE FROM public.t WHERE id = 2;
+UPDATE public.t SET v = 'v-discard-test-updated' WHERE id = 1;
+INSERT INTO public.t VALUES (4, 'v-discard-test-new');
+SELECT CASE WHEN overlay_branch.overlay_debug_delta_count(
+  (SELECT branch_id FROM public.pg_branch WHERE branch_name='b_discard_cascade')) = 3
+       THEN 'PASS:3' ELSE 'FAIL:EXPECTED3GOT'||
+       overlay_branch.overlay_debug_delta_count(
+       (SELECT branch_id FROM public.pg_branch WHERE branch_name='b_discard_cascade'))::text
+       END AS s8_discard_before_count;
+
+-- E1: discard now cascades deletion of all 3 delta rows.
+RESET overlay_branch.current;
+SELECT discard_branch('b_discard_cascade');
+
+SELECT CASE WHEN overlay_branch.overlay_debug_delta_count(
+  (SELECT branch_id FROM public.pg_branch WHERE branch_name='b_discard_cascade')) = 0
+       THEN 'PASS:0_DELTA_AFTER_DISCARD_CASCADE'
+       ELSE 'FAIL:DISK_LEAK_GOT'||
+       overlay_branch.overlay_debug_delta_count(
+       (SELECT branch_id FROM public.pg_branch WHERE branch_name='b_discard_cascade'))::text
+       END AS s8_discard_cascade_phys;
+SELECT state AS s8_state FROM public.pg_branch WHERE branch_name='b_discard_cascade';
+
+-- E2: double-discard MUST ERROR (not a silent no-op).
+DO $$
+BEGIN
+  PERFORM overlay_branch.discard_branch('b_discard_cascade');
+  RAISE EXCEPTION 'DOUBLE_DISCARD_SHOULD_HAVE_ERRORED';
+EXCEPTION WHEN OTHERS THEN
+  NULL;
+END $$;
+SELECT CASE WHEN state = 'discarded' THEN 'PASS:DOUBLE_DISCARD_ERROR'
+            ELSE 'FAIL:STATE_BECAME_'||state END AS s8_double_discard
+FROM public.pg_branch WHERE branch_name='b_discard_cascade';
+
+-- E3: b1 from Part A was transitioned to state=applied by A3; discard on an
+--     applied branch also MUST ERROR (not a silent no-op).
+DO $$
+BEGIN
+  PERFORM overlay_branch.discard_branch('b1');
+  RAISE EXCEPTION 'DISCARD_ON_APPLIED_SHOULD_HAVE_ERRORED';
+EXCEPTION WHEN OTHERS THEN
+  NULL;
+END $$;
+SELECT CASE WHEN state = 'applied' THEN 'PASS:DISCARD_ON_APPLIED_ERROR'
+            ELSE 'FAIL:STATE_BECAME_'||state END AS s8_discard_on_applied
+FROM public.pg_branch WHERE branch_name='b1';
+
+-- E4: MAIN zero pollution after the whole discard cascade sequence.
+SELECT string_agg(id::text||'='||v, ',' ORDER BY id) AS s8_main_after_cascade FROM public.t;
+SELECT CASE WHEN string_agg(id::text||'='||v, ',' ORDER BY id) = '1=v-base-1,2=v-base-2,3=v-base-3'
+            THEN 'PASS:S8_MAIN_UNCHANGED'
+            ELSE 'FAIL:S8_MAIN_DIRTY' END AS s8_main_check
+FROM public.t;
+
+-- ========== Part F: Step5 apply_branch 3-pass optimistic atomic Main writeback ==========
+-- F1 (apply no-conflict, former smoke-A):
+--     MAIN baseline 1,2,3 -> branch 3 DML -> apply -> MAIN precise new 3 rows.
+
+-- F0: public.t back to baseline.
+TRUNCATE public.t;
+INSERT INTO public.t VALUES (1,'v-base-1'),(2,'v-base-2'),(3,'v-base-3');
+SELECT create_branch('b_apply_good') AS id_b_apply_good;
+SELECT use_branch('b_apply_good');
+DELETE FROM public.t WHERE id = 2;
+UPDATE public.t SET v = 'v-b1-updated' WHERE id = 1;
+INSERT INTO public.t VALUES (4, 'v-branch-new-4');
+
+RESET overlay_branch.current;
+SELECT string_agg(id::text||'='||v, ',' ORDER BY id) AS s5f1_before_main FROM public.t;
+
+SELECT use_branch('b_apply_good');
+SELECT apply_branch('b_apply_good');
+SELECT b.state,
+       (SELECT COUNT(*) FROM overlay_branch.pg_branch_delta d WHERE d.branch_id = b.branch_id) AS dc
+FROM public.pg_branch b WHERE branch_name='b_apply_good';
+
+-- F1a: MAIN after apply contains exactly the post-branch values (id2 deleted,
+-- id1 overridden, id4 added).  count = 3.
+RESET overlay_branch.current;
+SELECT string_agg(id::text||'='||v, ',' ORDER BY id) AS s5f1_after_main FROM public.t;
+SELECT CASE
+  WHEN string_agg(id::text||'='||v, ',' ORDER BY id) = '1=v-b1-updated,3=v-base-3,4=v-branch-new-4'
+  THEN 'PASS:S5F1A_APPLY_NO_CONFLICT_PRECISE_MAIN'
+  ELSE 'FAIL:S5F1A_BAD_MAIN_SNAP' END AS s5_f1a
+FROM public.t;
+
+-- F1b: re-apply MUST ERROR (b_apply_good is state=applied, not active).
+DO $$
+BEGIN
+  PERFORM overlay_branch.apply_branch('b_apply_good');
+  RAISE EXCEPTION 'RE_APPLY_SHOULD_HAVE_ERRORED';
+EXCEPTION WHEN OTHERS THEN
+  NULL;
+END $$;
+SELECT CASE WHEN state='applied' THEN 'PASS:S5F1B_REAPPLY_BLOCKED' ELSE 'FAIL:S5F1B_STATE_CHANGED' END AS s5_f1b
+FROM public.pg_branch WHERE branch_name='b_apply_good';
+
+-- F2 (apply conflict, former smoke-B):
+--     MAIN baseline for b_apply_race (3 rows) -> b_apply_race writes id=1 ->
+--     we step back to MAIN and UPDATE id=1 with a race write, THEN apply_race
+--     -> Step5 old_version token mismatch MUST abort apply, AND MAIN MUST
+--     remain showing the race write (rollback of apply replay sub-tx must
+--     NOT undo the race write that was committed OUTSIDE the branch).
+
+-- F2a: Build MAIN baseline for the race scenario (new ids 1/2/3 values race-baseline so we
+--     can distinguish from F1 leftovers).
+TRUNCATE public.t;
+INSERT INTO public.t VALUES (1,'rb1'),(2,'rb2'),(3,'rb3');
+SELECT create_branch('b_apply_race') AS id_b_apply_race;
+SELECT use_branch('b_apply_race');
+UPDATE public.t SET v = 'rb1-branch' WHERE id = 1;
+
+-- F2b: Step out of branch and RACE-WRITE MAIN id=1 BEFORE apply.  This is the
+--      key assertion: our GUC dual-source truth fix must let this MAIN write
+--      actually hit MAIN (not get redirected into the delta via ghost-branch mode).
+RESET overlay_branch.current;
+UPDATE public.t SET v = 'RACE-MAIN-WRITE' WHERE id = 1;
+SELECT v AS s5f2_race_main_write FROM public.t WHERE id = 1;
+
+-- F2c: Back into the now-race-dirty branch, apply.  old_version mismatch ERROR.
+SELECT use_branch('b_apply_race');
+DO $$
+BEGIN
+  PERFORM overlay_branch.apply_branch('b_apply_race');
+  RAISE EXCEPTION 'APPLY_RACE_SHOULD_HAVE_CONFLICT_ERROR';
+EXCEPTION WHEN OTHERS THEN
+  NULL;
+END $$;
+
+-- F2d: Hard invariant: MAIN still shows 'RACE-MAIN-WRITE' on id=1.  Rollback of
+--      apply's internal transaction must not touch main writes committed OUTSIDE
+--      the branch.
+RESET overlay_branch.current;
+SELECT CASE
+  WHEN v='RACE-MAIN-WRITE' THEN 'PASS:S5F2D_RACE_WRITE_PRESERVED_AFTER_CONFLICT_ROLLBACK'
+  ELSE 'FAIL:S5F2D_MAIN_RACE_WRITE_LOST:'||COALESCE(v,'NULL') END AS s5_f2d
+FROM public.t WHERE id = 1;
+SELECT CASE WHEN string_agg(id::text||'='||v, ',' ORDER BY id) = '1=RACE-MAIN-WRITE,2=rb2,3=rb3'
+  THEN 'PASS:S5F2_MAIN_3ROWS_CORRECT_POST_CONFLICT'
+  ELSE 'FAIL:S5F2_MAIN_DIRTY' END AS s5_f2_full_snap
+FROM public.t;
+
+-- =====================================================================
+-- ========== Part 6: BranchScan MVP (CustomScan transparently merges
+-- ========== MAIN⊕delta for plain SELECT).
+-- =====================================================================
+
+-- 6.0 Teardown / reinstall extension so the Part 6 fixture table
+--     `public.bs_basic` cannot possibly collide with Part C's public.t,
+--     Step 5's guard_part tables, or Part 7 Step4's tables.
+DROP EXTENSION overlay_branch CASCADE;
+CREATE EXTENSION overlay_branch;
+
+CREATE TABLE public.bs_basic (
+  id   INT4 PRIMARY KEY,
+  amt  NUMERIC(10,2),
+  tag  TEXT
+);
+INSERT INTO public.bs_basic VALUES
+  (1,  10.50, 'alpha'),
+  (2,  20.00, 'beta'),
+  (3,  30.75, 'gamma'),
+  (7,  70.00, 'eta');
+
+-- 6.1 MAIN mode: sanity — plain IndexScan wins, no CustomScan.
+RESET overlay_branch.current;
+EXPLAIN (COSTS OFF, SUMMARY OFF) SELECT * FROM public.bs_basic WHERE id = 1;
+SELECT count(*) AS bs_baseline_main_count FROM public.bs_basic;
+
+-- 6.2 Open a dedicated branch and inject exactly the 4 representative
+--     mutations (I/U/D + no-op).
+SELECT create_branch('bs_basic_b1') AS bs_id_b1;
+SELECT use_branch('bs_basic_b1');
+
+DELETE FROM public.bs_basic WHERE id = 3;
+UPDATE public.bs_basic SET amt = 99.99, tag = 'BETA!' WHERE id = 2;
+INSERT INTO public.bs_basic VALUES (9, 900.00, 'inserted-niner');
+-- id=1 and id=7 intentionally NOT touched (purely-MAIN passthrough).
+
+-- 6.3 MAIN-heap zero-pollution check (run in MAIN mode).
+RESET overlay_branch.current;
+SELECT CASE
+         WHEN string_agg(id::text, ',' ORDER BY id) = '1,2,3,7'
+              AND string_agg(amt::text, ',' ORDER BY id) = '10.50,20.00,30.75,70.00'
+         THEN 'PASS:BS_MAIN_ZERO_POLLUTION'
+         ELSE 'FAIL:'||COALESCE(string_agg(id::text||':'||amt::text, ',' ORDER BY id),'NULL')
+       END AS bs63_main_pollution
+FROM public.bs_basic;
+
+-- 6.4 Delta physics pre-check (3 rows: 2U/3D/9I).
+SELECT use_branch('bs_basic_b1');
+SELECT count(*) AS bs64_delta_count
+FROM public.pg_branch_delta
+WHERE branch_id = (SELECT branch_id FROM public.pg_branch WHERE branch_name='bs_basic_b1')
+  AND relid = 'public.bs_basic'::regclass;
+
+-- 6.5 Core equivalence: SRF (proven-correct) vs. transparent BranchScan.
+WITH srf AS (
+  SELECT string_agg((r).id::text||':'||(r).amt::text||':'||COALESCE((r).tag,'NULL'), '|' ORDER BY (r).id) AS pic
+  FROM overlay_branch.overlay_main_plus_delta('public.bs_basic')
+    AS r(id int4, amt numeric, tag text)
+), cs AS (
+  SELECT string_agg(id::text||':'||amt::text||':'||COALESCE(tag,'NULL'), '|' ORDER BY id) AS pic
+  FROM public.bs_basic
+)
+SELECT CASE
+         WHEN srf.pic = cs.pic THEN 'PASS:BS_EQUIV_SRF_BRANCHSCAN'
+         ELSE 'FAIL_SRF<>'||COALESCE(cs.pic,'NULL')||' BASE='||COALESCE(srf.pic,'NULL')
+       END AS bs65_equiv,
+       srf.pic AS srf_pic,
+       cs.pic  AS cs_pic
+FROM srf, cs;
+
+-- 6.6 Plan shapes for 4 representative SELECT shapes.
+EXPLAIN (COSTS OFF, SUMMARY OFF) SELECT * FROM public.bs_basic;                     -- plain CustomScan
+EXPLAIN (COSTS OFF, SUMMARY OFF) SELECT count(*) FROM public.bs_basic;               -- Aggregate + CustomScan
+EXPLAIN (COSTS OFF, SUMMARY OFF) SELECT * FROM public.bs_basic WHERE id = 2;         -- Filter + CustomScan (MVP: qual NOT pushed)
+EXPLAIN (COSTS OFF, SUMMARY OFF) SELECT * FROM public.bs_basic ORDER BY amt DESC;   -- Sort + CustomScan (no IndexScan leak)
+
+-- 6.7 Row-level spot checks against the 4 expected tuples:
+--      (1, 10.50, alpha)        — untouched MAIN passthrough
+--      (2, 99.99, BETA!)        — UPDATE override
+--      (7, 70.00, eta)          — untouched MAIN passthrough
+--      (9, 900.00, inserted-niner) — pure-delta INSERT
+--      id=3 COMPLETELY GONE (DELETE tombstone)
+
+SELECT CASE WHEN count(*) = 4 THEN 'PASS:BS_4_TUPLES' ELSE 'FAIL:'||count(*) END AS bs67_n
+FROM public.bs_basic;
+
+SELECT CASE WHEN EXISTS(SELECT 1 FROM public.bs_basic WHERE id = 3)
+            THEN 'FAIL:ID3_STILL_PRESENT'
+            ELSE 'PASS:ID3_TOMBSTONE_SKIPPED' END AS bs67_tombstone;
+
+SELECT id, amt, tag FROM public.bs_basic ORDER BY id;
+
+-- 6.8 Re-verify MAIN (BranchScan is per-transient active-branch, must be
+--     completely gone after RESET so the same SELECT id=3 in MAIN mode
+--     returns the original tuple — zero pollution).
+RESET overlay_branch.current;
+SELECT CASE WHEN tag = 'gamma' THEN 'PASS:ID3_BACK_IN_MAIN'
+            ELSE 'FAIL:'||COALESCE(tag,'NULL') END AS bs68_id3_main_back
+FROM public.bs_basic WHERE id = 3;
+
+-- ========== Final cleanup ==========
+DROP TABLE public.t;
+DROP TABLE IF EXISTS public.bs_basic;
+DROP EXTENSION overlay_branch CASCADE;

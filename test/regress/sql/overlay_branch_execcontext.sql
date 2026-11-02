@@ -1,0 +1,313 @@
+--
+-- A1/A6 regression: per-statement branch identity (BranchExecContext).
+--
+-- Background
+--   overlay_ExecutorStart() now binds the statement's branch identity once
+--   (branch id + MAIN read snapshot) into a backend-local stack
+--   (src/overlay_branch.c: ob_exec_ctx_push / ob_exec_ctx_unwind, consumed
+--   through ob_get_exec_context()).  BranchScan, the write-redirect gate and
+--   the SRF read path all read that bound copy instead of re-deriving the
+--   identity from the mutable CurrentBranchContext global.
+--
+--   PostgreSQL skips ExecutorEnd on error abort (portalcmds.c PortalCleanup),
+--   so aborted statements cannot pop themselves; the transaction and
+--   subtransaction callbacks restore the stack instead.
+--
+-- What this test pins
+--   EC.1  Nested statement: a SQL function (nested executor under the active
+--         statement) reads the same branch overlay as the outer statement.
+--   EC.2  Explicit SAVEPOINT + ROLLBACK TO after an error: the rolled-back
+--         write leaves no delta row, and the bound branch identity survives.
+--   EC.3  PL/pgSQL EXCEPTION block (implicit subtransaction) executed 200
+--         times: the identity stack must not leak slots across aborts.
+--   EC.4  Prepared statement: PREPARE/EXECUTE returns the branch overlay on
+--         every execution, and stays correct across a branch switch.
+--   EC.5  Write-path identity: delta rows carry the bound branch id, and the
+--         aborted update in EC.2 contributed none.
+--   EC.6  R15/R18 base version: the persisted CAS token is the canonical
+--         "<blk>:<off>-x<xmin>" string produced by the shared
+--         overlay_base_ver_* codec; the branch's own repeat writes do NOT
+--         re-base it while MAIN is frozen; and a MAIN change landing after
+--         the branch's LAST write still makes apply refuse (0A000) with MAIN
+--         preserved and the branch ACTIVE again.
+--   EC.7  Cached-plan branch identity contract: a BranchScan plan is stamped
+--         with its plan-time branch id (custom_private[6]); BeginCustomScan
+--         asserts it matches the statement's bound branch id (0A000 on
+--         mismatch), and the right branch's overlay is returned on every
+--         EXECUTE across a branch->branch switch and a branch->MAIN exit.
+--
+-- Fixture
+--   ob_ec(id int PK, v text) with 5 MAIN rows; branch ob_ec_b1 holds
+--   3 UPDATE + 1 INSERT + 1 DELETE = 5 delta rows; branch ob_ec_b2 holds 1.
+--   ob_ec_ref(id int PK, v text) has a single MAIN row and is only used by
+--   EC.6, so the base-version assertions do not have to fabricate a delta key.
+--
+-- Tags: A1/A6, executor-hook, subxact-abort, nested-statement, prepared-plan,
+--       R15, base-version
+
+-- ===== 0. Prerequisite guard (same as the other regression files) =====
+DO $$
+DECLARE
+  _s text := current_setting('shared_preload_libraries', true);
+  _msg text;
+BEGIN
+  IF _s NOT LIKE '%overlay_branch%' THEN
+    _msg := 'Postmaster started WITHOUT shared_preload_libraries=''overlay_branch''.  '
+         || 'Use `make check`, or `make installcheck EXTRA_REGRESS_OPTS="--use-existing --host=/tmp --port=5432"`.';
+    RAISE EXCEPTION '%', _msg;
+  END IF;
+END $$;
+
+-- ===== Idempotent cleanup =====
+SET client_min_messages = warning;
+DROP FUNCTION IF EXISTS public.ob_ec_nested();
+DROP FUNCTION IF EXISTS public.ob_ec_try();
+DROP TABLE IF EXISTS public.ob_ec;
+DROP TABLE IF EXISTS public.ob_ec_ref;
+DROP EXTENSION IF EXISTS overlay_branch CASCADE;
+RESET client_min_messages;
+
+CREATE EXTENSION IF NOT EXISTS overlay_branch;
+SET client_min_messages = WARNING;
+
+-- ===== Fixture =====
+CREATE TABLE public.ob_ec (id int PRIMARY KEY, v text);
+INSERT INTO public.ob_ec SELECT g, 'main' || g FROM generate_series(1, 5) g;
+ANALYZE public.ob_ec;
+
+CREATE TABLE public.ob_ec_ref (id int PRIMARY KEY, v text);
+INSERT INTO public.ob_ec_ref VALUES (1, 'ref-main');
+ANALYZE public.ob_ec_ref;
+
+SELECT overlay_branch.create_branch('ob_ec_b1');
+SELECT overlay_branch.use_branch('ob_ec_b1');
+
+UPDATE public.ob_ec SET v = 'br' || id WHERE id <= 3;
+INSERT INTO public.ob_ec VALUES (6, 'br6');
+DELETE FROM public.ob_ec WHERE id = 5;
+
+SELECT id, v FROM public.ob_ec ORDER BY id;   -- expect 1..4 (br), 6 (br6)
+
+-- =====================================================================
+-- EC.1 Nested statement: the SQL function body runs its own executor while
+--      the outer statement is active; it must see the same branch overlay.
+-- =====================================================================
+CREATE FUNCTION public.ob_ec_nested() RETURNS bigint LANGUAGE sql AS
+$$ SELECT count(*) FROM overlay_branch.overlay_main_plus_delta('public.ob_ec')
+     AS r(id int, v text) WHERE v LIKE 'br%' $$;
+
+SELECT CASE WHEN public.ob_ec_nested() = 4 THEN 'EC_NESTED_STMT_PASS'
+            ELSE 'EC_NESTED_STMT_FAIL: got=' || public.ob_ec_nested() END AS res;
+
+-- =====================================================================
+-- EC.2 Explicit SAVEPOINT rollback: the aborted write must vanish and the
+--      branch identity must remain bound for the rest of the transaction.
+-- =====================================================================
+BEGIN;
+SAVEPOINT ec_s1;
+UPDATE public.ob_ec SET v = 'rollback_me' WHERE id = 1;
+SELECT 1 / 0;                                   -- ERROR: division by zero
+ROLLBACK TO SAVEPOINT ec_s1;
+
+SELECT CASE WHEN count(*) = 0 THEN 'EC_SUBXACT_UNDO_PASS'
+            ELSE 'EC_SUBXACT_UNDO_FAIL: got=' || count(*) END AS res
+  FROM public.ob_ec WHERE v = 'rollback_me';
+
+SELECT CASE WHEN count(*) = 1 THEN 'EC_SUBXACT_BRANCH_INTACT_PASS'
+            ELSE 'EC_SUBXACT_BRANCH_INTACT_FAIL' END AS res
+  FROM public.ob_ec WHERE id = 1 AND v = 'br1';
+COMMIT;
+
+-- =====================================================================
+-- EC.3 Implicit subtransaction (PL/pgSQL EXCEPTION) x200: no stack leak.
+-- =====================================================================
+CREATE FUNCTION public.ob_ec_try() RETURNS boolean LANGUAGE plpgsql AS
+$$
+DECLARE
+  c bigint;
+BEGIN
+  BEGIN
+    PERFORM 1 / 0;
+  EXCEPTION WHEN division_by_zero THEN
+    NULL;
+  END;
+  SELECT count(*) INTO c FROM overlay_branch.overlay_main_plus_delta('public.ob_ec')
+   AS r(id int, v text) WHERE v LIKE 'br%';
+  RETURN c = 4;
+END $$;
+
+SELECT CASE WHEN (SELECT count(*) FROM generate_series(1, 200) g
+                   WHERE public.ob_ec_try()) = 200
+            THEN 'EC_SUBXACT_LOOP_PASS'
+            ELSE 'EC_SUBXACT_LOOP_FAIL' END AS res;
+
+-- =====================================================================
+-- EC.4 Prepared statement across executions and a branch switch.
+-- =====================================================================
+PREPARE ob_ec_p AS
+  SELECT count(*) AS n FROM overlay_branch.overlay_main_plus_delta('public.ob_ec')
+   AS r(id int, v text) WHERE v LIKE 'br%';
+
+EXECUTE ob_ec_p;                                -- expect 4
+EXECUTE ob_ec_p;                                -- expect 4 (plan reuse)
+EXECUTE ob_ec_p;                                -- expect 4
+
+SELECT overlay_branch.create_branch('ob_ec_b2');
+SELECT overlay_branch.use_branch('ob_ec_b2');
+UPDATE public.ob_ec SET v = 'b2' WHERE id = 1;
+
+SELECT CASE WHEN (SELECT v FROM public.ob_ec WHERE id = 1) = 'b2'
+            THEN 'EC_SWITCH_B2_PASS' ELSE 'EC_SWITCH_B2_FAIL' END AS res;
+
+SELECT overlay_branch.use_branch('ob_ec_b1');
+
+SELECT CASE WHEN (SELECT v FROM public.ob_ec WHERE id = 1) = 'br1'
+            THEN 'EC_SWITCH_BACK_B1_PASS' ELSE 'EC_SWITCH_BACK_B1_FAIL' END AS res;
+
+EXECUTE ob_ec_p;                                -- expect 4 after replan
+
+-- =====================================================================
+-- EC.5 Delta rows carry the bound branch id.
+-- =====================================================================
+SELECT CASE WHEN count(*) = 5 THEN 'EC_DELTA_ROWCOUNT_PASS'
+            ELSE 'EC_DELTA_ROWCOUNT_FAIL: got=' || count(*) END AS res
+  FROM overlay_branch.pg_branch_delta d
+ WHERE d.branch_id = (SELECT branch_id FROM overlay_branch.pg_branch
+                       WHERE branch_name = 'ob_ec_b1');
+
+-- =====================================================================
+-- EC.6 R15/R18 base version.
+--
+--  (a) SHAPE: the token persisted in pg_branch_delta.old_version must be the
+--      canonical "<blk>:<off>-x<xmin>" string that the shared
+--      overlay_base_ver_format() codec produces (write path and apply format
+--      and parse it through the same helper).
+--  (b) STABILITY: while MAIN is frozen, a repeat write to the same key must
+--      NOT re-base the token -- apply's CAS must keep comparing against the
+--      same MAIN version.
+--  (c) GUARD: a MAIN change landing AFTER the branch's last write makes the
+--      token stale, so apply must refuse with 0A000, leave MAIN untouched
+--      and return the branch to ACTIVE (SQLSTATE asserted in a DO block so a
+--      silent success is reported instead of passing unnoticed).
+--
+--      ob_ec_ref is a single-row table so the delta row can be located
+--      without depending on the serialized PK key format.
+--
+--      NOTE: the token records the MAIN version that the write used as its
+--      pre-image.  The DML subplan still scans MAIN (not the overlay), so a
+--      MAIN move BETWEEN two branch writes re-bases the token; that is why
+--      this case only pins the "MAIN frozen" stability above; the
+--      independent consequence of the MAIN-only pre-image is out of scope
+--      for this case.
+-- =====================================================================
+SELECT overlay_branch.use_branch(NULL);   -- leave the branch: no DDL while active (A7)
+CREATE TEMP TABLE ob_ec_tok (tok text);
+INSERT INTO ob_ec_tok VALUES (NULL);
+
+SELECT overlay_branch.use_branch('ob_ec_b1');
+UPDATE public.ob_ec_ref SET v = 'ref-1' WHERE id = 1;
+
+-- Capture the token with a plain SELECT from MAIN mode: the capture table has
+-- no PRIMARY KEY, so writing it while the branch is active would be rejected
+-- by the branch-mode DML guard (V1 constraint).
+SELECT overlay_branch.use_branch(NULL);
+UPDATE ob_ec_tok
+   SET tok = (SELECT d.old_version
+                FROM overlay_branch.pg_branch_delta d
+               WHERE d.relid = 'public.ob_ec_ref'::regclass
+                 AND d.branch_id = (SELECT branch_id
+                                      FROM overlay_branch.pg_branch
+                                     WHERE branch_name = 'ob_ec_b1'));
+
+-- (a) canonical shape.
+SELECT CASE WHEN (SELECT tok FROM ob_ec_tok) ~ '^[0-9]+:[0-9]+-x[0-9]+$'
+            THEN 'EC_BASE_VER_SHAPE_PASS'
+            ELSE 'EC_BASE_VER_SHAPE_FAIL:' || COALESCE((SELECT tok FROM ob_ec_tok), 'NULL')
+       END AS res;
+
+-- (b) repeat write with MAIN frozen must not re-base the token.
+SELECT overlay_branch.use_branch('ob_ec_b1');
+UPDATE public.ob_ec_ref SET v = 'ref-2' WHERE id = 1;
+SELECT overlay_branch.use_branch(NULL);
+
+SELECT CASE WHEN (SELECT tok FROM ob_ec_tok) =
+                 (SELECT d.old_version
+                    FROM overlay_branch.pg_branch_delta d
+                   WHERE d.relid = 'public.ob_ec_ref'::regclass
+                     AND d.branch_id = (SELECT branch_id
+                                          FROM overlay_branch.pg_branch
+                                         WHERE branch_name = 'ob_ec_b1'))
+            THEN 'EC_BASE_VER_STABLE_PASS'
+            ELSE 'EC_BASE_VER_STABLE_FAIL:' || COALESCE((SELECT tok FROM ob_ec_tok), 'NULL')
+       END AS res;
+
+-- (c) move MAIN on after the branch's last write; apply must still refuse.
+UPDATE public.ob_ec_ref SET v = 'ref-main-moved' WHERE id = 1;
+
+DO $$
+DECLARE
+  _st text;
+BEGIN
+  BEGIN
+    PERFORM overlay_branch.apply_branch('ob_ec_b1');
+    _st := 'NO_ERROR';
+  EXCEPTION WHEN OTHERS THEN
+    _st := SQLSTATE;
+  END;
+  IF _st <> '0A000' THEN
+    RAISE EXCEPTION 'EC_BASE_VER_APPLY_GUARD_FAIL: sqlstate=%', _st;
+  END IF;
+END $$;
+SELECT 'EC_BASE_VER_APPLY_GUARD_PASS' AS res;
+
+SELECT CASE WHEN v = 'ref-main-moved' THEN 'EC_BASE_VER_MAIN_PRESERVED_PASS'
+            ELSE 'EC_BASE_VER_MAIN_PRESERVED_FAIL:' || COALESCE(v, 'NULL') END AS res
+  FROM public.ob_ec_ref WHERE id = 1;
+
+SELECT CASE WHEN state = 'active' THEN 'EC_BASE_VER_APPLY_ROLLBACK_PASS'
+            ELSE 'EC_BASE_VER_APPLY_ROLLBACK_FAIL:' || state END AS res
+  FROM overlay_branch.pg_branch WHERE branch_name = 'ob_ec_b1';
+
+-- =====================================================================
+-- EC.7 Cached-plan branch identity contract (A1/A6 Stage 3).
+--
+--  A BranchScan plan records the branch id it was built for
+--  (custom_private[6]); BeginCustomScan asserts that this id equals the
+--  statement's bound branch id and raises 0A000 on any mismatch, so a
+--  cached plan can never silently read another branch's overlay.  R07
+--  already invalidates cached plans on every branch enter/exit, so a plan
+--  is normally re-stamped before it can be reused; this case therefore pins
+--  the observable contract -- the right branch's overlay on every EXECUTE,
+--  across a branch->branch switch and a branch->MAIN exit -- which a silent
+--  stale-plan read (or a spurious assertion) would break.
+-- =====================================================================
+SELECT overlay_branch.use_branch('ob_ec_b1');
+PREPARE ob_ec_pb AS SELECT id, v FROM public.ob_ec ORDER BY id;
+
+EXECUTE ob_ec_pb;   -- expect b1 overlay: 1:br1 2:br2 3:br3 4:main4 6:br6
+EXECUTE ob_ec_pb;   -- expect b1 overlay again
+
+SELECT overlay_branch.use_branch('ob_ec_b2');
+EXECUTE ob_ec_pb;   -- expect b2 overlay: 1:b2 2:main2 3:main3 4:main4 5:main5
+
+SELECT overlay_branch.use_branch('ob_ec_b1');
+EXECUTE ob_ec_pb;   -- expect b1 overlay again
+
+SELECT overlay_branch.use_branch(NULL);
+EXECUTE ob_ec_pb;   -- expect MAIN: 1:main1 .. 5:main5
+
+DEALLOCATE ob_ec_pb;
+
+-- =====================================================================
+-- Cleanup
+-- =====================================================================
+DEALLOCATE ob_ec_p;
+SELECT overlay_branch.use_branch(NULL);
+SELECT overlay_branch.discard_branch('ob_ec_b1');
+SELECT overlay_branch.discard_branch('ob_ec_b2');
+DROP TABLE ob_ec_tok;
+DROP FUNCTION public.ob_ec_try();
+DROP FUNCTION public.ob_ec_nested();
+DROP TABLE public.ob_ec;
+DROP TABLE public.ob_ec_ref;
+RESET ALL;

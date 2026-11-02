@@ -1,0 +1,127 @@
+Parsed test spec with 4 sessions
+
+starting permutation: s1_enter_p1 s1_pure_ins s1_upd_101 s1_apply s1_check
+step s1_enter_p1: SELECT overlay_branch.create_branch('bs_upd_p1'); SELECT overlay_branch.use_branch('bs_upd_p1');
+create_branch
+-------------
+           11
+(1 row)
+
+use_branch
+----------
+          
+(1 row)
+
+step s1_pure_ins: INSERT INTO public.t9_upd VALUES (11, 1, 'pure');
+step s1_upd_101: UPDATE public.t9_upd SET v = 101, t = 'u1' WHERE id = 11;
+step s1_apply: SELECT overlay_branch.use_branch(NULL); RESET overlay_branch.current; SELECT overlay_branch.apply_branch('bs_upd_p1');
+use_branch
+----------
+          
+(1 row)
+
+apply_branch
+------------
+            
+(1 row)
+
+step s1_check: SELECT v AS v11, t AS t11 FROM public.t9_upd WHERE id = 11;
+v11|t11
+---+---
+101|u1 
+(1 row)
+
+
+starting permutation: s2_enter_p2 s2_pure_ins s2_upd_22 s2_upd_222 s2_discard s2_check
+step s2_enter_p2: SELECT overlay_branch.create_branch('bs_upd_p2'); SELECT overlay_branch.use_branch('bs_upd_p2');
+create_branch
+-------------
+           12
+(1 row)
+
+use_branch
+----------
+          
+(1 row)
+
+step s2_pure_ins: INSERT INTO public.t9_upd VALUES (22, 2, 'pure');
+step s2_upd_22: UPDATE public.t9_upd SET v = 22, t = 'u1' WHERE id = 22;
+step s2_upd_222: UPDATE public.t9_upd SET v = 222, t = 'u2' WHERE id = 22;
+step s2_discard: SELECT overlay_branch.use_branch(NULL); RESET overlay_branch.current; SELECT overlay_branch.discard_branch('bs_upd_p2');
+use_branch
+----------
+          
+(1 row)
+
+discard_branch
+--------------
+              
+(1 row)
+
+step s2_check: SELECT count(*) AS c22 FROM public.t9_upd WHERE id = 22;
+c22
+---
+  0
+(1 row)
+
+
+starting permutation: s3_enter_p3 s4_enter_p3 s4_pure_ins s3_upd_base s4_upd_pure s3_apply s4_apply s3_check s4_check
+step s3_enter_p3: SELECT overlay_branch.create_branch('bs_upd_p3'); SELECT overlay_branch.use_branch('bs_upd_p3');
+create_branch
+-------------
+           13
+(1 row)
+
+use_branch
+----------
+          
+(1 row)
+
+step s4_enter_p3: SELECT overlay_branch.create_branch('bs_upd_p3b'); SELECT overlay_branch.use_branch('bs_upd_p3b');
+create_branch
+-------------
+           14
+(1 row)
+
+use_branch
+----------
+          
+(1 row)
+
+step s4_pure_ins: INSERT INTO public.t9_upd VALUES (44, 4, 'pure');
+step s3_upd_base: UPDATE public.t9_upd SET v = v + 100 WHERE id = 3;
+step s4_upd_pure: UPDATE public.t9_upd SET v = 444, t = 'u-pure' WHERE id = 44;
+step s3_apply: SELECT overlay_branch.use_branch(NULL); RESET overlay_branch.current; SELECT overlay_branch.apply_branch('bs_upd_p3');
+use_branch
+----------
+          
+(1 row)
+
+apply_branch
+------------
+            
+(1 row)
+
+step s4_apply: SELECT overlay_branch.use_branch(NULL); RESET overlay_branch.current; SELECT overlay_branch.apply_branch('bs_upd_p3b');
+use_branch
+----------
+          
+(1 row)
+
+apply_branch
+------------
+            
+(1 row)
+
+step s3_check: SELECT v AS v3 FROM public.t9_upd WHERE id = 3;
+ v3
+---
+130
+(1 row)
+
+step s4_check: SELECT v AS v44, t AS t44 FROM public.t9_upd WHERE id = 44;
+v44|t44   
+---+------
+444|u-pure
+(1 row)
+

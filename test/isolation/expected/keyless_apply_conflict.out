@@ -1,0 +1,100 @@
+Parsed test spec with 2 sessions
+
+starting permutation: s1_enter s1_anchor s1_exit s2_race s2_main s1_reenter s1_apply s1_state s1_main s1_discard s1_b2_enter s1_b2_upd s1_b2_apply s1_b2_main
+step s1_enter: SELECT overlay_branch.create_branch('bs_kl_race_1'); SELECT overlay_branch.use_branch('bs_kl_race_1');
+create_branch
+-------------
+           25
+(1 row)
+
+use_branch
+----------
+          
+(1 row)
+
+s1: WARNING:  overlay_branch: table "public.kl_race" has no PRIMARY KEY; using experimental ctid-based row identity (overlay_branch.keyless_tables=on)
+DETAIL:  Row identity is the physical tuple location (ctid, xmin).  Concurrent UPDATE/DELETE on this table by other sessions may change a row's ctid and cause the branch to silently miss that row's delta (detected only at apply time as a conflict error).
+HINT:  Add a PRIMARY KEY (or ALTER TABLE ... ADD COLUMN ... GENERATED ALWAYS AS IDENTITY PRIMARY KEY) to get durable row identity.
+step s1_anchor: UPDATE public.kl_race SET v = 'r1-branch' WHERE v = 'r1';
+step s1_exit: SELECT overlay_branch.use_branch(NULL); RESET overlay_branch.current;
+use_branch
+----------
+          
+(1 row)
+
+step s2_race: UPDATE public.kl_race SET v = 'RACE-MAIN' WHERE v = 'r1';
+step s2_main: SELECT CASE WHEN string_agg(v, ',' ORDER BY v) = 'RACE-MAIN,r2,r3' THEN 'PASS:kl_race_s2_main' ELSE 'FAIL:kl_race_s2_main:'||string_agg(v, ',' ORDER BY v) END AS s2_main FROM public.kl_race;
+s2_main             
+--------------------
+PASS:kl_race_s2_main
+(1 row)
+
+step s1_reenter: SELECT overlay_branch.use_branch('bs_kl_race_1');
+use_branch
+----------
+          
+(1 row)
+
+s1: WARNING:  PASS:kl_race_apply_conflict_0A000
+step s1_apply: 
+    DO $$
+    BEGIN
+        PERFORM overlay_branch.apply_branch('bs_kl_race_1');
+        RAISE WARNING 'FAIL:kl_race_apply_not_blocked';
+    EXCEPTION
+        WHEN SQLSTATE '0A000' THEN RAISE WARNING 'PASS:kl_race_apply_conflict_0A000';
+        WHEN OTHERS           THEN RAISE WARNING 'FAIL:kl_race_apply_other_sqlstate=%', SQLSTATE;
+    END $$;
+
+step s1_state: SELECT state AS s1_state FROM overlay_branch.pg_branch WHERE branch_name = 'bs_kl_race_1';
+s1_state
+--------
+active  
+(1 row)
+
+step s1_main: SELECT CASE WHEN string_agg(v, ',' ORDER BY v) = 'RACE-MAIN,r2,r3' THEN 'PASS:kl_race_main_preserved' ELSE 'FAIL:kl_race_main_preserved:'||string_agg(v, ',' ORDER BY v) END AS s1_main FROM public.kl_race;
+s1_main                    
+---------------------------
+PASS:kl_race_main_preserved
+(1 row)
+
+step s1_discard: SELECT overlay_branch.use_branch(NULL); RESET overlay_branch.current; SELECT overlay_branch.discard_branch('bs_kl_race_1');
+use_branch
+----------
+          
+(1 row)
+
+discard_branch
+--------------
+              
+(1 row)
+
+step s1_b2_enter: SELECT overlay_branch.create_branch('bs_kl_race_2'); SELECT overlay_branch.use_branch('bs_kl_race_2');
+create_branch
+-------------
+           26
+(1 row)
+
+use_branch
+----------
+          
+(1 row)
+
+step s1_b2_upd: UPDATE public.kl_race SET v = 'r2-branch' WHERE v = 'r2';
+step s1_b2_apply: SELECT overlay_branch.use_branch(NULL); RESET overlay_branch.current; SELECT overlay_branch.apply_branch('bs_kl_race_2');
+use_branch
+----------
+          
+(1 row)
+
+apply_branch
+------------
+            
+(1 row)
+
+step s1_b2_main: SELECT CASE WHEN string_agg(v, ',' ORDER BY v) = 'RACE-MAIN,r2-branch,r3' THEN 'PASS:kl_race_ok_apply' ELSE 'FAIL:kl_race_ok_apply:'||string_agg(v, ',' ORDER BY v) END AS s1_b2_main FROM public.kl_race;
+s1_b2_main           
+---------------------
+PASS:kl_race_ok_apply
+(1 row)
+

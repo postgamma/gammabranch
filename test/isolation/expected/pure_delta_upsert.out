@@ -1,0 +1,87 @@
+Parsed test spec with 3 sessions
+
+starting permutation: s1_use_p1 s3_parallel s1_upsert_a s1_apply s1_check
+step s1_use_p1: SELECT overlay_branch.create_branch('bs_up_p1'); SELECT overlay_branch.use_branch('bs_up_p1');
+create_branch
+-------------
+            8
+(1 row)
+
+use_branch
+----------
+          
+(1 row)
+
+step s3_parallel: 
+    SELECT overlay_branch.create_branch('bs_up_parallel');
+    BEGIN;
+    SELECT overlay_branch.use_branch('bs_up_parallel');
+    INSERT INTO public.t8_up VALUES (55, 555, 'pure');
+    COMMIT;
+    RESET overlay_branch.current;
+
+create_branch
+-------------
+            9
+(1 row)
+
+use_branch
+----------
+          
+(1 row)
+
+step s1_upsert_a: INSERT INTO public.t8_up VALUES (2, 205, 'excluded') ON CONFLICT (id) DO UPDATE SET v = EXCLUDED.v RETURNING id,v,t;
+id|  v|t   
+--+---+----
+ 2|205|main
+(1 row)
+
+step s1_apply: SELECT overlay_branch.apply_branch('bs_up_p1');
+apply_branch
+------------
+            
+(1 row)
+
+step s1_check: SELECT v AS v2 FROM public.t8_up WHERE id = 2;
+ v2
+---
+205
+(1 row)
+
+
+starting permutation: s2_use_p2 s2_pure_seed s2_upsert_b s2_discard s2_check
+step s2_use_p2: SELECT overlay_branch.create_branch('bs_up_p2'); SELECT overlay_branch.use_branch('bs_up_p2');
+create_branch
+-------------
+           10
+(1 row)
+
+use_branch
+----------
+          
+(1 row)
+
+step s2_pure_seed: INSERT INTO public.t8_up VALUES (11, 1, 'pure');
+step s2_upsert_b: INSERT INTO public.t8_up VALUES (11, 101, 'excluded') ON CONFLICT (id) DO UPDATE SET v = EXCLUDED.v RETURNING id,v,t;
+id|  v|t   
+--+---+----
+11|101|pure
+(1 row)
+
+step s2_discard: SELECT overlay_branch.use_branch(NULL); RESET overlay_branch.current; SET overlay_branch.current = ''; SELECT overlay_branch.discard_branch('bs_up_p2');
+use_branch
+----------
+          
+(1 row)
+
+discard_branch
+--------------
+              
+(1 row)
+
+step s2_check: SELECT count(*) AS c FROM public.t8_up WHERE id = 11;
+c
+-
+0
+(1 row)
+

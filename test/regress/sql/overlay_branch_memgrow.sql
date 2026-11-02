@@ -1,0 +1,336 @@
+--
+-- MF-1 regression: repeated full-table branch reads must not grow the
+-- backend's memory for the lifetime of the session.
+--
+-- Background
+--   Two independent leaks used to grow TopMemoryContext by one unreclaimable
+--   chunk per scanned row, so a long-lived session's RSS grew without bound:
+--
+--     1. BranchScan materialization and reconstruct_slot_from_delta() built
+--        each result slot (and its own CreateTupleDescCopy()) in
+--        TopMemoryContext.  ExecDropSingleTupleTableSlot() only pfree()s the
+--        slot and ReleaseTupleDesc() is a no-op for a -1 refcount copy, so one
+--        tupdesc per result row stayed in TopMemoryContext forever.  Slots now
+--        live in a per-scan context, reset at Rescan and deleted at
+--        EndCustomScan.
+--     2. delta_store.c read the TEXT delta columns with
+--        TextDatumGetCString(datumCopy(d, ...)): the intermediate datumCopy()
+--        varlena was never freed, leaking once per delta row per scan.
+--
+--   The write redirect had the same disease, on three independent objects:
+--
+--     3. fetch_tuple_by_ctid() (delta_store.c) rebuilt each pre-image slot,
+--        its CreateTupleDescCopy() tupdesc and every datumCopy() of the row
+--        in TopMemoryContext, so every redirected UPDATE/DELETE row leaked
+--        one tupdesc + slot + toasted value copies.
+--     4. the UPDATE SET-merge copied the post-image datums into
+--        TopMemoryContext as well (one leak per varchar SET column per row).
+--     5. the pure-delta UPDATE step kept the overlay_delta_lookup() result
+--        (key + old_version + tuple_data, all deep-copied into
+--        TopMemoryContext by design) and never freed it, leaking the whole
+--        serialized payload per rewritten pure-delta row.
+--
+-- Assertion
+--   Measure TopMemoryContext.total_bytes, run many full-table branch reads,
+--   measure again.  With the leaks in place one scan of the 2200-row result
+--   grew TopMemoryContext by ~26 KB (several MB over the loop below); the
+--   fixed code returns to a flat baseline.  The 2 MB ceiling keeps the test
+--   robust against unrelated one-off allocations while still failing
+--   decisively if either leak comes back.
+--
+--   The write-path probe (leaks 3-5) measures TopMemoryContext around a
+--   loop that rewrites rows through every write sub-path (redirected
+--   UPDATE, redirected DELETE, pure-delta UPDATE).  It must stay under
+--   1 MB; with the leaks present the redirected-UPDATE loop alone grows it
+--   by several MB, and the pure-delta loop by ~2 MB.
+--
+--   The probes run inside a DO block because the A7 gate rejects DDL
+--   (including CREATE TEMP TABLE) while a branch is active.
+--
+--   A second audit round (full-tree review of every SPI allocation site)
+--   found more of the same disease, covering three more shapes, each with its
+--   own probe below:
+--
+--     11. write_redirect.c pure-delta Phase D collected the per-row
+--         pk/old_version strings by pstrdup()ing SPI_getvalue() results that
+--         already lived in es_query_cxt (and leaked them on the early-continue
+--         branch too).  Probe: rewrite all pure-delta rows 100 times.
+--     6.  branch_lifecycle.c error branches read SPI-owned pointers after
+--         SPI_finish() (ob_check_branch_scope detail; ob_registry_check_current_schema
+--         sql/ins texts) and parked message-only copies in TopMemoryContext on
+--         a path that never returns.  Probe: repeat a rejected create_branch().
+--     8.  ob_build_pk_where_clause() (used only by the per-row apply replay,
+--         overlay_branch.apply_batch=off) leaked the SPI_getvalue() PK text and
+--         the quote_literal_cstr() result per PK column per row.  Probe: replay
+--         the branch through the per-row path many times (each apply rolled
+--         back) and check MAIN after one committed replay.
+--     9.  overlay_main_plus_delta() (the FROM-clause SRF in overlay_branch.c)
+--         allocated its per-row scratch (the values[]/isnulls[] arrays and the
+--         result tuple) in funcctx->multi_call_memory_ctx -- a context deleted
+--         only when the SRF finishes -- so a large scan grew the backend
+--         linearly with the number of rows produced.  The growth is a transient
+--         peak (that context is released the moment the SRF ends), unlike every
+--         leak above it, so the TopMemoryContext before/after probes cannot see
+--         it and no SQL-level assertion can; it is covered by the peak-RSS
+--         probe test/bench/srf_peak_rss.sh, and Section 1b exercises the path.
+--
+-- Tags: MF-1, memory, TopMemoryContext, BranchScan, delta_store, write_redirect,
+--       branch_lifecycle, apply_batch, overlay_main_plus_delta, SRF
+
+CREATE EXTENSION IF NOT EXISTS overlay_branch;
+
+CREATE TABLE ob_mem (id int PRIMARY KEY, v text);
+INSERT INTO ob_mem SELECT g, repeat('x', 40) || g FROM generate_series(1, 2000) g;
+ANALYZE ob_mem;
+
+SELECT overlay_branch.create_branch('ob_mem_b1');
+SELECT overlay_branch.use_branch('ob_mem_b1');
+
+UPDATE ob_mem SET v = 'u' || v WHERE id % 10 = 0;                          -- 200 overlaid rows
+INSERT INTO ob_mem SELECT g, 'n' || g FROM generate_series(2001, 2200) g;  -- 200 pure delta
+
+-- Warm-up: first executions also fill relcache/syscache/plan cache.
+SELECT count(*) FROM ob_mem;
+SELECT count(*) FROM ob_mem;
+SELECT count(*) FROM ob_mem;
+
+DO $$
+DECLARE
+  before_bytes bigint;
+  after_bytes  bigint;
+  i            int;
+BEGIN
+  SELECT total_bytes INTO before_bytes
+    FROM pg_backend_memory_contexts WHERE name = 'TopMemoryContext';
+
+  FOR i IN 1..200 LOOP
+    PERFORM count(*) FROM ob_mem;
+  END LOOP;
+
+  SELECT total_bytes INTO after_bytes
+    FROM pg_backend_memory_contexts WHERE name = 'TopMemoryContext';
+
+  IF after_bytes - before_bytes < 2097152 THEN
+    RAISE NOTICE 'MF1_MEM_STABLE_PASS: grew=% bytes', after_bytes - before_bytes;
+  ELSE
+    RAISE NOTICE 'MF1_MEM_STABLE_FAIL: grew=% bytes', after_bytes - before_bytes;
+  END IF;
+END $$;
+
+-- Sanity: the reads above really did exercise the overlay merge (2000 + 200).
+SELECT CASE WHEN count(*) = 2200 THEN 'MF1_RESULT_CORRECT_PASS'
+            ELSE 'MF1_RESULT_CORRECT_FAIL: got=' || count(*) END AS res
+  FROM ob_mem;
+
+-- ==========================================================================
+-- Section 1b: explicit SRF read path (leak 9, overlay_branch.c)
+-- --------------------------------------------------------------------------
+-- overlay_main_plus_delta() is a distinct entry point from the BranchScan
+-- path measured above, and its per-row scratch must live in the executor's
+-- per-tuple context (reset before every call) rather than in the SRF's
+-- multi-call context (deleted only when the SRF finishes).  The wrong choice
+-- grows the backend linearly with the row count, but only as a transient
+-- peak -- so no SQL-level before/after assertion can observe it (see the
+-- header).  It is caught by test/bench/srf_peak_rss.sh; the assertions below
+-- just pin the SRF's result at the same 2200-row branch state, so the path is
+-- exercised by the L3 gate at all.
+-- ==========================================================================
+SELECT CASE WHEN count(*) = 2200 THEN 'MF1_SRF_RESULT_CORRECT_PASS'
+            ELSE 'MF1_SRF_RESULT_CORRECT_FAIL: got=' || count(*) END AS res
+  FROM overlay_branch.overlay_main_plus_delta('public.ob_mem')
+       AS r(id int, v text);
+
+-- The overlay must agree row-for-row with the transparent BranchScan read,
+-- and must include the overlaid UPDATE (v = 'u...') and the pure-delta rows.
+SELECT CASE WHEN count(*) = 0 THEN 'MF1_SRF_CONTENT_CORRECT_PASS'
+            ELSE 'MF1_SRF_CONTENT_CORRECT_FAIL: diff=' || count(*) END AS res
+  FROM (
+    SELECT id, v FROM overlay_branch.overlay_main_plus_delta('public.ob_mem')
+                  AS r(id int, v text)
+    EXCEPT
+    SELECT id, v FROM ob_mem
+  ) d;
+
+-- MF-1 write path (leaks 3-5): redirected UPDATE/DELETE + pure-delta UPDATE.
+DO $$
+DECLARE
+  before_bytes bigint;
+  after_bytes  bigint;
+  i            int;
+BEGIN
+  -- Warm-up: first execution of each statement shape fills the plan /
+  -- relcache / syscache caches, so the measured window sees steady state.
+  UPDATE ob_mem SET v = repeat('q', 40) WHERE id % 10 = 0;   -- redirected UPDATE
+  UPDATE ob_mem SET v = repeat('q', 8000) WHERE id = 2001;   -- pure-delta UPDATE
+  DELETE FROM ob_mem WHERE id = 1;                           -- redirected DELETE
+
+  SELECT total_bytes INTO before_bytes
+    FROM pg_backend_memory_contexts WHERE name = 'TopMemoryContext';
+
+  FOR i IN 1..40 LOOP
+    UPDATE ob_mem SET v = repeat('q', 40) WHERE id % 10 = 0; -- 200 x 40 redirected
+  END LOOP;
+  FOR i IN 1..250 LOOP
+    UPDATE ob_mem SET v = repeat('q', 8000) WHERE id = 2001; -- 250 pure-delta rewrites
+  END LOOP;
+  DELETE FROM ob_mem WHERE id <= 2000;                       -- redirected deletes
+
+  SELECT total_bytes INTO after_bytes
+    FROM pg_backend_memory_contexts WHERE name = 'TopMemoryContext';
+
+  IF after_bytes - before_bytes < 1048576 THEN
+    RAISE NOTICE 'MF1_WRITE_MEM_STABLE_PASS: grew=% bytes', after_bytes - before_bytes;
+  ELSE
+    RAISE NOTICE 'MF1_WRITE_MEM_STABLE_FAIL: grew=% bytes', after_bytes - before_bytes;
+  END IF;
+END $$;
+
+-- Sanity: only the 200 pure-delta rows survive the mass DELETE above.
+SELECT CASE WHEN count(*) = 200 THEN 'MF1_WRITE_RESULT_CORRECT_PASS'
+            ELSE 'MF1_WRITE_RESULT_CORRECT_FAIL: got=' || count(*) END AS res
+  FROM ob_mem;
+
+-- ==========================================================================
+-- Section 2: pure-delta multi-row UPDATE (leak 11, write_redirect.c)
+-- --------------------------------------------------------------------------
+-- The 200 rows left above (ids 2001..2200) are pure delta.  Rewriting them all
+-- drives the Phase D raw_rows collection loop with SPI_processed = 200, where
+-- the old code pstrdup()ed two es_query_cxt strings per row and dropped the
+-- originals.  The old code grew TopMemoryContext by ~2 heap chunks per row per
+-- statement; 100 statements is decisively over the 512 KB ceiling.
+-- ==========================================================================
+DO $$
+DECLARE
+  before_bytes bigint;
+  after_bytes  bigint;
+  i            int;
+BEGIN
+  UPDATE ob_mem SET v = 'pd' || id WHERE id > 2000;   -- warm-up
+
+  SELECT total_bytes INTO before_bytes
+    FROM pg_backend_memory_contexts WHERE name = 'TopMemoryContext';
+
+  FOR i IN 1..100 LOOP
+    UPDATE ob_mem SET v = 'pd' || id WHERE id > 2000; -- 200 pure-delta rows each
+  END LOOP;
+
+  SELECT total_bytes INTO after_bytes
+    FROM pg_backend_memory_contexts WHERE name = 'TopMemoryContext';
+
+  IF after_bytes - before_bytes < 524288 THEN
+    RAISE NOTICE 'MF1_PD_MULTIROW_MEM_STABLE_PASS: grew=% bytes', after_bytes - before_bytes;
+  ELSE
+    RAISE NOTICE 'MF1_PD_MULTIROW_MEM_STABLE_FAIL: grew=% bytes', after_bytes - before_bytes;
+  END IF;
+END $$;
+
+-- Leave branch mode (but keep ob_mem_b1 active) so the DDL below is allowed.
+SELECT overlay_branch.use_branch(NULL);
+
+-- ==========================================================================
+-- Section 3: error-path discipline (leaks/UAF 6, 7)
+-- --------------------------------------------------------------------------
+-- The create_branch() scope pre-flight and the registry-drift branches build
+-- their ereport text from SPI-owned pointers.  A regression that copies those
+-- into TopMemoryContext leaks on every rejection (the error path never
+-- returns).  Repeat a rejected create_branch() and require a flat
+-- TopMemoryContext.
+-- ==========================================================================
+CREATE VIEW ob_mem_scope_v AS SELECT * FROM ob_mem;
+
+DO $$
+DECLARE
+  before_bytes bigint;
+  after_bytes  bigint;
+  i            int;
+BEGIN
+  BEGIN
+    PERFORM overlay_branch.create_branch('ob_mem_scope_probe');
+    RAISE EXCEPTION 'MF1_ERRPATH_FAIL: create_branch unexpectedly succeeded';
+  EXCEPTION WHEN feature_not_supported THEN
+    NULL;                       -- expected: unsupported relkind (the view)
+  END;
+
+  SELECT total_bytes INTO before_bytes
+    FROM pg_backend_memory_contexts WHERE name = 'TopMemoryContext';
+
+  FOR i IN 1..500 LOOP
+    BEGIN
+      PERFORM overlay_branch.create_branch('ob_mem_scope_probe');
+      RAISE EXCEPTION 'MF1_ERRPATH_FAIL: create_branch unexpectedly succeeded';
+    EXCEPTION WHEN feature_not_supported THEN
+      NULL;
+    END;
+  END LOOP;
+
+  SELECT total_bytes INTO after_bytes
+    FROM pg_backend_memory_contexts WHERE name = 'TopMemoryContext';
+
+  IF after_bytes - before_bytes < 262144 THEN
+    RAISE NOTICE 'MF1_ERRPATH_MEM_STABLE_PASS: grew=% bytes', after_bytes - before_bytes;
+  ELSE
+    RAISE NOTICE 'MF1_ERRPATH_MEM_STABLE_FAIL: grew=% bytes', after_bytes - before_bytes;
+  END IF;
+END $$;
+
+DROP VIEW ob_mem_scope_v;
+
+-- ==========================================================================
+-- Section 4: per-row apply replay (leak 8, branch_lifecycle.c)
+-- --------------------------------------------------------------------------
+-- ob_build_pk_where_clause() runs only on the legacy per-row replay, selected
+-- by overlay_branch.apply_batch=off.  The old code leaked the SPI_getvalue()
+-- PK text (into TopMemoryContext) and the quote_literal_cstr() result once per
+-- PK column per row.  Replay ob_mem_b1's deltas through that path repeatedly
+-- and require a flat TopMemoryContext.  Memory is not transactional, so each
+-- replayed apply is rolled back (restoring state='active' + the deltas) and
+-- replayed again; the final apply below is the real, committed one.
+-- ==========================================================================
+SET overlay_branch.apply_batch = off;
+
+DO $$
+DECLARE
+  before_bytes bigint;
+  after_bytes  bigint;
+  i            int;
+BEGIN
+  -- Warm-up replay + rollback (fills caches; also seeds any first-touch alloc).
+  BEGIN
+    PERFORM overlay_branch.apply_branch('ob_mem_b1');
+    RAISE EXCEPTION 'MF1_APPLYPR_ROLLBACK';
+  EXCEPTION WHEN raise_exception THEN NULL;
+  END;
+
+  SELECT total_bytes INTO before_bytes
+    FROM pg_backend_memory_contexts WHERE name = 'TopMemoryContext';
+
+  FOR i IN 1..30 LOOP
+    BEGIN
+      PERFORM overlay_branch.apply_branch('ob_mem_b1');
+      RAISE EXCEPTION 'MF1_APPLYPR_ROLLBACK';
+    EXCEPTION WHEN raise_exception THEN NULL;
+    END;
+  END LOOP;
+
+  SELECT total_bytes INTO after_bytes
+    FROM pg_backend_memory_contexts WHERE name = 'TopMemoryContext';
+
+  IF after_bytes - before_bytes < 1048576 THEN
+    RAISE NOTICE 'MF1_APPLYPR_MEM_STABLE_PASS: grew=% bytes', after_bytes - before_bytes;
+  ELSE
+    RAISE NOTICE 'MF1_APPLYPR_MEM_STABLE_FAIL: grew=% bytes', after_bytes - before_bytes;
+  END IF;
+END $$;
+
+-- Functional: one real (committed) per-row replay materialises MAIN = the 200
+-- pure-delta rows that survived Section 1.
+SELECT overlay_branch.apply_branch('ob_mem_b1');
+RESET overlay_branch.apply_batch;
+SELECT overlay_branch.use_branch(NULL);
+SELECT CASE WHEN count(*) = 200 THEN 'MF1_APPLYPR_RESULT_CORRECT_PASS'
+            ELSE 'MF1_APPLYPR_RESULT_CORRECT_FAIL: got=' || count(*) END AS res
+  FROM ob_mem;
+
+-- Cleanup
+DROP TABLE ob_mem;
+RESET ALL;

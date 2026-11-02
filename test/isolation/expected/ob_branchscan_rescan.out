@@ -1,0 +1,51 @@
+Parsed test spec with 3 sessions
+
+starting permutation: ctrl_setup s1_use s1_read_iter s2_insert_delta s1_read_iter2
+step ctrl_setup: 
+    SELECT overlay_branch.create_branch('bs_rescan');
+    SELECT overlay_branch.use_branch('bs_rescan', 'live');
+    INSERT INTO public.t8_res VALUES (3, 'd1');
+    COMMIT;
+    RESET overlay_branch.current;
+
+create_branch
+-------------
+            7
+(1 row)
+
+use_branch
+----------
+          
+(1 row)
+
+ctrl: WARNING:  there is no transaction in progress
+step s1_use: SELECT overlay_branch.use_branch('bs_rescan', 'live');
+use_branch
+----------
+          
+(1 row)
+
+step s1_read_iter: SELECT count(*) AS read1 FROM public.t8_res;
+read1
+-----
+    3
+(1 row)
+
+step s2_insert_delta: 
+    SELECT overlay_branch.use_branch('bs_rescan', 'live');
+    INSERT INTO public.t8_res VALUES (4, 'd2_written');
+    COMMIT;
+    RESET overlay_branch.current;
+
+use_branch
+----------
+          
+(1 row)
+
+s2: WARNING:  there is no transaction in progress
+step s1_read_iter2: SELECT count(*) AS read2 FROM public.t8_res;
+read2
+-----
+    4
+(1 row)
+

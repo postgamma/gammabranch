@@ -1,0 +1,51 @@
+Parsed test spec with 2 sessions
+
+starting permutation: ctrl_setup s1_use s1_nl_cnts s1_exit
+step ctrl_setup: 
+    SELECT overlay_branch.create_branch('bs_nl');
+    SELECT overlay_branch.use_branch('bs_nl', 'live');
+    -- Overlay composition: 10 MAIN - 1 DEL (id=3) + 5 INS (ids 11..15) = 14
+    INSERT INTO public.nl_tbl VALUES
+      (11, 1, 'd11'), (12, 2, 'd12'), (13, 3, 'd13'),
+      (14, 4, 'd14'), (15, 5, 'd15');
+    DELETE FROM public.nl_tbl WHERE id = 3;
+    UPDATE public.nl_tbl SET v = 'u_'||id WHERE id IN (1,2);
+    COMMIT;
+    RESET overlay_branch.current;
+
+create_branch
+-------------
+           19
+(1 row)
+
+use_branch
+----------
+          
+(1 row)
+
+ctrl: WARNING:  there is no transaction in progress
+step s1_use: SELECT overlay_branch.use_branch('bs_nl', 'live');
+use_branch
+----------
+          
+(1 row)
+
+step s1_nl_cnts: 
+    SELECT o.g, x.inner_cnt
+      FROM public.nl_drv o,
+           LATERAL (SELECT count(*) AS inner_cnt FROM public.nl_tbl) x
+     ORDER BY o.g;
+
+g|inner_cnt
+-+---------
+1|       14
+2|       14
+3|       14
+(3 rows)
+
+step s1_exit: SELECT overlay_branch.use_branch(NULL);
+use_branch
+----------
+          
+(1 row)
+

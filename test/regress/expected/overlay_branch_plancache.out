@@ -1,0 +1,254 @@
+--
+-- WR-1a regression: write-path parameterized prepared-plan cache.
+--
+-- Background
+--   WR-1a replaced the write path's inline SQL literals (psprintf built text
+--   with quote_literal_cstr / '\x..' hex bytea literals inlined per row) with
+--   $1..$n bind parameters served from a small prepared-plan cache
+--   (src/spi_helpers.c: ob_plancache_get / ob_spi_exec_params, built on
+--   SPI_prepare_cursor + SPI_keepplan + SPI_execute_plan).  Only *plan reuse*
+--   changed -- the SQL text semantics and the resulting delta row bytes must
+--   stay identical to the old inline-literal path.
+--
+-- What this test pins
+--   PC.1  Cross-statement reuse: a statement executed repeatedly in one
+--         session prepares its plan once and reuses it; every execution must
+--         produce the same, correct overlay result (no stale plan, no
+--         appended / dropped delta rows where UPSERT semantics apply).
+--   PC.2  Delta durability: text keys/values carrying '"' '\' ''' and a
+--         newline, plus a bytea payload with non-UTF8 bytes, must round-trip
+--         byte-exact through the parameterized key / tuple_data bindings
+--         (the bytea binding in particular replaced the '\x..' text form).
+--   PC.3  Plan invalidation + rebuild:
+--           - DISCARD PLANS while the branch is active (the A7 gate
+--             whitelists T_DiscardStmt) runs ResetPlanCache(), which walks the
+--             saved_plan_list that SPI-kept plans live on;
+--           - ALTER TABLE (only legal with no branch active, A7) plus the
+--             branch re-entry invalidation likewise force a replan.
+--         After each, the same write text must replan and stay correct.
+--
+-- Fixture
+--   ob_pc(k text PK, v text NOT NULL, b bytea); one MAIN row.
+--
+-- Tags: WR-1a, plan_cache, prepared-plan, durability, bytea, invalidation
+-- ===== 0. Prerequisite guard (same as the other regression files) =====
+DO $$
+DECLARE
+  _s text := current_setting('shared_preload_libraries', true);
+  _msg text;
+BEGIN
+  IF _s NOT LIKE '%overlay_branch%' THEN
+    _msg := 'Postmaster started WITHOUT shared_preload_libraries=''overlay_branch''.  '
+         || 'The 3 correct ways to invoke these tests (DON''T `cd test/` first):'
+         || chr(10)||chr(10)||'  (A) make check                    <- temp-instance, hooks auto-loaded'
+         || chr(10)||'  (B) make installcheck EXTRA_REGRESS_OPTS="--use-existing --host=/tmp --port=15433"'
+         || chr(10)||'  (C) pg_regress overlay_branch_plancache \'
+         || chr(10)||'         --inputdir=./test --outputdir=./test_output \'
+         || chr(10)||'         --temp-config=$(pwd)/test/temp_instance_shared_libs.conf \'
+         || chr(10)||'         --bindir=$(pg_config --bindir)'
+         || chr(10)||chr(10);
+    RAISE EXCEPTION '%', _msg;
+  END IF;
+END $$;
+-- ===== Idempotent cleanup =====
+SET client_min_messages = warning;
+DROP TABLE IF EXISTS public.ob_pc;
+DROP EXTENSION IF EXISTS overlay_branch CASCADE;
+RESET client_min_messages;
+CREATE EXTENSION IF NOT EXISTS overlay_branch;
+SET client_min_messages = WARNING;
+-- ===== Fixture =====
+CREATE TABLE public.ob_pc (
+    k   text PRIMARY KEY,
+    v   text NOT NULL,
+    b   bytea
+);
+INSERT INTO public.ob_pc VALUES ('plain', 'main', decode('deadbeef','hex'));
+ANALYZE public.ob_pc;
+SELECT count(*) AS pc_main_cnt FROM public.ob_pc;                 -- expect 1
+ pc_main_cnt 
+-------------
+           1
+(1 row)
+
+SELECT overlay_branch.create_branch('ob_pc_b1');
+ create_branch 
+---------------
+             1
+(1 row)
+
+SELECT overlay_branch.use_branch('ob_pc_b1');
+ use_branch 
+------------
+ 
+(1 row)
+
+-- =====================================================================
+-- PC.1 Cross-statement reuse: identical statement text, executions 2..N
+--      reuse the prepared plan.  Result must be stable and correct.
+-- =====================================================================
+UPDATE public.ob_pc SET v = 'reuse' WHERE k = 'plain';
+UPDATE public.ob_pc SET v = 'reuse' WHERE k = 'plain';
+UPDATE public.ob_pc SET v = 'reuse' WHERE k = 'plain';
+SELECT k, v FROM public.ob_pc WHERE k = 'plain';
+   k   |   v   
+-------+-------
+ plain | reuse
+(1 row)
+
+SELECT k, v FROM public.ob_pc WHERE k = 'plain';
+   k   |   v   
+-------+-------
+ plain | reuse
+(1 row)
+
+-- Repeated pure-delta UPSERT via ON CONFLICT must leave exactly ONE delta
+-- row for the key (UPSERT, not append) -- the reused plan must not lose the
+-- conflict clause.
+INSERT INTO public.ob_pc VALUES ('loop', 'x', decode('0102','hex'))
+  ON CONFLICT (k) DO UPDATE SET v = EXCLUDED.v;
+INSERT INTO public.ob_pc VALUES ('loop', 'x', decode('0102','hex'))
+  ON CONFLICT (k) DO UPDATE SET v = EXCLUDED.v;
+INSERT INTO public.ob_pc VALUES ('loop', 'x', decode('0102','hex'))
+  ON CONFLICT (k) DO UPDATE SET v = EXCLUDED.v;
+SELECT k, v FROM public.ob_pc WHERE k = 'loop';
+  k   | v 
+------+---
+ loop | x
+(1 row)
+
+-- 'plain' is a redirected (MAIN) row, 'loop' is pure delta -> 2 delta rows.
+SELECT CASE WHEN count(*) = 2 THEN 'PC_REUSE_DELTA_ROWCOUNT_PASS'
+            ELSE 'PC_REUSE_DELTA_ROWCOUNT_FAIL: got=' || count(*) END AS res
+  FROM overlay_branch.pg_branch_delta d
+  WHERE d.branch_id = (SELECT branch_id FROM overlay_branch.pg_branch
+                       WHERE branch_name = 'ob_pc_b1');
+             res              
+------------------------------
+ PC_REUSE_DELTA_ROWCOUNT_PASS
+(1 row)
+
+-- =====================================================================
+-- PC.2 Delta durability: special characters + non-UTF8 bytea payload.
+-- =====================================================================
+INSERT INTO public.ob_pc VALUES ($$q"uote$$,  $$back\slash$$,  decode('feedface','hex'));
+INSERT INTO public.ob_pc VALUES (E'new\nline', $$tab\there$$,   decode('cafebabe','hex'));
+INSERT INTO public.ob_pc VALUES ($$it's$$,     $$quote'here$$,   decode('00ff10','hex'));
+-- Row presence + byte-exact round-trip of the bytea payload.
+SELECT k, v, encode(b, 'hex') AS b_hex
+  FROM public.ob_pc
+ WHERE k IN ($$q"uote$$, E'new\nline', $$it's$$)
+ ORDER BY k;
+   k    |     v      |  b_hex   
+--------+------------+----------
+ it's   | quote'here | 00ff10
+ new   +| tab\there  | cafebabe
+ line   |            | 
+ q"uote | back\slash | feedface
+(3 rows)
+
+SELECT CASE WHEN count(*) = 3 THEN 'PC_DURABILITY_ROWS_PASS'
+            ELSE 'PC_DURABILITY_ROWS_FAIL: got=' || count(*) END AS res
+  FROM public.ob_pc
+ WHERE k IN ($$q"uote$$, E'new\nline', $$it's$$);
+           res           
+-------------------------
+ PC_DURABILITY_ROWS_PASS
+(1 row)
+
+SELECT CASE WHEN count(*) = 3 THEN 'PC_DURABILITY_BYTES_PASS'
+            ELSE 'PC_DURABILITY_BYTES_FAIL: got=' || count(*) END AS res
+  FROM public.ob_pc
+ WHERE (k = $$q"uote$$   AND b = decode('feedface','hex'))
+    OR (k = E'new\nline' AND b = decode('cafebabe','hex'))
+    OR (k = $$it's$$     AND b = decode('00ff10','hex'));
+           res            
+--------------------------
+ PC_DURABILITY_BYTES_PASS
+(1 row)
+
+-- Redirected UPDATE / DELETE on special-character keys (fetch_tuple_by_ctid
+-- + R21 pre-check bind the key as a text parameter).
+UPDATE public.ob_pc SET v = $$updated\v$$ WHERE k = $$q"uote$$;
+SELECT v = $$updated\v$$ AS pc_update_ok FROM public.ob_pc WHERE k = $$q"uote$$;
+ pc_update_ok 
+--------------
+ t
+(1 row)
+
+DELETE FROM public.ob_pc WHERE k = $$it's$$;
+SELECT count(*) AS pc_deleted_absent FROM public.ob_pc WHERE k = $$it's$$;   -- expect 0
+ pc_deleted_absent 
+-------------------
+                 0
+(1 row)
+
+-- =====================================================================
+-- PC.3a Plan invalidation: DISCARD PLANS while the branch is active.
+-- =====================================================================
+DISCARD PLANS;
+-- Same statement text as PC.1: the saved plan was invalidated -> must
+-- replan and reproduce the same result.
+UPDATE public.ob_pc SET v = 'reuse' WHERE k = 'plain';
+SELECT k, v FROM public.ob_pc WHERE k = 'plain';
+   k   |   v   
+-------+-------
+ plain | reuse
+(1 row)
+
+SELECT CASE WHEN count(*) = 1 THEN 'PC_AFTER_DISCARD_PASS'
+            ELSE 'PC_AFTER_DISCARD_FAIL' END AS res
+  FROM public.ob_pc WHERE k = 'plain' AND v = 'reuse';
+          res          
+-----------------------
+ PC_AFTER_DISCARD_PASS
+(1 row)
+
+-- =====================================================================
+-- PC.3b Plan invalidation: ALTER TABLE (DDL requires no active branch).
+-- =====================================================================
+SELECT overlay_branch.use_branch(NULL);
+ use_branch 
+------------
+ 
+(1 row)
+
+ALTER TABLE public.ob_pc SET (fillfactor = 90);
+SELECT overlay_branch.use_branch('ob_pc_b1');
+ use_branch 
+------------
+ 
+(1 row)
+
+-- Same statement text again; relcache invalidation from the DDL plus the
+-- branch re-entry must rebuild the plan and stay correct.
+UPDATE public.ob_pc SET v = 'after_alter' WHERE k = 'plain';
+SELECT k, v FROM public.ob_pc WHERE k = 'plain';
+   k   |      v      
+-------+-------------
+ plain | after_alter
+(1 row)
+
+SELECT CASE WHEN count(*) = 1 THEN 'PC_AFTER_ALTER_PASS'
+            ELSE 'PC_AFTER_ALTER_FAIL' END AS res
+  FROM public.ob_pc WHERE k = 'plain' AND v = 'after_alter';
+         res         
+---------------------
+ PC_AFTER_ALTER_PASS
+(1 row)
+
+-- Cleanup
+SELECT overlay_branch.use_branch(NULL);
+ use_branch 
+------------
+ 
+(1 row)
+
+SELECT overlay_branch.discard_branch('ob_pc_b1');
+ discard_branch 
+----------------
+ 
+(1 row)
+
+DROP TABLE public.ob_pc;
+RESET ALL;

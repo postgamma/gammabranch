@@ -1,0 +1,117 @@
+Parsed test spec with 3 sessions
+
+starting permutation: s1_enter s2_enter s1_ins s2_ins s1_upd s1_del s1_check s2_check ctrl_main s1_apply ctrl_applied s2_discard s1_pk_enter s1_pk_ins s1_pk_upd s1_pk_check s1_pk_apply ctrl_pk
+step s1_enter: SELECT overlay_branch.create_branch('bs_kl_basic_1'); SELECT overlay_branch.use_branch('bs_kl_basic_1');
+create_branch
+-------------
+           20
+(1 row)
+
+use_branch
+----------
+          
+(1 row)
+
+step s2_enter: SELECT overlay_branch.create_branch('bs_kl_basic_2'); SELECT overlay_branch.use_branch('bs_kl_basic_2');
+create_branch
+-------------
+           21
+(1 row)
+
+use_branch
+----------
+          
+(1 row)
+
+s1: WARNING:  overlay_branch: table "public.kl_basic" has no PRIMARY KEY; using experimental ctid-based row identity (overlay_branch.keyless_tables=on)
+DETAIL:  Row identity is the physical tuple location (ctid, xmin).  Concurrent UPDATE/DELETE on this table by other sessions may change a row's ctid and cause the branch to silently miss that row's delta (detected only at apply time as a conflict error).
+HINT:  Add a PRIMARY KEY (or ALTER TABLE ... ADD COLUMN ... GENERATED ALWAYS AS IDENTITY PRIMARY KEY) to get durable row identity.
+step s1_ins: INSERT INTO public.kl_basic VALUES ('x');
+s2: WARNING:  overlay_branch: table "public.kl_basic" has no PRIMARY KEY; using experimental ctid-based row identity (overlay_branch.keyless_tables=on)
+DETAIL:  Row identity is the physical tuple location (ctid, xmin).  Concurrent UPDATE/DELETE on this table by other sessions may change a row's ctid and cause the branch to silently miss that row's delta (detected only at apply time as a conflict error).
+HINT:  Add a PRIMARY KEY (or ALTER TABLE ... ADD COLUMN ... GENERATED ALWAYS AS IDENTITY PRIMARY KEY) to get durable row identity.
+step s2_ins: INSERT INTO public.kl_basic VALUES ('y');
+step s1_upd: UPDATE public.kl_basic SET v = 'b2' WHERE v = 'b';
+step s1_del: DELETE FROM public.kl_basic WHERE v = 'c';
+step s1_check: SELECT CASE WHEN string_agg(v, ',' ORDER BY v) = 'a,b2,x' THEN 'PASS:kl_basic_b1_overlay' ELSE 'FAIL:kl_basic_b1_overlay:'||string_agg(v, ',' ORDER BY v) END AS s1_overlay FROM public.kl_basic;
+s1_overlay              
+------------------------
+PASS:kl_basic_b1_overlay
+(1 row)
+
+step s2_check: SELECT CASE WHEN string_agg(v, ',' ORDER BY v) = 'a,b,c,y' THEN 'PASS:kl_basic_b2_overlay' ELSE 'FAIL:kl_basic_b2_overlay:'||string_agg(v, ',' ORDER BY v) END AS s2_overlay FROM public.kl_basic;
+s2_overlay              
+------------------------
+PASS:kl_basic_b2_overlay
+(1 row)
+
+step ctrl_main: SELECT CASE WHEN string_agg(v, ',' ORDER BY v) = 'a,b,c' THEN 'PASS:kl_basic_main_pristine' ELSE 'FAIL:kl_basic_main_pristine:'||string_agg(v, ',' ORDER BY v) END AS ctrl_main FROM public.kl_basic;
+ctrl_main                  
+---------------------------
+PASS:kl_basic_main_pristine
+(1 row)
+
+step s1_apply: SELECT overlay_branch.use_branch(NULL); RESET overlay_branch.current; SELECT overlay_branch.apply_branch('bs_kl_basic_1');
+use_branch
+----------
+          
+(1 row)
+
+apply_branch
+------------
+            
+(1 row)
+
+step ctrl_applied: SELECT CASE WHEN string_agg(v, ',' ORDER BY v) = 'a,b2,x' THEN 'PASS:kl_basic_main_applied' ELSE 'FAIL:kl_basic_main_applied:'||string_agg(v, ',' ORDER BY v) END AS ctrl_applied FROM public.kl_basic;
+ctrl_applied              
+--------------------------
+PASS:kl_basic_main_applied
+(1 row)
+
+step s2_discard: SELECT overlay_branch.use_branch(NULL); RESET overlay_branch.current; SELECT overlay_branch.discard_branch('bs_kl_basic_2');
+use_branch
+----------
+          
+(1 row)
+
+discard_branch
+--------------
+              
+(1 row)
+
+step s1_pk_enter: SELECT overlay_branch.create_branch('bs_kl_basic_pk'); SELECT overlay_branch.use_branch('bs_kl_basic_pk');
+create_branch
+-------------
+           22
+(1 row)
+
+use_branch
+----------
+          
+(1 row)
+
+step s1_pk_ins: INSERT INTO public.kl_basic_pk VALUES (3, 'p3');
+step s1_pk_upd: UPDATE public.kl_basic_pk SET v = 'p2b' WHERE id = 2;
+step s1_pk_check: SELECT CASE WHEN string_agg(id::text||'='||v, ',' ORDER BY id) = '1=p1,2=p2b,3=p3' THEN 'PASS:kl_basic_pk_overlay' ELSE 'FAIL:kl_basic_pk_overlay:'||string_agg(id::text||'='||v, ',' ORDER BY id) END AS s1_pk_overlay FROM public.kl_basic_pk;
+s1_pk_overlay           
+------------------------
+PASS:kl_basic_pk_overlay
+(1 row)
+
+step s1_pk_apply: SELECT overlay_branch.use_branch(NULL); RESET overlay_branch.current; SELECT overlay_branch.apply_branch('bs_kl_basic_pk');
+use_branch
+----------
+          
+(1 row)
+
+apply_branch
+------------
+            
+(1 row)
+
+step ctrl_pk: SELECT CASE WHEN string_agg(id::text||'='||v, ',' ORDER BY id) = '1=p1,2=p2b,3=p3' THEN 'PASS:kl_basic_pk_applied' ELSE 'FAIL:kl_basic_pk_applied:'||string_agg(id::text||'='||v, ',' ORDER BY id) END AS ctrl_pk FROM public.kl_basic_pk;
+ctrl_pk                 
+------------------------
+PASS:kl_basic_pk_applied
+(1 row)
+

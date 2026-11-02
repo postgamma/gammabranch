@@ -1,0 +1,127 @@
+Parsed test spec with 4 sessions
+
+starting permutation: s1_enter_p1 s1_pure_ins s1_del_55 s1_apply s1_check
+step s1_enter_p1: SELECT overlay_branch.create_branch('bs_del_p1'); SELECT overlay_branch.use_branch('bs_del_p1');
+create_branch
+-------------
+           15
+(1 row)
+
+use_branch
+----------
+          
+(1 row)
+
+step s1_pure_ins: INSERT INTO public.t10_del VALUES (55, 5, 'pure');
+step s1_del_55: DELETE FROM public.t10_del WHERE id = 55;
+step s1_apply: SELECT overlay_branch.use_branch(NULL); RESET overlay_branch.current; SELECT overlay_branch.apply_branch('bs_del_p1');
+use_branch
+----------
+          
+(1 row)
+
+apply_branch
+------------
+            
+(1 row)
+
+step s1_check: SELECT count(*) AS c55 FROM public.t10_del WHERE id = 55;
+c55
+---
+  0
+(1 row)
+
+
+starting permutation: s2_enter_p2 s2_pure_ins s2_upd_2 s2_del_66 s2_discard s2_check
+step s2_enter_p2: SELECT overlay_branch.create_branch('bs_del_p2'); SELECT overlay_branch.use_branch('bs_del_p2');
+create_branch
+-------------
+           16
+(1 row)
+
+use_branch
+----------
+          
+(1 row)
+
+step s2_pure_ins: INSERT INTO public.t10_del VALUES (66, 1, 'pure');
+step s2_upd_2: UPDATE public.t10_del SET v = 2 WHERE id = 66;
+step s2_del_66: DELETE FROM public.t10_del WHERE id = 66;
+step s2_discard: SELECT overlay_branch.use_branch(NULL); RESET overlay_branch.current; SELECT overlay_branch.discard_branch('bs_del_p2');
+use_branch
+----------
+          
+(1 row)
+
+discard_branch
+--------------
+              
+(1 row)
+
+step s2_check: SELECT count(*) AS c66 FROM public.t10_del WHERE id = 66;
+c66
+---
+  0
+(1 row)
+
+
+starting permutation: s3_enter_p3 s4_enter_p3 s4_pure_ins s3_del_base s4_del_pure s3_apply s4_apply s3_check s4_check
+step s3_enter_p3: SELECT overlay_branch.create_branch('bs_del_p3'); SELECT overlay_branch.use_branch('bs_del_p3');
+create_branch
+-------------
+           17
+(1 row)
+
+use_branch
+----------
+          
+(1 row)
+
+step s4_enter_p3: SELECT overlay_branch.create_branch('bs_del_p3b'); SELECT overlay_branch.use_branch('bs_del_p3b');
+create_branch
+-------------
+           18
+(1 row)
+
+use_branch
+----------
+          
+(1 row)
+
+step s4_pure_ins: INSERT INTO public.t10_del VALUES (77, 7, 'pure');
+step s3_del_base: DELETE FROM public.t10_del WHERE id = 4;
+step s4_del_pure: DELETE FROM public.t10_del WHERE id = 77;
+step s3_apply: SELECT overlay_branch.use_branch(NULL); RESET overlay_branch.current; SELECT overlay_branch.apply_branch('bs_del_p3');
+use_branch
+----------
+          
+(1 row)
+
+apply_branch
+------------
+            
+(1 row)
+
+step s4_apply: SELECT overlay_branch.use_branch(NULL); RESET overlay_branch.current; SELECT overlay_branch.apply_branch('bs_del_p3b');
+use_branch
+----------
+          
+(1 row)
+
+apply_branch
+------------
+            
+(1 row)
+
+step s3_check: SELECT count(*) AS c4 FROM public.t10_del WHERE id = 4;
+c4
+--
+ 0
+(1 row)
+
+step s4_check: SELECT count(*) AS c77 FROM public.t10_del WHERE id = 77;
+c77
+---
+  0
+(1 row)
+

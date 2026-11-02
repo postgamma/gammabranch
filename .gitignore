@@ -1,0 +1,24 @@
+# Compiled objects / shared libraries
+*.o
+*.bc
+*.so
+*.dll
+*.dylib
+
+# PGXS / Make build artifacts
+Makefile.regress
+regression.*
+test_output/
+test_output_iso/
+tmp_check/
+tmp_check_iso/
+output_iso/
+output_l3/
+log/
+results/
+
+# Meson build artifacts
+meson-private/
+
+# L2 bench runtime transcripts (generated locally, not committed)
+test/bench/*.log

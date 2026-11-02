@@ -1,0 +1,55 @@
+Parsed test spec with 3 sessions
+
+starting permutation: s1_ctrl_setup s1_apply_cas s2_delta s1_commit s3_verify
+step s1_ctrl_setup: 
+    SELECT overlay_branch.create_branch('bs_freeze');
+    SELECT overlay_branch.use_branch('bs_freeze', 'live');
+    INSERT INTO public.t8_apply VALUES (101, 'd1'), (102, 'd2'), (103, 'd3'),
+       (104, 'd4'), (105, 'd5'), (106, 'd6'), (107, 'd7'), (108, 'd8'),
+       (109, 'd9'), (110, 'd10');
+    COMMIT;
+    RESET overlay_branch.current;
+
+create_branch
+-------------
+            5
+(1 row)
+
+use_branch
+----------
+          
+(1 row)
+
+s1: WARNING:  there is no transaction in progress
+step s1_apply_cas: 
+    BEGIN;
+    SET LOCAL overlay_branch._debug_apply_sleep_sec = 2;
+    SELECT overlay_branch.apply_branch('bs_freeze');
+
+apply_branch
+------------
+            
+(1 row)
+
+step s2_delta: 
+    SELECT overlay_branch.use_branch('bs_freeze', 'live');
+    INSERT INTO public.t8_apply VALUES (200, 'WR_by_s2_should_freeze');
+    SELECT 1 AS s2_ok;
+
+use_branch
+----------
+          
+(1 row)
+
+s2_ok
+-----
+    1
+(1 row)
+
+step s1_commit: COMMIT;
+step s3_verify: SELECT count(*) AS main_rows FROM public.t8_apply;
+main_rows
+---------
+      110
+(1 row)
+
