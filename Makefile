@@ -17,10 +17,9 @@ PGFILEDESC = "overlay_branch - speculative database state using table overlay an
 override CPPFLAGS += -I$(srcdir)/include
 
 # Directory layout for test/ (clean separation of 3 test tiers):
-#   test/regress/{sql,expected}   L3 pg_regress (make check gate)
+#   test/regress/{sql,expected}   L3 pg_regress (make installcheck gate)
 #   test/isolation/specs          L1 pg_isolation_regress (T8 concurrency)
 #   test/isolation/expected       L1 baseline .out files
-#   test/isolation/isolation_schedule
 #   test/bench/                   L2 pgbench manual race-detection fixture
 # Temp instance shared-libs conf lives at root level (shared by both harnesses).
 REGRESS = \
@@ -43,7 +42,8 @@ REGRESS = \
   overlay_branch_pushdown \
   overlay_branch_plancache \
   overlay_branch_acc1 \
-  overlay_branch_execcontext
+  overlay_branch_execcontext \
+  overlay_branch_deltastats
 REGRESS_OPTS = \
 	--inputdir=$(srcdir)/test/regress \
 	--outputdir=./test_output \
@@ -53,24 +53,14 @@ ISOLATION_OPTS = \
 	--temp-config=$(srcdir)/temp_instance_shared_libs.conf
 
 # L1 pg_isolation_regress concurrency tests (T9 total acceptance).
-ISOLATION = ob_apply_mutex ob_state_inval ob_applying_freeze ob_snapshot_mode ob_branchscan_rescan pure_delta_upsert pure_delta_update pure_delta_delete ob_view_unify_rescan keyless_basic keyless_pure_delta_repeat keyless_apply_conflict
+ISOLATION = ob_apply_mutex ob_state_inval ob_applying_freeze ob_snapshot_mode ob_branchscan_rescan pure_delta_upsert pure_delta_update pure_delta_delete ob_view_unify_rescan keyless_basic keyless_pure_delta_repeat keyless_apply_conflict keyless_version_chain keyless_upsert keyless_delete_invalidation
 EXTRA_CLEAN += test_output test_output_iso output_iso output_l3 tmp_check tmp_check_iso
 
 # NOTE on test entry points:
-#   in-tree  (contrib/overlay_branch in a PostgreSQL source tree): `make check`
-#            runs REGRESS + ISOLATION against a throw-away temp instance.
-#   out-of-tree (USE_PGXS=1, e.g. a standalone clone): `make check` is NOT
-#            supported by PGXS; run `make install` first, then
-#            `make installcheck` against a running server that has
-#            shared_preload_libraries='overlay_branch' (see README.md).
+#   Standalone (PGXS) build: `make check` is NOT supported by PGXS; run
+#   `make install` first, then `make installcheck` against a running server
+#   that has shared_preload_libraries='overlay_branch' (see README.md).
 
-ifdef USE_PGXS
 PG_CONFIG = pg_config
 PGXS := $(shell $(PG_CONFIG) --pgxs)
 include $(PGXS)
-else
-subdir = contrib/overlay_branch
-top_builddir = ../..
-include $(top_builddir)/src/Makefile.global
-include $(top_srcdir)/contrib/contrib-global.mk
-endif

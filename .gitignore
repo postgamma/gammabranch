@@ -17,8 +17,5 @@ output_l3/
 log/
 results/
 
-# Meson build artifacts
-meson-private/
-
 # L2 bench runtime transcripts (generated locally, not committed)
 test/bench/*.log

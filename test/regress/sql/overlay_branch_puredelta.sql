@@ -134,11 +134,11 @@ SELECT CASE WHEN v = 'z' THEN 'PASS:P10'
             ELSE 'FAIL:P10 v=' || v END
 FROM pd_t4 WHERE id = 99;
 
--- P11: MVP NOP guards (CTID-based writes + multi-table JOIN WR)
---   These are intentionally out-of-scope for the MVP: WR hook must not
+-- P11: NOP guards (CTID-based writes + multi-table JOIN WR)
+--   These are intentionally out-of-scope: WR hook must not
 --   corrupt data by silently performing half-work; instead it must keep
 --   the row untouched so the user can detect the no-op via CASE assertions
---   (matches the documented MVP scope: only PK-equality quals supported).
+--   (matches the documented scope: only PK-equality quals supported).
 CREATE TABLE pd_t5 (id int PRIMARY KEY, v text, payload text);
 CREATE TABLE pd_t6 (id int PRIMARY KEY, ref int);
 SELECT create_branch('b11');
@@ -147,21 +147,21 @@ INSERT INTO pd_t5 VALUES (1, 'orig', 'base');      -- pure delta row
 INSERT INTO pd_t6 VALUES (101, 1);                   -- pure delta row (FK-emulation)
 
 -- P11.1 UPDATE WHERE ctid = ...: ctid refers to MAIN storage only; pure
---       delta rows have no MAIN ctid.  MVP guard: no PK-equality → NOP.
+--       delta rows have no MAIN ctid.  Guard: no PK-equality → NOP.
 UPDATE pd_t5 SET payload = 'WRONG-ctid-upd'
  WHERE ctid = (SELECT ctid FROM pd_t5 WHERE id = 1 LIMIT 1);
 SELECT CASE WHEN payload = 'base' THEN 'PASS:P11_1_UPD_CTID_NOP'
             ELSE 'FAIL:P11_1 payload=' || COALESCE(payload,'NULL') END AS p11_1
   FROM pd_t5 WHERE id = 1;
 
--- P11.2 DELETE WHERE ctid = ...: same MVP guard → NOP.
+-- P11.2 DELETE WHERE ctid = ...: same guard → NOP.
 DELETE FROM pd_t5
  WHERE ctid = (SELECT ctid FROM pd_t5 WHERE id = 1 LIMIT 1);
 SELECT CASE WHEN count(*) = 1 THEN 'PASS:P11_2_DEL_CTID_NOP'
             ELSE 'FAIL:P11_2 count=' || count(*) END AS p11_2
   FROM pd_t5 WHERE id = 1;
 
--- P11.3 UPDATE ... FROM (join): MVP decomposes only single-rel PK-equality
+-- P11.3 UPDATE ... FROM (join): decomposes only single-rel PK-equality
 --       quals; join quals cannot be rewritten into a PK exact-match.  Guard
 --       MUST produce a safe NOP, not a partial or mis-joined write.
 UPDATE pd_t5 SET payload = 'WRONG-join-upd'
@@ -174,7 +174,7 @@ SELECT CASE WHEN payload = 'base' THEN 'PASS:P11_3_UPD_JOIN_NOP'
 
 -- P11.4 RETURNING * on pure-delta UPDATE (PK-equality): pure-delta UPDATE
 --       branch must correctly populate RETURNING projection with the
---       post-SET row (all columns).  Covers V1 RETURNING projection path.
+--       post-SET row (all columns).  Covers RETURNING projection path.
 UPDATE pd_t5 SET v = 'p114', payload = 'ret-upd' WHERE id = 1
   RETURNING id, v, payload;
 SELECT CASE WHEN v = 'p114' AND payload = 'ret-upd'

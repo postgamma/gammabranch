@@ -3,7 +3,7 @@
 -- Purpose : produce comparable wall-clock numbers for the four cost centers
 --           documented in doc/internals.md §5 (branch merge read, PK/non-PK
 --           read, delta size, apply).  NOT a correctness gate and NOT part of
---           `make check`.
+--           `make installcheck`.
 -- Coverage: MAIN seqscan vs BranchScan overlay read; P0 PK-equality fast path;
 --           P2 non-PK pushdown; delta payload amplification; apply timing.
 -- Deps    : shared_preload_libraries='overlay_branch'; run against a live

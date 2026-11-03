@@ -6,12 +6,12 @@
 --            instances independent; set-equality vs baseline replay;
 --            EXPLAIN visual 2x mention (no auto-assert, EXPLAIN is
 --            PG top-level command only).
---   Part 2 — A2.3 SAME-CSS rescan + A2.4 no-crash (MVP):
+--   Part 2 — A2.3 SAME-CSS rescan + A2.4 no-crash:
 --            (NL LATERAL no-WHERE: deterministic SAME-CSS rescan
 --             proof via repeated full-inner-count per outer tuple
 --             if cursor not reset → count drops to 0, FAIL fires);
 --            (non-lateral NL no-crash with Join Filter).
---            MVP LIMITATION: parameterized LATERAL with outer-Var
+--            LIMITATION: parameterized LATERAL with outer-Var
 --            WHERE (i.col = o.col) subquery form known to crash in
 --            SubPlan re-entry, kept outside regress harness.
 --   Part 3 — A2.2 cursor (NO SCROLL): FETCH rows, MOVE FORWARD ALL
@@ -63,7 +63,7 @@ INSERT INTO a2_self(id, grp, amt) VALUES
 UPDATE a2_self SET amt = amt + 10.00 WHERE id IN (1,2);
 DELETE FROM a2_self WHERE id = 3;
 -- Replay 3 writes ON baseline (permanent table, never mapped to
--- branch delta; V1 PK guard allows heap writes because DML guard
+-- branch delta; PK guard allows heap writes because DML guard
 -- only redirects relids listed in current BranchContext).
 DELETE FROM a2_self_baseline WHERE id = 3;
 UPDATE a2_self_baseline SET amt = amt + 10 WHERE id IN (1,2);
@@ -142,7 +142,7 @@ EXPLAIN (FORMAT TEXT)
 (8 rows)
 
 -- =================================================================
--- Part 2 — A2.3 SAME-CSS rescan + A2.4 NL no-crash (MVP)
+-- Part 2 — A2.3 SAME-CSS rescan + A2.4 NL no-crash
 -- =================================================================
 SET enable_hashjoin  = off;
 SET enable_mergejoin = off;
@@ -173,7 +173,7 @@ SELECT CASE WHEN bool_and(inner_cnt = 14) AND count(*) = 3
 -- A2_NL_NOCRASH (non-lateral nested loop with Join Filter):
 -- Non-lateral NL: per-tuple rescan still runs; Join Filter applied
 -- by NestedLoop node (no SubPlan LATERAL flattening pitfalls).
--- MVP proves: 2 BranchScans × NL → 0 crash, counts match baseline.
+-- This proves: 2 BranchScans × NL → 0 crash, counts match baseline.
 SELECT CASE WHEN count(*) = (
               SELECT count(*) FROM a2_self_baseline a
                               JOIN a2_self_baseline b USING (grp))

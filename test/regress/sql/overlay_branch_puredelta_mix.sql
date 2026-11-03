@@ -5,7 +5,7 @@
  * COVERAGE (formerly overlay_branch_advanced.sql Section K~Q):
  *   Section K — Mixed DML lifecycle: UPDATE→DELETE→INSERT rebirth chain; WR multi-op row counts;
  *               same-tx multi-table zero-pollution MAIN (bs_mix + bs_mix2 two independent tables)
- *   Section L — Pure-delta UPDATE MVP NOOP: SET projection not wired, WR SAFE NOOP;
+ *   Section L — Pure-delta UPDATE NOOP: SET projection not wired, WR SAFE NOOP;
  *               NOT silent data corruption (UPDATE WHERE not hit → OK, no error)
  *   Section M — BPCHAR/NUMERIC typmod PK pure-delta DML: I.1/I.2 MAIN-PK paths
  *               also work for pure delta rows; bpchar r-trim comparison / NUMERIC scale preserved
@@ -14,7 +14,7 @@
  *   Section O — apply/discard boundary: pure delta INSERT → apply propagates to MAIN;
  *               pure delta INSERT → discard ROLLBACK; MAIN original rows unchanged
  *   Section P — EMPTY MAIN heap 100% pure delta: MAIN 0 rows, overlay composed entirely of pure delta
- *               INSERT; UPDATE( MVP NOP ) / DELETE OK; BranchScan reads correctly; apply propagates
+ *               INSERT; UPDATE( NOP ) / DELETE OK; BranchScan reads correctly; apply propagates
  *   Section Q — Composite PK pure-delta: serialize_pk / deparse both cover composite PK;
  *               WR WHERE (a,b)=(?,?) composite key serialized correctly
  *
@@ -29,10 +29,9 @@ DECLARE
 BEGIN
   IF _s NOT LIKE '%overlay_branch%' THEN
     _msg := 'Postmaster started WITHOUT shared_preload_libraries=''overlay_branch''.  '
-         || 'The 3 correct ways to invoke these tests (DON''T `cd test/` first):'
-         || chr(10)||chr(10)||'  (A) make check                    <- temp-instance, hooks auto-loaded'
-         || chr(10)||'  (B) make installcheck EXTRA_REGRESS_OPTS="--use-existing --host=/tmp --port=15433"'
-         || chr(10)||'  (C) pg_regress overlay_branch_advanced \'
+         || 'The 2 correct ways to invoke these tests (DON''T `cd test/` first):'
+         || chr(10)||chr(10)||'  (A) make installcheck EXTRA_REGRESS_OPTS="--use-existing --host=/tmp --port=15433"'
+         || chr(10)||'  (B) pg_regress overlay_branch_advanced \'
          || chr(10)||'         --inputdir=./test --outputdir=./test_output \'
          || chr(10)||'         --temp-config=$(pwd)/test/temp_instance_shared_libs.conf \'
          || chr(10)||'         --bindir=$(pg_config --bindir)'
@@ -143,7 +142,7 @@ FROM public.bs_L_upd WHERE id IN (11,12,13);
 -- L.2 Pure delta UPDATE by PK equality: WR CMD_UPDATE pure-delta MAIN-miss
 --     implementation (approach B) properly materializes the reconstructed slot,
 --     runs ModifyTable SET projection, and writes op=U back to delta_store.
---     Previous MVP NOP guard is bypassed because PK-equality qual is
+--     The NOP guard is bypassed because PK-equality qual is
 --     successfully decomposed.  Assert the row was updated correctly.
 UPDATE public.bs_L_upd SET payload = 'pd-c-UPD', score = score + 100 WHERE id = 11;
 SELECT CASE WHEN payload = 'pd-c-UPD' AND score = 130 THEN 'PASS:L2_UPD_PK_EQ_APPLIED'

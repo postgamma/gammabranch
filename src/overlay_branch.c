@@ -14,7 +14,7 @@
  *		- Step7 HARD GUARD functions (rel_ok / ddl_ok / ereport_fail)
  *		- SQL-callable function thin-dispatch wrappers (all real logic
  *		  lives in branch_lifecycle.c / delta_store.c / write_redirect.c)
- *		- overlay_main_plus_delta SRF (V1 manual Main+Delta view) and
+ *		- overlay_main_plus_delta SRF (manual Main+Delta view) and
  *		  overlay_branch_list SRF — both kept here because they use
  *		  public helpers only and are simple SQL-callable entry points.
  *
@@ -84,7 +84,7 @@ bool		overlay_branch_enabled = true;
 bool		overlay_keyless_tables = false;
 
 /* ================================================================
- * V3 multi-session tuning GUCs
+ * multi-session tuning GUCs
  * ================================================================ */
 int			ob_invalidation_check_threshold = 32;
 int			ob_invalidation_check_interval_ms = 100;
@@ -102,13 +102,27 @@ bool		ob_in_snapshot_mode_helper = false;
  *   Snapshot mode captures and registers a snapshot that pins the
  *   global RecentGlobalXmin, which delays vacuuming of dead rows
  *   for the ENTIRE cluster.  Indefinite pinning is a resource
- *   exhaustion DoS hazard.  To keep the MVP RESTRICTED posture, we
+ *   exhaustion DoS hazard.  To keep the RESTRICTED posture, we
  *   refuse to enter snapshot mode past this per-session lifetime
  *   budget (0 = allow infinite; PGC_POSTMASTER so superuser chooses).
  *   Enforcement lives in branch_lifecycle.c
  *   use_with_mode_internal() and throttled() helper.
  * ================================================================ */
 int			ob_snapshot_max_hold_minutes = 10; /* 10 minutes = default */
+
+/* ================================================================
+ * B1 delta-size observability GUCs
+ *
+ *   The write path already funnels every delta row through one
+ *   choke point (overlay_delta_insert).  When delta_size_warn_rows
+ *   is > 0 the choke point counts the current branch's delta rows
+ *   once every delta_size_check_interval writes and emits a single
+ *   WARNING per session when the count first exceeds the threshold
+ *   (see doc/internals.md §5.6).  Default 0 disables the whole
+ *   check, so the write path stays byte-for-byte unchanged.
+ * ================================================================ */
+int			ob_delta_size_warn_rows = 0;
+int			ob_delta_size_check_interval = 1024;
 
 /* ================================================================
  * Global session state
@@ -475,7 +489,7 @@ _PG_init(void)
 							 NULL,
 							 NULL);
 
-	/* -------- V3 multi-session GUCs (FR2/FR4/FR7 tunables) -------- */
+	/* -------- multi-session GUCs (FR2/FR4/FR7 tunables) -------- */
 	DefineCustomIntVariable("overlay_branch.invalidation_check_threshold",
 							"Run a SPI state-recheck after N calls to overlay_branch_is_active (FR4 fast-path override of NOTIFY push).",
 							"Set to 0 to disable call-count throttling and require time-based or NOTIFY-based invalidation only.",
@@ -577,6 +591,33 @@ _PG_init(void)
 							365 * 24 * 60,        /* ~1 year = upper bound */
 							PGC_POSTMASTER,
 							GUC_UNIT_MIN,
+							NULL,
+							NULL,
+							NULL);
+
+	/* -------- B1 delta-size observability (§5.6) -------- */
+	DefineCustomIntVariable("overlay_branch.delta_size_warn_rows",
+							"Emit a WARNING when the current branch's delta exceeds this many rows.",
+							"0 (default) disables the check entirely.  When > 0 the write path counts the delta rows of the session's branch once every overlay_branch.delta_size_check_interval writes and warns once per session on first overflow.",
+							&ob_delta_size_warn_rows,
+							0,
+							0,
+							INT_MAX / 2,
+							PGC_USERSET,
+							0,
+							NULL,
+							NULL,
+							NULL);
+
+	DefineCustomIntVariable("overlay_branch.delta_size_check_interval",
+							"Number of delta writes between delta-size checks (B1).",
+							"Amortizes the delta-size count over this many writes.  Only consulted when overlay_branch.delta_size_warn_rows > 0.",
+							&ob_delta_size_check_interval,
+							1024,
+							1,
+							INT_MAX / 2,
+							PGC_USERSET,
+							0,
 							NULL,
 							NULL,
 							NULL);
@@ -941,7 +982,7 @@ overlay_guard_ereport_fail(const char *operation, const char *relname,
 					operation,
 					relname ? psprintf(" relation \"%s\"", relname) : "",
 					brname,
-					reason ? reason : "operation is not supported in branch mode V1"),
+					reason ? reason : "operation is not supported in branch mode"),
 			 relname ? errdetail("Target relation: %s.", relname) : 0,
 			 /* The "switch back to MAIN" hint only makes sense when the
 			  * failing statement actually ran INSIDE branch mode. */
@@ -973,25 +1014,25 @@ overlay_guard_rel_ok(Relation rel, char **reason)
 	{
 		case RELKIND_RELATION: break;
 		case RELKIND_VIEW:
-			if (reason) *reason = psprintf("views are not supported (V1 branch mode only accepts plain heap tables with a PRIMARY KEY)");
+			if (reason) *reason = psprintf("views are not supported (branch mode only accepts plain heap tables with a PRIMARY KEY)");
 			return false;
 		case RELKIND_MATVIEW:
-			if (reason) *reason = psprintf("materialized views are not supported in V1");
+			if (reason) *reason = psprintf("materialized views are not supported");
 			return false;
 		case RELKIND_FOREIGN_TABLE:
-			if (reason) *reason = psprintf("foreign tables are not supported in V1");
+			if (reason) *reason = psprintf("foreign tables are not supported");
 			return false;
 		case RELKIND_PARTITIONED_TABLE:
-			if (reason) *reason = psprintf("partitioned root tables are not supported in V1");
+			if (reason) *reason = psprintf("partitioned root tables are not supported");
 			return false;
 		default:
-			if (reason) *reason = psprintf("relkind='%c' is not supported in V1 branch mode", rel->rd_rel->relkind);
+			if (reason) *reason = psprintf("relkind='%c' is not supported in branch mode", rel->rd_rel->relkind);
 			return false;
 	}
 
 	if (rel->rd_rel->relispartition)
 	{
-		if (reason) *reason = psprintf("partition child tables are not supported in V1");
+		if (reason) *reason = psprintf("partition child tables are not supported");
 		return false;
 	}
 
@@ -1002,7 +1043,7 @@ overlay_guard_rel_ok(Relation rel, char **reason)
 		{
 			if (!rel->trigdesc->triggers[i].tgisinternal)
 			{
-				if (reason) *reason = psprintf("user-defined triggers are not supported in V1 (found trigger \"%s\")",
+				if (reason) *reason = psprintf("user-defined triggers are not supported (found trigger \"%s\")",
 											   rel->trigdesc->triggers[i].tgname);
 				return false;
 			}
@@ -1041,7 +1082,7 @@ overlay_guard_rel_ok(Relation rel, char **reason)
 
 		if (nfk > 0 || nref > 0)
 		{
-			if (reason) *reason = psprintf("FOREIGN KEYs are not supported in V1 (this table has %d outgoing and is referenced by %d FK constraints)",
+			if (reason) *reason = psprintf("FOREIGN KEYs are not supported (this table has %d outgoing and is referenced by %d FK constraints)",
 										   nfk, nref);
 			return false;
 		}
@@ -1049,7 +1090,7 @@ overlay_guard_rel_ok(Relation rel, char **reason)
 
 	if (!overlay_relation_has_pk(rel) && !overlay_keyless_tables)
 	{
-		if (reason) *reason = psprintf("table must have a PRIMARY KEY for branch-mode DML (V1 constraint; enable overlay_branch.keyless_tables for the experimental ctid fallback)");
+		if (reason) *reason = psprintf("table must have a PRIMARY KEY for branch-mode DML (enable overlay_branch.keyless_tables for the experimental ctid fallback)");
 		return false;
 	}
 
@@ -1465,7 +1506,7 @@ overlay_ProcessUtility(PlannedStmt *pstmt, const char *queryString,
 			 *   ZERO write-redirect protection.  We intercept here
 			 *   because this is the single choke point for ALL COPY
 			 *   variants (COPY FROM view with INSTEAD OF trigger is
-			 *   rejected separately, but raw heap COPY is the MVP
+			 *   rejected separately, but raw heap COPY is the
 			 *   hazard).  COPY TO (read-side) is deliberately not
 			 *   blocked because a plain SELECT overlay-equivalent
 			 *   read is safe; we block only writes. */
@@ -1477,7 +1518,7 @@ overlay_ProcessUtility(PlannedStmt *pstmt, const char *queryString,
 					if (overlay_branch_is_active())
 						ereport(ERROR,
 								(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
-								 errmsg("overlay_branch MVP does not support COPY FROM inside a branch (R05 drift-write blocked)"),
+								 errmsg("overlay_branch does not support COPY FROM inside a branch (R05 drift-write blocked)"),
 								 errhint("Use INSERT ... VALUES / INSERT ... SELECT instead.  "
 										 "COPY FROM bypasses WriteRedirect and would silently write MAIN.")));
 					break;
@@ -1492,7 +1533,7 @@ overlay_ProcessUtility(PlannedStmt *pstmt, const char *queryString,
 				if (overlay_branch_is_active())
 					ereport(ERROR,
 							(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
-							 errmsg("overlay_branch MVP does not support MERGE inside a branch (R06 drift-write blocked)"),
+							 errmsg("overlay_branch does not support MERGE inside a branch (R06 drift-write blocked)"),
 							 errhint("Rework MERGE as separate INSERT/UPDATE/DELETE "
 									 "wrapped in a transaction; those DML are "
 									 "properly redirected to the delta store.")));
@@ -1886,7 +1927,7 @@ overlay_branch_list(PG_FUNCTION_ARGS)
 				}
 
 				/* Peek bid (col 0) first for possible mode-cache overlay
-				 * (FR2 V1 I8.2: mode no longer written to catalog per-use;
+				 * (FR2 I8.2: mode no longer written to catalog per-use;
 				 * it lives in a session-local bid HTAB to avoid cross-
 				 * session RowExclusiveLock contention). */
 				{
@@ -1972,7 +2013,7 @@ overlay_branch_list(PG_FUNCTION_ARGS)
 }
 
 /* ================================================================
- * overlay_main_plus_delta SRF — V1 manual Main+Delta view
+ * overlay_main_plus_delta SRF — manual Main+Delta view
  * ================================================================ */
 Datum
 overlay_main_plus_delta(PG_FUNCTION_ARGS)

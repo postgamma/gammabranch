@@ -1,7 +1,7 @@
 # AGENTS.md
 
 > Agent-only instructions for the `overlay_branch` PostgreSQL extension
-> (standalone repository; also buildable in-tree as `contrib/overlay_branch`).
+> (standalone repository, built with PGXS).
 > This is the "README for agents": context, build/test commands, and hard rules.
 > Anything detailed lives in `doc/` — see the index at the end. Do NOT mirror
 > trackers or test plans here.
@@ -54,11 +54,9 @@ Always run from the repository root.
 rm -rf src/*.o src/*.o.d *.so \
        test_output test_output_iso output_iso output_l3 tmp_check tmp_check_iso
 
-# standalone clone (PGXS) — pg_config on PATH must point at the PG 17 install
+# standalone (PGXS) — pg_config on PATH must point at the PG 17 install
 make -j4 USE_PGXS=1
 make install USE_PGXS=1     # may need sudo
-
-# in-tree (contrib/overlay_branch) — make -j4 && make install prefix=<pg_install>
 #   Zero-warning policy: gcc -Wall must print 0 warnings + 0 errors.
 #   `-Wdeclaration-after-statement` is a HARD FAIL (see §4).
 ```
@@ -71,18 +69,16 @@ Three layers — do **not** force cross-session races into L3.
 
 ```bash
 # L3 + L1.
-#   standalone clone: PGXS does NOT support `make check`; install first, then run
-#   against a running server that has shared_preload_libraries='overlay_branch'.
+#   PGXS does NOT support `make check`; install first, then run against a
+#   running server that has shared_preload_libraries='overlay_branch'.
 make installcheck USE_PGXS=1
-#   in-tree only: `make check` spins up its own temp instance.
-make check prefix=<pg_install>
-#   accept: L3 "ok 1..20" + "# All 20 tests passed.", L1 12/12, 0 diff
+#   accept: L3 "ok 1..21" + "# All 21 tests passed.", L1 15/15, 0 diff
 ```
 
 - **L2** — `pgbench` stress harness under `test/bench/`, run manually; see
   `test/bench/README.md`.
 
-**Locale prerequisite for `make check` / `make installcheck`.** The temp
+**Locale prerequisite for `make installcheck`.** The temp
 `initdb` needs a *real, installed* UTF-8 locale. A `LANG`/`LC_*` naming a missing
 locale (e.g. `zh_CN.UTF-8` on a bare host) aborts with `invalid locale settings`;
 forcing `LANG=C` instead mis-measures multibyte widths and yields bogus
@@ -99,7 +95,7 @@ column-width diffs in `mvcc_review` / `rentry`. Use `LC_ALL=C.utf8`.
    files behind.
 
 **Green-Bar = definition of "delivered"** — ALL of: 0-warning build,
-**two independent clean rebuilds**, and after rebuild #2 L3 20/20 + L1 12/12
+**two independent clean rebuilds**, and after rebuild #2 L3 21/21 + L1 15/15
 with both `diff -r` = 0 lines.
 
 ---
@@ -170,7 +166,7 @@ with both `diff -r` = 0 lines.
 ### Scope & gating
 - Reject at `create_branch` time (0A000/55000), never at execution: partitioned /
   foreign tables, views, matviews, foreign keys, multi-column PKs, non-PK UNIQUE.
-- **MVP write interceptions** — at the very top of the executor intercept before
+- **Write interceptions** — at the very top of the executor intercept before
   any redirect: `COPY FROM` → 0A000, `MERGE` → 0A000, data-modifying CTE on a
   managed table → 0A000.
 - **Write-through choke**: if a managed-table write reaches
@@ -187,15 +183,15 @@ with both `diff -r` = 0 lines.
 - **Conv-1 — every change ships with a test.** No behavior change (C, catalog SQL,
   hooks, GUC) without an L3 Section or L1 spec covering the positive path and,
   where applicable, the negative error path. Scope: public API → `user` /
-  `mvcc_review`; gates / errors → `rentry`; cross-session → `test/isolation/specs/`
-  + `isolation_schedule`; pure-delta → `puredelta` / `puredelta_mix`.
+  `mvcc_review`; gates / errors → `rentry`; cross-session → `test/isolation/specs/`;
+  pure-delta → `puredelta` / `puredelta_mix`.
 - **Conv-2 — design first.** Write the design into the matching section of
   `doc/internals.md` BEFORE coding — architecture / catalog → §1; BranchScan →
   §2; concurrency / MVCC → §3; keyless ctid → §4; performance → §5. Then code
   (`include/*.h` → `src/*.c` → `overlay_branch--0.1.sql`), then tests, then
   Green-Bar.
 - **Conv-3 — sync the user examples.** For every new/changed public API or
-  recommended pattern, open `doc/example_sql.md` and add or update a minimal,
+  recommended pattern, open `doc/user_guide.md` and add or update a minimal,
   runnable example block.
 
 **Before declaring done**: Green-Bar passes (§3); docs synced (Conv-2 + Conv-3). No
@@ -217,7 +213,7 @@ clearer).
 | File | What it covers |
 |---|---|
 | `README.md` | Human-facing feature overview + quick start. |
-| `doc/example_sql.md` | Copy-pasteable user scenarios (keep in sync — Conv-3). |
+| `doc/user_guide.md` | Copy-pasteable user scenarios (keep in sync — Conv-3). |
 | `doc/internals.md` | The single internal doc: architecture, BranchScan, concurrency, keyless ctid, performance, invariants. |
 | `test/README.md` | Test layout: L3 / L1 / L2 suites and how to run them. |
 | `test/bench/README.md` | L2 `pgbench` stress harness. |

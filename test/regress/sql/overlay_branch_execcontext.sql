@@ -53,7 +53,7 @@ DECLARE
 BEGIN
   IF _s NOT LIKE '%overlay_branch%' THEN
     _msg := 'Postmaster started WITHOUT shared_preload_libraries=''overlay_branch''.  '
-         || 'Use `make check`, or `make installcheck EXTRA_REGRESS_OPTS="--use-existing --host=/tmp --port=5432"`.';
+         || 'Use `make installcheck EXTRA_REGRESS_OPTS="--use-existing --host=/tmp --port=5432"`.';
     RAISE EXCEPTION '%', _msg;
   END IF;
 END $$;
@@ -209,7 +209,7 @@ UPDATE public.ob_ec_ref SET v = 'ref-1' WHERE id = 1;
 
 -- Capture the token with a plain SELECT from MAIN mode: the capture table has
 -- no PRIMARY KEY, so writing it while the branch is active would be rejected
--- by the branch-mode DML guard (V1 constraint).
+-- by the branch-mode DML guard (constraint).
 SELECT overlay_branch.use_branch(NULL);
 UPDATE ob_ec_tok
    SET tok = (SELECT d.old_version

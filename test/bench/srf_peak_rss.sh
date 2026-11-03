@@ -13,7 +13,7 @@
 #   only observe allocations that outlive the statement; the scratch is gone
 #   by the time the statement ends.  The process footprint during the scan is
 #   the only observable, which is why this probe lives in test/bench and is
-#   NOT part of `make check` (see README.md).
+#   NOT part of `make installcheck` (see README.md).
 #
 # Method (why two scans)
 #   A single scan is not a usable signal.  Even with the leak fixed, the first

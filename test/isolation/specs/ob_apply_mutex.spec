@@ -1,7 +1,7 @@
 # ob_apply_mutex.spec — L1 pg_isolation_regress (T8)
 # Covers:
 #   P1(AC-A1): dual-apply mutex CAS; loser → kick ERROR "not active (state=applying)"
-#   P2(AC-A3): reverse order apply; no deadlock (FR2 V1: no shared→exclusive upgrade)
+#   P2(AC-A3): reverse order apply; no deadlock (FR2: no shared→exclusive upgrade)
 # I8.2: 2 permutations → 2 unique branch names (setup runs only once per spec).
 
 setup
@@ -73,5 +73,5 @@ step "ctrl_p2_state" { SELECT state FROM overlay_branch.pg_branch WHERE branch_n
 permutation "ctrl_p1_setup" "s1_p1_begin" "s1_p1_use" "s2_p1_begin" "s2_p1_use" "s1_p1_apply" "s2_p1_apply" "s1_p1_commit" "s2_p1_commit" "ctrl_p1_state"
 
 # P2 (AC-A3 reverse order): s1 locks and applies first BEFORE s2 ever use+apply.
-# FR2 V1 protocol guarantees NO shared→exclusive upgrade → no deadlock possible.
+# FR2 protocol guarantees NO shared→exclusive upgrade → no deadlock possible.
 permutation "ctrl_p2_setup" "s1_p2_begin" "s1_p2_use" "s1_p2_apply" "s2_p2_begin" "s2_p2_use" "s2_p2_apply" "s1_p2_commit" "s2_p2_commit" "ctrl_p2_state"

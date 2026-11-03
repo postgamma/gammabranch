@@ -2,7 +2,7 @@
 
 > Implementation of the `overlay_branch` extension: architecture, BranchScan,
 > concurrency control, keyless ctid identity and performance.
-> The only user-facing companion document is [example_sql.md](example_sql.md)
+> The only user-facing companion document is [user_guide.md](user_guide.md)
 > (runnable SQL examples); everything internal lives here.
 
 ---
@@ -44,14 +44,14 @@
   - [4.4 Write / read / apply path mapping](#44-write--read--apply-path-mapping)
   - [4.5 Anchor-invalidation triggers](#45-anchor-invalidation-triggers)
   - [4.6 Persistence & retention](#46-persistence--retention)
-  - [4.7 MVP scope](#47-mvp-scope)
+  - [4.7 Scope](#47-scope)
 - [5. Performance](#5-performance)
   - [5.1 Performance model & notation](#51-performance-model--notation)
   - [5.2 Identified bottlenecks / first-round measurement conclusions](#52-identified-bottlenecks--first-round-measurement-conclusions)
   - [5.3 Read-path optimizations](#53-read-path-optimizations)
   - [5.4 Write-path optimization WR-1 and redundant index](#54-write-path-optimization-wr-1-and-redundant-index)
   - [5.5 Apply batching (AP-1)](#55-apply-batching-ap-1)
-  - [5.6 Delta size: current state and observability](#56-delta-size-current-state-and-observability)
+  - [5.6 Delta size: observability](#56-delta-size-observability)
   - [5.7 Measurement pitfalls](#57-measurement-pitfalls)
   - [5.8 Baseline methodology](#58-baseline-methodology)
 - [6. Key invariants and corner cases](#6-key-invariants-and-corner-cases)
@@ -130,7 +130,7 @@ the current MAIN row, normalized by key.
 
 **Pure-delta rules** (`old_version IS NULL` = the row never existed in MAIN):
 `op=D` (inserted then deleted inside the branch) is a NOP; `op=I` goes to Pass 3;
-`op=U` is not produced by the MVP (treated as DELETE + INSERT). **PK type
+`op=U` is not produced by the current implementation (treated as DELETE + INSERT). **PK type
 constraint**: the chain must use the typmod-aware type name and `rtrim` BPCHAR
 keys on both sides, else `BPCHAR(N)` / `NUMERIC(p,s)` keys mismatch.
 
@@ -554,7 +554,8 @@ the original `key` carried with each delta row (a rebuilt keyless slot has no
 usable ctid), else repeated UPSERTs mint new keys and duplicate on read.
 **Apply** rebuilds the WHERE clause from the key: `A:` → `ctid =
 '(<blk>,<off>)'::tid`; `S:` → no positioning (pure INSERT); PK JSON → status quo;
-conflict validation reuses the ctid/xmin/`_base` chain, decoupled from the PK.
+conflict validation reuses the ctid/xmin/`_base` chain, decoupled from the PK;
+the set-based replay joins keyless deltas on that ctid anchor instead of a PK.
 
 ### 4.5 Anchor-invalidation triggers
 
@@ -563,8 +564,8 @@ same logical row; other sessions can break it:
 
 | Trigger | Read side | apply side |
 |---|---|---|
-| Concurrent UPDATE of an anchored row | delta unmatched → **silent drop** | no visible row → 0A000 |
-| Concurrent DELETE | same as above | same as above |
+| Concurrent UPDATE of an anchored row | version chain followed → delta **re-anchored** to the current version | no visible row → 0A000 |
+| Concurrent DELETE | delta unmatched → **silent drop** | no visible row → 0A000 |
 | ctid reuse (new INSERT after VACUUM takes the slot) | ctid match hits the new row; the `xmin` check deems it stale → dropped (**no misread**) | `old_version` `xmin` mismatch → 0A000 |
 | Whole-table rewrite (`VACUUM FULL`/`CLUSTER`/`REINDEX`/`TRUNCATE` refill) | all anchors mismatch → **silent drop** | 0A000 row by row |
 
@@ -572,6 +573,19 @@ The read side's `xmin` check: after a ctid equality match, Pass 1 compares the
 `-x<xmin>` suffix of `old_version` against the MAIN tuple's raw `xmin`; on
 mismatch the row falls into the Pass 2 orphan rule (unmatched `A:*` orphans are
 not revived), so ctid reuse degrades to a silent drop rather than a misread.
+
+**Version-chain resolution (read side).** When a concurrent UPDATE moves an
+anchored row to a new ctid, the delta's stale anchor would otherwise go
+unmatched. At scan setup the reader resolves each keyless `A:` anchor along the
+`t_ctid` chain with `heap_get_latest_tid` (under the scan's snapshot) and, when
+the row has moved, registers the delta under the current ctid so Pass 1 still
+matches it. The resolution is guarded: the anchor line pointer must still hold
+the same logical version (its raw `xmin` equals the `old_version` suffix), so a
+recycled line pointer is never re-anchored. It is deliberately read-only — the
+persisted anchor key is left untouched, so apply still reports the moved row as
+a 0A000 conflict. `DELETE`d rows and whole-table rewrites have no `t_ctid`
+successor to follow and keep the silent-drop behavior.
+
 Rewrite-type DDL is blocked while a branch is active, but during the inactive
 window (after exit, before apply) it cannot be, so the apply-side `old_version`
 is the only fallback (0A000).
@@ -600,16 +614,32 @@ pinned).
   invalidation. It is **explicitly not implemented** — no switch, no code path; if
   added later it must be an independent GUC with a max-hold TTL auto-release.
 
-### 4.7 MVP scope
+### 4.7 Scope
 
 **Implemented:** SELECT / INSERT / UPDATE / DELETE on no-PK tables (best-effort
-Approach A); the identity serializer, the read-side anchor `xmin` check, apply
-positioning and conflict validation, and the per-`(session, relid)` WARNING.
-**Unsupported (existing 0A000 style):** keyless + `INSERT ... ON CONFLICT`
-(UPSERT depends on the PK); keyless + partitioned / foreign-key / `MERGE` /
-`COPY FROM` / DML-CTE; consistency under concurrent MAIN writes (silent drop,
-apply error as fallback); version-chain resolution for stale ctids
-(`heap_get_latest_tid`) — a future enhancement.
+Approach A); the identity serializer, the read-side anchor `xmin` check and
+version-chain resolution, apply positioning and conflict validation, the
+per-`(session, relid)` WARNING, and `INSERT ... ON CONFLICT` (see below).
+
+**Keyless UPSERT.** A no-PK table arbitrates a conflict on the UNIQUE constraint
+the statement names, not on the ctid identity that keys the delta. The redirect
+reuses the PK path's two-phase detector with its probes rebound to the arbiter
+columns, so all downstream promotion and apply behaviour is unchanged:
+
+- the arbiter must resolve to exactly one UNIQUE index (multi-column allowed);
+  several candidate indexes, or an expression index, keep the 0A000 guard;
+- phase one matches a delta row whose stored image carries the proposed arbiter
+  values, restricted to the live insert/update states so a tombstone still
+  permits rebirth;
+- phase two matches a MAIN row carrying the same arbiter values;
+- on a MAIN hit the delta is re-anchored to that row's ctid with its version
+  token, on a delta hit the existing delta key and version are reused, and with
+  no hit the row takes a synthetic key as a plain insert.
+
+**Unsupported (existing 0A000 style):** keyless + partitioned / foreign-key /
+`MERGE` / `COPY FROM` / DML-CTE, and a keyless UPSERT whose arbiter does not
+resolve to exactly one UNIQUE index; consistency under concurrent `DELETE` /
+whole-table rewrites (silent drop on the read side, apply error as fallback).
 
 ---
 
@@ -712,9 +742,10 @@ token re-queried the heap for those two values.
   LIMIT 1`) plus a batched DML (`jsonb_populate_record` + a PK join). Key
   uniqueness makes op key sets mutually exclusive, preserving D→U→I error
   precedence; the DML's own row locks replace per-row `FOR UPDATE`, and any
-  conflict rolls back all batched DML. Falls back per-row for GUC off / keyless
-  relation / any delta row containing `_base`. A 20000-row apply drops from
-  ~1261 ms to ~166 ms (~7×).
+  conflict rolls back all batched DML. Keyless relations batch through a
+  ctid-anchor join (the `A:<blk>:<off>` key rendered as `m.ctid = ...`) instead
+  of a PK join. Falls back per-row for GUC off / any delta row containing
+  `_base`. A 20000-row apply drops from ~1261 ms to ~166 ms (~7×).
 
 Invariants preserved: D→U→I order; per-row optimistic conflict semantics
 (missing MAIN / `old_version` mismatch / HOT base-image divergence → 55000);
@@ -722,22 +753,38 @@ pure-delta cases; keyless identity; lock order advisory → catalog → user
 `RowExclusiveLock`; the CAS state machine with the xact-scoped exclusive advisory
 lock. Error messages stay byte-for-byte aligned with the baselines.
 
-### 5.6 Delta size: current state and observability
+### 5.6 Delta size: observability
 
 `M` is independent of operation count, so "the delta grows without bound" does
 not hold; the real risk is a branch touching near the whole table, plus the
-per-row weight doubled by `_base`. There is no size query interface or bound.
+per-row weight doubled by `_base`. Two read-only products expose this:
 
 | Metric | Definition |
 |---|---|
 | `delta_rows` | `count(*)` on `(branch_id, relid)` |
+| `delta_insert` / `delta_update` / `delta_delete` | per-`op` row counts |
 | `delta_payload_bytes` | `sum` of key + old_version + tuple_data octet lengths |
-| `delta_relation_bytes` | `pg_total_relation_size('pg_branch_delta')` |
 | `main_bytes` | `pg_total_relation_size(relid)` |
 | `amplification` | `delta_payload_bytes / main_bytes` (includes the `_base` doubling) |
 
-Reference queries are in `test/bench/perf_baseline.sql`; productization (a stats
-view + throttled WARNING) is a separate future increment.
+**Query interface — `branch_delta_stats(branch_name)`.** A read-only SQL
+function returning one row per `(branch, relation)`, plus a `public` synonym.
+It exposes counts and byte sizes only — never delta row content. Access mirrors
+`list_branches()`: it reads the delta catalog, which is administrator-only per
+R22, so SECURITY INVOKER is retained.
+
+**Throttled WARNING.** `overlay_branch.delta_size_warn_rows` (int, default 0 =
+disabled, PGC_USERSET). When > 0, the single delta-write choke point
+(`overlay_delta_insert`) counts the current branch's delta rows once every
+`overlay_branch.delta_size_check_interval` (int, default 1024) writes and emits
+one WARNING per session when the count first exceeds the threshold, naming the
+branch and pointing at `branch_delta_stats()`. The count is amortized over the
+interval, the counter is session-local and never persisted, and the check runs
+inside `PG_TRY` fail-open so a catalog/SPI problem can never break user DML.
+Both GUCs are no-ops when the threshold is 0, so the default write path is
+unchanged.
+
+Reference queries remain in `test/bench/perf_baseline.sql`.
 
 ### 5.7 Measurement pitfalls
 

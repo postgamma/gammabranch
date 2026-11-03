@@ -25,10 +25,9 @@ DECLARE
 BEGIN
   IF _s NOT LIKE '%overlay_branch%' THEN
     _msg := 'Postmaster started WITHOUT shared_preload_libraries=''overlay_branch''.  '
-         || 'The 3 correct ways to invoke these tests (DON''T `cd test/` first):'
-         || chr(10)||chr(10)||'  (A) make check                    <- temp-instance, hooks auto-loaded'
-         || chr(10)||'  (B) make installcheck EXTRA_REGRESS_OPTS="--use-existing --host=/tmp --port=15433"'
-         || chr(10)||'  (C) pg_regress overlay_branch_advanced \'
+         || 'The 2 correct ways to invoke these tests (DON''T `cd test/` first):'
+         || chr(10)||chr(10)||'  (A) make installcheck EXTRA_REGRESS_OPTS="--use-existing --host=/tmp --port=15433"'
+         || chr(10)||'  (B) pg_regress overlay_branch_advanced \'
          || chr(10)||'         --inputdir=./test --outputdir=./test_output \'
          || chr(10)||'         --temp-config=$(pwd)/test/temp_instance_shared_libs.conf \'
          || chr(10)||'         --bindir=$(pg_config --bindir)'
@@ -212,7 +211,7 @@ FROM public.bs_pk_edge WHERE id = 1;
 
 -- G.4 Verify same MAIN-row PK DELETE tombstone -> INSERT rebirth;
 --      pure-INSERT-only row DELETE/UPDATE requires WR-path extra
---      support (MVP-out-of-scope, covered in H.2).
+--      support (out-of-scope, covered in H.2).
 DELETE FROM public.bs_pk_edge WHERE id = 3;
 SELECT CASE WHEN count(*) = 0 THEN 'PASS:ADV_G4_ID3_TOMBSTONED'
             ELSE 'FAIL:'||count(*) END AS adv_g4_id3_dead
@@ -282,9 +281,9 @@ DROP TABLE public.bs_pk_bpchar;
 --     BranchScan) because the Planner hook returns early for non-SELECT
 --     commandType (Confirmed fact 6).  So DELETE WHERE id=5: subplan scans
 --     MAIN -> 0 rows matched -> ndone=0.  Correct pure-delta DML needs
---     either BranchScan injection on the subplan side (MVP-out-of-scope) OR
+--     either BranchScan injection on the subplan side (out-of-scope) OR
 --     re-running the original subplan's ExecQual qual in our foreach.
---     MVP-safe assertions: (H2a) pure INSERT is readable; (H2b) real pure-
+--     safe assertions: (H2a) pure INSERT is readable; (H2b) real pure-
 CREATE TABLE public.bs_pk_bug2 (id INT4 PRIMARY KEY, payload TEXT);
 INSERT INTO public.bs_pk_bug2 VALUES (1,'a'),(2,'b'),(3,'c');
 SELECT overlay_branch.create_branch('bs_h2_b');

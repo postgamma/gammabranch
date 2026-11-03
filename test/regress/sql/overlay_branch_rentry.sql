@@ -22,10 +22,9 @@ DECLARE
 BEGIN
   IF _s NOT LIKE '%overlay_branch%' THEN
     _msg := 'Postmaster started WITHOUT shared_preload_libraries=''overlay_branch''.  '
-         || 'The 3 correct ways to invoke these tests (DON''T `cd test/` first):'
-         || chr(10)||chr(10)||'  (A) make check                    <- temp-instance, hooks auto-loaded'
-         || chr(10)||'  (B) make installcheck EXTRA_REGRESS_OPTS="--use-existing --host=/tmp --port=15433"'
-         || chr(10)||'  (C) pg_regress overlay_branch_advanced \'
+         || 'The 2 correct ways to invoke these tests (DON''T `cd test/` first):'
+         || chr(10)||chr(10)||'  (A) make installcheck EXTRA_REGRESS_OPTS="--use-existing --host=/tmp --port=15433"'
+         || chr(10)||'  (B) pg_regress overlay_branch_advanced \'
          || chr(10)||'         --inputdir=./test --outputdir=./test_output \'
          || chr(10)||'         --temp-config=$(pwd)/test/temp_instance_shared_libs.conf \'
          || chr(10)||'         --bindir=$(pg_config --bindir)'
@@ -213,9 +212,9 @@ BEGIN
         RETURN;
     END;
 
-    -- MVP G06 constraint: PG 17 has no per-table publish=false mechanism (publish is a publication-level
+    -- G06 constraint: PG 17 has no per-table publish=false mechanism (publish is a publication-level
     -- WITH option controlling insert/update/delete/truncate). FOR ALL TABLES will include all
-    -- permanent non-catalog RELATIONs; therefore overlay_branch.* internal tables at the MVP stage
+    -- permanent non-catalog RELATIONs; therefore overlay_branch.* internal tables at this stage
     -- will appear in pg_publication_tables (this is a PG upstream API limitation).
     -- Our defense: E-2 create/use/apply/discard entries emit WARNING when puball=true,
     -- deployment doc recommends FOR TABLE x ONLY or manual exclusion. Here we only verify publication is truly created +
@@ -256,7 +255,7 @@ DROP TABLE IF EXISTS public.r_entry_t;
 RESET client_min_messages;
 
 -- =====================================================================
--- Section R21 : R21 MVP pre-check pass — NOT NULL (ERRCODE 23502) + PK
+-- Section R21 : R21 pre-check pass — NOT NULL (ERRCODE 23502) + PK
 --               UNIQUE on both MAIN/delta sides (ERRCODE 23505) on plain INSERT
 --               (ONCONFLICT_NONE path).  All errors MUST fire BEFORE
 --               any MAIN/delta write (zero side effects), so post-error
@@ -381,7 +380,7 @@ DROP TABLE public.t_r21;
 
 -- =====================================================================
 -- ===== Section G02 (REVIEW-260926 S13 §6):
--- =====   MVP ACL minimum hardening (double-layer defense).
+-- =====   ACL minimum hardening (double-layer defense).
 -- =====
 -- ===== Matrix re-stated here for test traceability:
 -- =====   create_branch                  → superuser | mgmt role only
@@ -594,7 +593,7 @@ DROP ROLE IF EXISTS regress_g02_alice;
 DROP ROLE IF EXISTS regress_g02_bob;
 
 /* =====================================================================
- * Section G01: MVP create_branch scope pre-flight guard (FAIL FAST)
+ * Section G01: create_branch scope pre-flight guard (FAIL FAST)
  *
  * Overview (10 sub-cases, PASS labels prefix PASS:G01_SCOPE_*):
  *   G01_A clean-schema create OK after cleanup
@@ -757,7 +756,7 @@ SELECT CASE WHEN (SELECT create_branch('br_g01_final_clean') IS NOT NULL)
 SELECT discard_branch('br_g01_final_clean');
 
 /* ================================================================
- * §A7 / Gx: schema epoch registry + DDL restricted MVP
+ * §A7 / Gx: schema epoch registry + DDL restricted
  * 12 subcases: registry populated at create → drift 55000 kick-out
  * at use/apply → DDL inside active branch → 0A000 §A7 → discard
  * cascade deletes registry → Z clean recreate/apply PASS.

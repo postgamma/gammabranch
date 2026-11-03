@@ -113,6 +113,16 @@ static const CustomExecMethods ob_branchscan_exec_methods = {
  * by the caller (the relation is borrowed, the state is reclaimed with the
  * context).
  * ================================================================ */
+
+/* B2: one keyless anchor whose MAIN row moved to a different physical version
+ * (a concurrent UPDATE followed along the t_ctid chain).  `key` is the CURRENT
+ * "A:<blk>:<off>" of the row; `dt` is the delta that anchored the OLD ctid. */
+typedef struct ObAnchorRemap
+{
+    char       *key;
+    DeltaTuple *dt;
+} ObAnchorRemap;
+
 typedef struct OverlayScanState
 {
     MemoryContext   result_cxt;   /* owns the iterator + long-lived (P0) slots */
@@ -146,6 +156,15 @@ typedef struct OverlayScanState
     /* ---- Pass 2: pure-delta orphans (no MAIN counterpart) ---- */
     bool            pass2_started;
     ListCell       *pass2_cur;
+
+    /* ---- B2: keyless anchor re-anchoring (doc/internals.md §4.5) ----
+     * A concurrent UPDATE moves an anchored MAIN row to a new ctid, leaving
+     * the delta's persisted "A:<old ctid>" key stale.  At open() we follow
+     * every keyless anchor along its t_ctid chain and, when the row has
+     * moved, record the CURRENT ctid key here so Pass 1 still matches it.
+     * Sorted by key for bsearch; empty when nothing moved. */
+    ObAnchorRemap **remap_arr;
+    int             remap_n;
 } OverlayScanState;
 
 static OverlayScanState *overlay_scan_open(Relation rel, int32 branch_id,
@@ -220,6 +239,27 @@ ob_cmp_searchkey_vs_dtp(const void *vkey, const void *velem)
     return strcmp(ka, kd);
 }
 
+/* qsort comparator for ObAnchorRemap* by their (ctid) key; keys are never
+ * NULL here (only moved anchors with a fresh "A:<blk>:<off>" are recorded). */
+static int
+ob_cmp_remap_by_key(const void *a, const void *b)
+{
+    ObAnchorRemap *const *ra = (ObAnchorRemap *const *) a;
+    ObAnchorRemap *const *rb = (ObAnchorRemap *const *) b;
+
+    return strcmp((*ra)->key, (*rb)->key);
+}
+
+/* bsearch comparator: const char* (key) vs ObAnchorRemap*. */
+static int
+ob_cmp_key_vs_remap(const void *vkey, const void *velem)
+{
+    const char *key = (const char *) vkey;
+    ObAnchorRemap *const *re = (ObAnchorRemap *const *) velem;
+
+    return strcmp(key, (*re)->key);
+}
+
 /* ----- ExtendedCustomScanState: embed CustomScanState as 1st field per PG
  * design rule (ExecInitCustomScan nodeCustom.c L36-40).  BranchScanState
  * follows immediately so we can recover it with a simple container_of.
@@ -236,7 +276,7 @@ typedef struct ExtendedCustomScanState
     Relation      rel;
     Oid           relid;
     int32         branch_id;
-    /* P0 PK-IndexScan MVP: fast-path info passed through from the Planner hook */
+    /* P0 PK-IndexScan fast path: info passed through from the Planner hook */
     bool          has_pk_pred;
     char         *pk_where_sql;
     char         *pk_serialized_key;
@@ -301,6 +341,102 @@ ob_anchor_is_stale(const DeltaTuple *dt, TransactionId raw_xmin)
     return anchor_xmin != raw_xmin;
 }
 
+/* ================================================================
+ * B2 — read-side version-chain resolution (doc/internals.md §4.5)
+ *
+ * A keyless delta anchors a MAIN row by the physical ctid it had when the
+ * branch first touched it ("A:<blk>:<off>").  A concurrent MAIN UPDATE moves
+ * that row to a new ctid (the old line pointer keeps a dangling t_ctid link),
+ * so the persisted anchor key no longer matches the version the MAIN scan now
+ * sees; without resolution the delta would be silently dropped (Pass 2 orphan
+ * rule).  Here we chase every keyless anchor forward along its t_ctid chain
+ * and, when the row has moved to a version VISIBLE to this scan's snapshot,
+ * record the CURRENT "A:<blk>:<off>" key so Pass 1 still pairs the two.
+ *
+ * Safety — never graft onto a recycled line pointer: the anchored ctid is
+ * fetched with SnapshotAny and its raw xmin must equal the xmin half of
+ * old_version.  VACUUM may recycle the LP and a later INSERT reuse it, giving
+ * a different xmin; that anchor is rejected and the delta keeps the legacy
+ * silent-drop behaviour.
+ *
+ * Read-only: the persisted anchor key is never rewritten (the apply path
+ * still reports its conflict), so this changes only what an overlay READ
+ * shows.
+ * ================================================================ */
+static void
+ob_resolve_moved_anchors(OverlayScanState *st)
+{
+    ListCell   *lc;
+    MemoryContext oldcxt;
+
+    oldcxt = MemoryContextSwitchTo(st->result_cxt);
+    foreach(lc, st->delta_list)
+    {
+        DeltaTuple     *dt = (DeltaTuple *) lfirst(lc);
+        ItemPointerData anchor;
+        TransactionId   anchor_xmin;
+        HeapTupleData   htup;
+        Buffer          buf;
+        ItemPointerData latest;
+        unsigned int    blk = 0;
+        unsigned int    off = 0;
+
+        if (dt == NULL || dt->key == NULL || dt->old_version == NULL)
+            continue;
+        if (!(dt->key[0] == 'A' && dt->key[1] == ':'))
+            continue;
+
+        if (sscanf(dt->key + 2, "%u:%u", &blk, &off) != 2)
+            continue;                   /* malformed: leave to the legacy path */
+        ItemPointerSet(&anchor, blk, off);
+
+        if (!overlay_base_ver_parse_xmin(dt->old_version, &anchor_xmin))
+            continue;
+
+        /* Prove the anchored line pointer still holds the SAME logical version
+         * BEFORE trusting the chain: heap_get_latest_tid() cannot check the
+         * first tuple's xmin (priorXmax starts Invalid). */
+        htup.t_self = anchor;
+        htup.t_data = NULL;
+        htup.t_len  = 0;
+        if (!heap_fetch(st->rel, SnapshotAny, &htup, &buf, false))
+            continue;                   /* LP dead/unused: nothing to chase */
+        if (!TransactionIdEquals(HeapTupleHeaderGetRawXmin(htup.t_data),
+                                 anchor_xmin))
+        {
+            ReleaseBuffer(buf);
+            continue;                   /* recycled LP: refuse to graft */
+        }
+        ReleaseBuffer(buf);
+
+        /* Follow t_ctid to the version visible to this scan's snapshot. */
+        latest = anchor;
+        heap_get_latest_tid(st->tscan, &latest);
+        if (ItemPointerEquals(&latest, &anchor))
+            continue;                   /* did not move: normal Pass 1 match */
+
+        if (st->remap_arr == NULL)
+            st->remap_arr = (ObAnchorRemap **)
+                palloc(sizeof(ObAnchorRemap *) * (st->M_total + 1));
+
+        {
+            ObAnchorRemap *rm = (ObAnchorRemap *) palloc(sizeof(ObAnchorRemap));
+
+            rm->key = psprintf("A:%u:%u",
+                               ItemPointerGetBlockNumber(&latest),
+                               ItemPointerGetOffsetNumber(&latest));
+            rm->dt  = dt;
+            st->remap_arr[st->remap_n++] = rm;
+        }
+    }
+
+    if (st->remap_n > 1)
+        qsort(st->remap_arr, st->remap_n, sizeof(ObAnchorRemap *),
+              ob_cmp_remap_by_key);
+
+    MemoryContextSwitchTo(oldcxt);
+}
+
 /* One MAIN baseline row as produced by the MAIN reader below: the merge
  * input slot plus the physical half of the keyless anchor.  The ctid half
  * lives in slot->tts_tid; raw_xmin is kept separately because the anchor
@@ -316,7 +452,7 @@ typedef struct ObMainRow
  * SHARED streaming 2-pass overlay iterator (used by BOTH the SRF and the
  * CustomScan executor).
  *
- *   PK-predicate fast-path (P0 MVP):
+ *   PK-predicate fast-path (P0):
  *     has_pk_pred = true
  *     pk_where_sql = non-empty SQL fragment like "id = 10::integer"
  *     pk_serialized_key = non-empty JSON array string like '["10"]'
@@ -330,7 +466,7 @@ typedef struct ObMainRow
  *   -> table_beginscan/table_scan_getnextslot replaces SPI `SELECT *`
  *   -> qual pre-filters MAIN rows (PK tables only; for keyless the Pass2 fallback does not apply)
  *
- *   General non-PK qual pushdown (P2 MVP)  SQL text now only serves the P0
+ *   General non-PK qual pushdown (P2)  SQL text now only serves the P0
  *   point lookup; equivalent non-P0 filtering is handled by the qual prefilter.
  *
  * RD-6 turns the old helper from “materialize the full List<slot> up front” into an iterator:
@@ -717,6 +853,13 @@ overlay_scan_open(Relation rel, int32 branch_id,
 
         st->probe = MakeSingleTupleTableSlot(reldesc, &TTSOpsBufferHeapTuple);
         st->tscan = table_beginscan(rel, snap, 0, NULL);
+
+        /* B2: keyless anchors whose MAIN row was moved by a concurrent UPDATE
+         * are re-anchored to the current version here, using the scan snapshot
+         * just established.  Keyless never takes the P0 path (no PK predicate),
+         * so the heap scan descriptor is always available. */
+        if (!st->rel_has_pk && st->M_total > 0)
+            ob_resolve_moved_anchors(st);
     }
 
     MemoryContextSwitchTo(oldcxt);
@@ -821,6 +964,7 @@ overlay_scan_next(OverlayScanState *st)
         {
             char            *pk_key = NULL;
             DeltaTuple      *match = NULL;
+            bool             matched_via_remap = false;
             TypedKey        *main_typed_pk = NULL;
             int              main_typed_n = 0;
             TupleTableSlot  *output_slot;
@@ -874,11 +1018,33 @@ overlay_scan_next(OverlayScanState *st)
                     match = *found;
             }
 
+            /* B2: a keyless anchor whose MAIN row was moved by a concurrent
+             * UPDATE (the persisted "A:<old ctid>" key no longer matches the
+             * row Pass 1 now sees) is recovered by its CURRENT ctid key via
+             * the remap table built at open().  Consulted only when the direct
+             * anchor lookup missed. */
+            if (match == NULL && !st->rel_has_pk &&
+                st->remap_n > 0 && pk_key != NULL)
+            {
+                ObAnchorRemap **re;
+
+                re = (ObAnchorRemap **) bsearch(pk_key, st->remap_arr,
+                                                st->remap_n,
+                                                sizeof(ObAnchorRemap *),
+                                                ob_cmp_key_vs_remap);
+                if (re != NULL)
+                {
+                    match = (*re)->dt;
+                    matched_via_remap = true;
+                }
+            }
+
             /* keyless: a ctid-only match can hit a RECYCLED line pointer
              * (VACUUM freed it, a later INSERT reused it).  Reject the anchor
              * then, so the branch edit is not grafted onto an unrelated row;
-             * the delta falls to the Pass 2 orphan rule and is dropped. */
-            if (!st->rel_has_pk && match != NULL &&
+             * the delta falls to the Pass 2 orphan rule and is dropped.  A
+             * remap match is exempt: it was already xmin-verified at open(). */
+            if (!st->rel_has_pk && match != NULL && !matched_via_remap &&
                 ob_anchor_is_stale(match, raw_xmin))
                 match = NULL;
 
@@ -1009,6 +1175,23 @@ overlay_scan_close(OverlayScanState *st)
     {
         pfree(st->arr);
         st->arr = NULL;
+    }
+    if (st->remap_arr != NULL)
+    {
+        int i;
+
+        for (i = 0; i < st->remap_n; i++)
+        {
+            if (st->remap_arr[i] != NULL)
+            {
+                if (st->remap_arr[i]->key != NULL)
+                    pfree(st->remap_arr[i]->key);
+                pfree(st->remap_arr[i]);
+            }
+        }
+        pfree(st->remap_arr);
+        st->remap_arr = NULL;
+        st->remap_n = 0;
     }
     if (st->delta_list != NIL)
     {
@@ -1295,7 +1478,7 @@ ob_branchscan_planner_hook(PlannerInfo *root, RelOptInfo *rel,
         return;
 
     /* ================================================================
-     * REVIEW-260926 / R16: MVP guard for ModifyingCTE (Data-Modifying
+     * REVIEW-260926 / R16: guard for ModifyingCTE (Data-Modifying
      *   statements inside WITH clauses).
      *
      * Why THREE separate choke points (belt-and-braces, redundancy by
@@ -1339,7 +1522,7 @@ ob_branchscan_planner_hook(PlannerInfo *root, RelOptInfo *rel,
              * planning; PG_TRY/CATCH in caller handles it). */
             ereport(ERROR,
                     (errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
-                     errmsg("overlay_branch MVP does not support data-modifying statements inside WITH (CTE) clauses (R16 planner-stage blocked)"),
+                     errmsg("overlay_branch does not support data-modifying statements inside WITH (CTE) clauses (R16 planner-stage blocked)"),
                      errhint("Rewrite WITH (UPDATE/DELETE/INSERT ... RETURNING) SELECT ... "
                              "using a TEMP TABLE to collect RETURNING rows:\n"
                              "  CREATE TEMP TABLE _r AS UPDATE t SET ... RETURNING ...;\n"
@@ -1347,7 +1530,7 @@ ob_branchscan_planner_hook(PlannerInfo *root, RelOptInfo *rel,
         }
     }
 
-    /* B2 PRE-CHECK: MVP injects CustomScan for pure SELECT, and (ACC-1) for
+    /* B2 PRE-CHECK: we inject CustomScan for pure SELECT, and (ACC-1) for
      * the DML target baserel of an UPDATE/DELETE so the DML subplan reads
      * overlay rows.  Every other non-SELECT command (INSERT, and the FROM/USING
      * side of UPDATE ... FROM / DELETE ... USING, which is a non-target RTI)
@@ -1443,7 +1626,7 @@ ob_branchscan_planner_hook(PlannerInfo *root, RelOptInfo *rel,
         CustomPath *cpath;
         Cost        min_cost = 1.0e-6;
         ListCell   *lc;
-        /* P0: PK-IndexScan MVP — try to recognize from baserestrictinfo
+        /* P0: PK-IndexScan — try to recognize from baserestrictinfo
          * a single-column PK = Const equality condition. On a hit, the fast path: the SPI MAIN lookup uses
          * WHERE pk=val, delta uses overlay_delta_lookup (O(1)).
          * custom_private transfer protocol (List length 6):
@@ -1503,7 +1686,7 @@ ob_branchscan_planner_hook(PlannerInfo *root, RelOptInfo *rel,
                                     : (Node *) makeBoolExpr(AND_EXPR,
                                                             pk_clauses,
                                                             -1));
-                /* V2 strategy (doc/internals.md §2.1): hand the whole
+                /* Strategy (doc/internals.md §2.1): hand the whole
                  * predicate node to ruleutils instead of assembling SQL by
                  * hand, so the literal's consttype drives the output
                  * function and no static format_type_be buffer leaks in. */
@@ -1632,7 +1815,7 @@ ob_branchscan_planner_hook(PlannerInfo *root, RelOptInfo *rel,
         cpath->path.parallel_workers = 0;
 
         /* =====================================================================
-         * REVIEW-260926 / A8 — cost_branchscan() MVP-level cost model
+         * REVIEW-260926 / A8 — cost_branchscan() cost model
          * ---------------------------------------------------------------
          * Background (R11/R12 review):
          *   Pass1 MAIN merge loop used to be O(N×M) naive double-scan.
@@ -1642,12 +1825,12 @@ ob_branchscan_planner_hook(PlannerInfo *root, RelOptInfo *rel,
          *                   Pass2 = delta_list 2 linear walks → O(M) in practice
          *   Total complexity = O(M log M + N log M).
          *
-         * Planner stage constraint (MVP):
+         * Planner stage constraint:
          *   M (#delta rows for current_bid + relid) is NOT trivially known
          *   here (planner has no direct SPI access to pg_branch_delta w/o
          *   a heavy call).  We therefore estimate M using a realistic
          *   "editing branch" ratio: typical in-branch rewrite ratio for a
-         *   100% acceptance MVP ∈ [1%, 10%] of MAIN rows.  We use a middle
+         *   100% acceptance ∈ [1%, 10%] of MAIN rows.  We use a middle
          *   estimate of 5% (= 0.05), clamped to a sane interval to avoid
          *   pathological estimates for very small/large tables.
          *
@@ -1671,7 +1854,7 @@ ob_branchscan_planner_hook(PlannerInfo *root, RelOptInfo *rel,
          *   If the resulting total_cost would be LARGER than the cheapest
          *   native path (unlikely, given our 5% M ratio is conservative),
          *   we still keep our computed cost (truthful, EXPLAIN output is
-         *   correct for DBA inspection) — MVP correctness does NOT depend
+         *   correct for DBA inspection) — correctness does NOT depend
          *   on planner choosing us, because the L1350-1360 block below
          *   forcibly deletes all non-CustomPath paths from rel->pathlist
          *   in active-branch mode (BranchScan becomes the ONLY candidate).
@@ -1819,13 +2002,13 @@ ob_branchscan_planner_hook(PlannerInfo *root, RelOptInfo *rel,
          * floor), add_path() SILENTLY REJECTS our cpath and returns NULL
          * without appending it to rel->pathlist.
          *
-         * Then the MVP pathlist-prune block below finds newlist=NIL
+         * Then the pathlist-prune block below finds newlist=NIL
          * (no CustomPath exists) and falls back to keeping the
          * original SeqScan/IndexScan-only pathlist → the entire overlay
          * delta merge is BYPASSED (silent correctness bug: UPDATEs/
          * DELETEs/INSERTs of the branch silently don't show up in reads).
          *
-         * MVP contract = in active branch, BranchScan is the ONLY
+         * Contract = in active branch, BranchScan is the ONLY
          * correct scan (MAIN heap's bare rows are just the baseline).
          * We must therefore FORCE our cpath into the pathlist regardless
          * of Planner cost comparisons, then delete all native competitors.
@@ -1834,7 +2017,7 @@ ob_branchscan_planner_hook(PlannerInfo *root, RelOptInfo *rel,
          * ================================================================= */
         rel->pathlist = lappend(rel->pathlist, cpath);
 
-        /* MVP override: in an active branch, our overlay merge result
+        /* Override: in an active branch, our overlay merge result
          * MUST be used — the MAIN heap rows are only the baseline and
          * do NOT reflect the branch's writes (INSERT/UPDATE/DELETE
          * redirected to the delta table).  If the Planner is allowed
@@ -1842,10 +2025,10 @@ ob_branchscan_planner_hook(PlannerInfo *root, RelOptInfo *rel,
          * we only undercut their cost by a 1e-5 multiplicative
          * factor but index pathkeys match ORDER BY etc.), it will
          * silently ignore the delta table and return stale results.
-         * Simplest safe fix for MVP: delete every non-CustomPath path
+         * Simplest safe fix: delete every non-CustomPath path
          * from rel->pathlist so our CustomPath is the ONLY candidate
          * (retaining any parallel-aware variants of CustomScan if
-         * any — MVP has none).  Later optimizations can whitelist
+         * any — there are none).  Later optimizations can whitelist
          * specific MAIN-heap scans for inner uses (e.g. PK lookups
          * from write-redirection helper SELECTs already bypass here
          * via the B1.25 guard above). */
@@ -1920,7 +2103,7 @@ ob_branchscan_plan_custom_path(PlannerInfo *root, RelOptInfo *rel,
 
     (void) root;
     (void) relid;    /* relid OID is already passed in custom_private[0]; here it is only unpacked for a check */
-    (void) clauses;  /* qual is NOT pushed down in MVP: we materialize the
+    (void) clauses;  /* qual is NOT pushed down: we materialize the
                       * full overlay result set in ExecCustomScan and let PG
                       * wrap our CustomScan node in an upper Filter node to
                       * evaluate WHERE quals.  For PK-predicate fast-path:
@@ -2123,7 +2306,7 @@ ob_branchscan_begin(CustomScanState *node, EState *estate, int eflags)
         rte = rt_fetch(rti, estate->es_range_table);
         relid = rte->relid;
     }
-    /* P0 PK=Const fast-path unpacking (see doc/p0_pk_oidx_deparse_strategy.md §5).
+    /* P0 PK=Const fast-path unpacking (see doc/internals.md §2.6).
      * Protocol: cpriv[1]=Integer pkflag; cpriv[2]=String pk_where_sql;
      *       cpriv[3]=String pk_serialized_key.
      * Any malformed / empty string → has_pk_pred=false, safely fall back to seqscan
@@ -2388,7 +2571,7 @@ next_tuple:
     ResetExprContext(econtext);
     econtext->ecxt_scantuple = dst;
 
-    /* Run any scan-level qual (MVP: scan.plan.qual=NIL so quals live
+    /* Run any scan-level qual (scan.plan.qual=NIL so quals live
      * in an upper Filter node, but check anyway for future proofing). */
     if (node->ss.ps.qual != NULL &&
         !ExecQual(node->ss.ps.qual, econtext))
@@ -2437,7 +2620,7 @@ ob_branchscan_end(CustomScanState *node)
         ebs->scan_cxt = NULL;
     }
 
-    /* P0 PK-IndexScan MVP: free the strings pstrdup'd in the Begin phase */
+    /* P0 PK-IndexScan: free the strings pstrdup'd in the Begin phase */
     if (ebs->pk_where_sql != NULL)
     {
         pfree(ebs->pk_where_sql);

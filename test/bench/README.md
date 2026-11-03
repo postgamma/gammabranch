@@ -1,9 +1,9 @@
 # T8 L2 pgbench Concurrency Stress Fixture (non-gating, for manual debugging)
 
-> R7 constraint restated: correctness first, performance second. **This L2 fixture is not a `make check` gate** (gates = L1 12/12 isolation specs + L3 20/20 pg_regress), and only needs to be run manually in the following scenarios:
-> - When you want to stress-test the FR2 V1 lock protocol under high concurrency (high-frequency CAS winner/loser)
+> R7 constraint restated: correctness first, performance second. **This L2 fixture is not a `make installcheck` gate** (gates = L1 15/15 isolation specs + L3 21/21 pg_regress), and only needs to be run manually in the following scenarios:
+> - When you want to stress-test the FR2 lock protocol under high concurrency (high-frequency CAS winner/loser)
 > - When you want to probabilistically trigger the NOTIFY path (stable long-lived LISTEN)
-> - When you want to reproduce an edge-case race that the L1 12 specs cannot cover
+> - When you want to reproduce an edge-case race that the L1 15 specs cannot cover
 
 ---
 
@@ -165,8 +165,8 @@ tps = 25978.112345 (excluding connections establishing)
 | Role | Share | What it does per transaction | Target coverage |
 |---|---|---|---|
 | **WR writer (0..5)** | 60% | BEGIN; SELECT count WHERE aid=randid; UPSERT (INSERT ON CONFLICT DO NOTHING) id=10000+randid; UPDATE abalance+1; COMMIT | high-frequency write_redirect DELTA INSERT; delta visibility in snapshot/live mode; FR6 ReScan fresh materialization |
-| **Branch switcher (6..7)** | 20% | alternating `use_branch(bs_pgbench_{1..8}, live | snapshot)`; cache-set on entry; assign-hook RESTORE path | GUC assign hook cache-hit path; ob_mode_cache set/remove; live↔snapshot switching does not trigger an FR2 V1 deadlock (zero-lock guarantee) |
-| **Applyer (8)** | 10% | `apply_branch(random active branch)`; **normally catches a lot of 55000** (another session already applied it; the FR2 V1 CAS loser fast-fails with ERROR and does not deadlock) | FR3 CAS winner/loser; FR2 Exclusive advisory held by only 1; MAIN merge write path; apply→mode_cache_remove; ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE(55000) triggered correctly at high frequency (not a hang/deadlock) |
+| **Branch switcher (6..7)** | 20% | alternating `use_branch(bs_pgbench_{1..8}, live | snapshot)`; cache-set on entry; assign-hook RESTORE path | GUC assign hook cache-hit path; ob_mode_cache set/remove; live↔snapshot switching does not trigger an FR2 deadlock (zero-lock guarantee) |
+| **Applyer (8)** | 10% | `apply_branch(random active branch)`; **normally catches a lot of 55000** (another session already applied it; the FR2 CAS loser fast-fails with ERROR and does not deadlock) | FR3 CAS winner/loser; FR2 Exclusive advisory held by only 1; MAIN merge write path; apply→mode_cache_remove; ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE(55000) triggered correctly at high frequency (not a hang/deadlock) |
 | **Discarder (9)** | 10% | `discard_branch(random applied branch)`; here too 55000 is a normal branch | discarding CAS; bulk DELETE on the delta table; symmetric snapshot/mode cache remove |
 
 ---
@@ -174,18 +174,18 @@ tps = 25978.112345 (excluding connections establishing)
 ## Post-stress verification SQL (most important, must run)
 
 ```sql
--- ===== V1: FR3 state machine has no leak (any abnormal state counts as FAIL) =====
+-- ===== FR3 state machine has no leak (any abnormal state counts as FAIL) =====
 SELECT state, count(*) FROM overlay_branch.pg_branch
  WHERE branch_name LIKE 'bs_pgbench_%' GROUP BY 1 ORDER BY 1;
 -- ideal PASS distribution: mostly active + applied; a few discarded;
 -- FAIL condition: rows with applying / discarding appear (= state machine stuck in an intermediate state = BUG)
 
--- ===== V2: absolutely no applying / discarding residue =====
+-- ===== absolutely no applying / discarding residue =====
 SELECT count(*) AS stuck_applying FROM overlay_branch.pg_branch WHERE state = 'applying';
 SELECT count(*) AS stuck_discarding FROM overlay_branch.pg_branch WHERE state = 'discarding';
 -- ✅ PASS: both rows = 0
 
--- ===== V3: MAIN row count baseline exactly 10000 (= the seed at initialization) =====
+-- ===== MAIN row count baseline exactly 10000 (= the seed at initialization) =====
 -- NOTE: the aid=10000+randid range of the UPSERT in the WR writer transaction is [10001,19999]
 -- if write_redirect works correctly, these rows are written only to the WR delta, not into MAIN;
 -- if there is any write-to-MAIN leak (a variant of the CmdType split BUG of FAIL#1),
@@ -211,11 +211,11 @@ SELECT count(*) AS sessions_in_branch FROM pg_stat_activity
 Meeting all 4 of the following counts as passing (**none of them is a tps threshold**; R7 correctness first):
 
 1. ✅ `pgbench` itself has no `connection failed` / `FATAL` / `SIGABRT`-level errors (a normal ERROR 55000 is expected; pgbench does not treat ERROR as FAIL, it only counts it toward latency)
-2. ✅ **V2 stuck = 0** (nothing stuck in the applying/discarding intermediate state)
-3. ✅ **V3 main_leak_rows = 0** (no WR-writer leaks of rows >10000 into the MAIN table)
+2. ✅ **stuck = 0** (nothing stuck in the applying/discarding intermediate state)
+3. ✅ **main_leak_rows = 0** (no WR-writer leaks of rows >10000 into the MAIN table)
 4. ✅ **no psql backend process crash / coredump** (`dmesg` or `journalctl -u postgresql` to look for segfault)
 
-> tps level, ERROR 55000 count, and average latency are all **performance metrics**, not used for PASS/FAIL judgment; record them in a separate performance table when needed (reconsider in V3).
+> tps level, ERROR 55000 count, and average latency are all **performance metrics**, not used for PASS/FAIL judgment; record them in a separate performance table when needed (reconsider later).
 
 ---
 
@@ -224,7 +224,7 @@ Meeting all 4 of the following counts as passing (**none of them is a tps thresh
 | Symptom | Cause | Handling |
 |---|---|---|
 | 1st run ERROR `branch bs_pgbench_X does not exist` | fixture.sql initialization never ran successfully, or another test script discarded the branch | re-run fixture.sql once |
-| lots of 55000 ERROR from apply/discard | **normal** (FR2 V1 CAS loser fast-fails; it is actually the correctness demonstrated by L1 ob_apply_mutex). tps will be a bit lower but it does not affect the correctness judgment | ignore. If you want to see fewer 55000, use `-c 8` for fewer clients, or lower the apply/discard share |
+| lots of 55000 ERROR from apply/discard | **normal** (FR2 CAS loser fast-fails; it is actually the correctness demonstrated by L1 ob_apply_mutex). tps will be a bit lower but it does not affect the correctness judgment | ignore. If you want to see fewer 55000, use `-c 8` for fewer clients, or lower the apply/discard share |
 | MAIN leak_rows comes out >0 | **CRITICAL BUG**, highest priority. Stop the stress run immediately, take the minimal reproduction and run L1 isolation tests to see whether it can be reduced to a permutation-level spec | open a new debug session, record the minimal reproduction and conclusion item by item |
 | stuck_applying > 0 for a long time >30 seconds | the CAS winner is stuck during the MAIN merge (possibly a MAIN table-level lock or DDL conflict) | check pg_locks; if it is truly stuck, kill -9 the stuck backend and count it as FAIL |
 
@@ -233,11 +233,11 @@ Meeting all 4 of the following counts as passing (**none of them is a tps thresh
 ## Relationship diagram with the L1 / L3 gates
 
 ```
-[L1 pg_isolation 12 specs] — "all concurrent critical topologies precisely scheduled"
+[L1 pg_isolation 15 specs] — "all concurrent critical topologies precisely scheduled"
          │  (FR2/FR3/FR4/FR5/FR6 semantic verify one by one)
          ▼
-[L3 pg_regress 20 suites] — "functionality outside L1 + FR4 LISTEN single-connection path"
-         │  (this extension's default make check gate = L1 + L3 totaling 32/32 zero-diff 2×)
+[L3 pg_regress 21 suites] — "functionality outside L1 + FR4 LISTEN single-connection path"
+         │  (this extension's default make installcheck gate = L1 + L3 totaling 36/36 zero-diff 2×)
          ▼
 [L2 pgbench (this directory, manual)] — "correctness backstop sanity check under high-concurrency real load"
          │  (NOT a gate. For performance exploration / triggering edge races not covered by L1/L3)

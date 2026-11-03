@@ -1,5 +1,5 @@
 --
--- D-3 REVIEW-260926 / A8: cost_branchscan() MVP cost model + join-order stability.
+-- D-3 REVIEW-260926 / A8: cost_branchscan() cost model + join-order stability.
 -- Purpose:
 --   Verify that our CustomScan no longer reports artificially zero cost
 --   (previously min_cost * 1.0e-5, effectively 0.00 in EXPLAIN) and

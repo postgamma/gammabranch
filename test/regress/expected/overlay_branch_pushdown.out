@@ -65,7 +65,7 @@ SELECT count(*) AS pd_main_cnt FROM ob_pd;                       -- expect 200
 SELECT overlay_branch.create_branch('ob_pd_b1');
  create_branch 
 ---------------
-             8
+            13
 (1 row)
 
 SELECT overlay_branch.use_branch('ob_pd_b1');

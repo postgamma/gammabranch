@@ -44,6 +44,7 @@
   - [6.6 Fast Return for Empty Branch Apply/Discard](#66-fast-return-for-empty-branch-applydiscard)
   - [6.7 DDL RESTRICTED Inside an Active Branch](#67-ddl-restricted-inside-an-active-branch)
   - [6.8 No-PK Tables (Experimental Feature)](#68-no-pk-tables-experimental-feature)
+  - [6.9 Delta Size Observability](#69-delta-size-observability)
 
 ---
 
@@ -475,7 +476,7 @@ SELECT * FROM products ORDER BY id;
 
 ## 4. apply_branch() — Merge the Branch Delta into Main
 
-Merge the branch's current delta into Main, performing optimistic per-row conflict validation. A conflict raises a ERROR directly; no automatic merge is performed.
+Merge the branch's current delta into Main, performing optimistic row-level conflict validation. A conflict raises a ERROR directly; no automatic merge is performed.
 
 ### 4.1 APPLY Success Path
 
@@ -612,7 +613,7 @@ Alternative: use top-level DML with `RETURNING` directly (see §6.2).
 | Capability | Status |
 | --- | --- |
 | plain INSERT/UPDATE/DELETE | ✅ Supported |
-| INSERT … ON CONFLICT (PK) | ✅ Supported |
+| INSERT … ON CONFLICT (UPSERT) | ✅ Supported (arbitrates on the PK, or on the single UNIQUE constraint in keyless mode — see §6.8) |
 | UPDATE/DELETE … RETURNING | ✅ Supported |
 | PK predicates (`pk = c` / `pk IN (…)` / `pk BETWEEN …` / `pk > c` / their `AND`/`OR` combinations) | ✅ Recommended path (goes through the PK index) |
 | Non-PK predicates (arbitrary filter / Seq scan) | ✅ Supported |
@@ -995,7 +996,7 @@ INSERT INTO logs VALUES ('boot');
 SELECT create_branch('b_logs');
 SELECT use_branch('b_logs');
 INSERT INTO logs VALUES ('x');
-ERROR:  overlay_branch: cannot INSERT relation "logs" inside active branch "b_logs": table must have a PRIMARY KEY for branch-mode DML (V1 constraint; enable overlay_branch.keyless_tables for the experimental ctid fallback)
+ERROR:  overlay_branch: cannot INSERT relation "logs" inside active branch "b_logs": table must have a PRIMARY KEY for branch-mode DML (enable overlay_branch.keyless_tables for the experimental ctid fallback)
 DETAIL:  Target relation: logs.
 ```
 
@@ -1017,6 +1018,20 @@ SELECT * FROM logs;   -- Main('boot') ⊕ branch('x')
 SELECT apply_branch('b_logs');
 ```
 
+`INSERT ... ON CONFLICT` (UPSERT) also works on a no-PK table. Because there is no primary key to arbitrate on, the conflict is resolved on the single `UNIQUE` constraint the statement names; `DO NOTHING` / `DO UPDATE` then behave exactly as for a PK table (the row is rewritten in the branch, Main stays untouched until `apply_branch`):
+
+```sql
+CREATE TABLE counters (id int UNIQUE, n int);
+INSERT INTO counters VALUES (1, 10);
+SELECT create_branch('b_ctr');
+SELECT use_branch('b_ctr');
+INSERT INTO counters VALUES (1, 11) ON CONFLICT (id) DO UPDATE SET n = EXCLUDED.n;
+SELECT * FROM counters;              -- 1 = 11 (branch image)
+SELECT use_branch(NULL);
+SELECT * FROM counters;              -- 1 = 10 (Main untouched)
+SELECT apply_branch('b_ctr');
+```
+
 Key behavior points:
 
 | Item | Behavior |
@@ -1025,6 +1040,60 @@ Key behavior points:
 | WARNING | Emitted once per session the first time a no-PK table is hit |
 | Read/write overlay | INSERT/UPDATE/DELETE/SELECT/apply/discard are the same as for PK tables |
 | Row identity | Based on the row's **physical location** (best-effort): if another session modifies a Main row that the branch anchored to while the branch is alive, apply reports a conflict |
-| UPSERT | `INSERT ... ON CONFLICT` is still not supported; reports `0A000` |
+| UPSERT | `INSERT ... ON CONFLICT` arbitrates on the single `UNIQUE` index named in the statement (single- or multi-column); an arbiter that does not resolve to exactly one plain-column `UNIQUE` index (e.g. an expression index) is still rejected with `0A000` |
 
 > This feature does not aim for full parity with PK tables and is recommended only for experimental / short-term draft scenarios; for long-term use, add a primary key to the table. For design and limitations, see [internals.md](internals.md) §4.
+
+### 6.9 Delta Size Observability
+
+A long-lived branch keeps accumulating delta rows, and each delta row also doubles
+the weight of the MAIN row it shadows. Two read-only products let you watch that
+growth without reading delta content.
+
+`branch_delta_stats(branch_name)` returns one row per `(branch, relation)` that has
+delta rows:
+
+```sql
+CREATE TABLE t (id int PRIMARY KEY, v text);
+INSERT INTO t VALUES (1, 'a'), (2, 'b'), (3, 'c');
+SELECT create_branch('b_stat');
+SELECT use_branch('b_stat');
+INSERT INTO t VALUES (10, 'x');          -- I
+INSERT INTO t VALUES (11, 'y');          -- I
+UPDATE t SET v = 'a2' WHERE id = 1;      -- U
+DELETE FROM t WHERE id = 2;              -- D
+
+SELECT branch_name, relation, delta_rows, delta_insert, delta_update, delta_delete
+  FROM branch_delta_stats('b_stat');
+ branch_name | relation | delta_rows | delta_insert | delta_update | delta_delete
+-------------+----------+------------+--------------+--------------+--------------
+ b_stat      | public.t |          4 |            2 |            1 |            1
+```
+
+The remaining columns are environment-dependent byte sizes: `delta_payload_bytes`
+sums the stored key / `old_version` / `tuple_data` octet lengths, `main_bytes` is the
+MAIN relation's `pg_total_relation_size`, and `amplification` is `delta_payload_bytes
+/ main_bytes` (it includes the `_base` doubling). The function exposes counts and
+byte sizes only — never delta row content. A branch with no delta rows does not
+appear; an unknown branch name (or `NULL`) returns no rows.
+
+**Throttled WARNING.** Set a row threshold and the write path nudges you before the
+delta grows unbounded:
+
+```sql
+SET overlay_branch.delta_size_warn_rows = 1000;       -- 0 (default) = disabled
+SET overlay_branch.delta_size_check_interval = 1024;  -- check once per N writes
+
+-- once the branch delta first exceeds the threshold:
+WARNING:  overlay_branch: branch "b_stat" delta has reached 1024 rows (threshold 1000); consider apply_branch()/discard_branch() to bound growth
+HINT:  Inspect per-relation delta size with SELECT * FROM branch_delta_stats('b_stat').
+```
+
+| Item | Behavior |
+|----|------|
+| `branch_delta_stats(name)` | Read-only; one row per `(branch, relation)` with delta rows. SECURITY INVOKER, like `list_branches()` |
+| `overlay_branch.delta_size_warn_rows` | int, default `0` (disabled), `PGC_USERSET` |
+| `overlay_branch.delta_size_check_interval` | int, default `1024`; delta writes between checks |
+| WARNING | Amortized counter, emitted once per session on first overflow, and fail-open (never breaks user DML) |
+
+> For the design, see [internals.md](internals.md) §5.6.
