@@ -1,7 +1,7 @@
 -- =====================================================================
 -- overlay_branch_user.sql — User-facing "happy path" regression test.
 --
--- Mirror of doc/example_sql.md §0~§4, using the actual V1 SQL functions
+-- Mirror of doc/user_guide.md §0~§4, using the actual SQL functions
 -- (SELECT overlay_branch.create_branch/use_branch/discard_branch/apply_branch
 --  instead of the future CREATE BRANCH / USE BRANCH / APPLY BRANCH / DISCARD
 --  BRANCH grammar sugar that does not exist yet).
@@ -21,10 +21,9 @@ DECLARE
 BEGIN
   IF _s NOT LIKE '%overlay_branch%' THEN
     _msg := 'Postmaster started WITHOUT shared_preload_libraries=''overlay_branch''.  '
-         || 'The 3 correct ways to invoke these tests (DON''T `cd test/` first):'
-         || chr(10)||chr(10)||'  (A) make check                    <- temp-instance, hooks auto-loaded'
-         || chr(10)||'  (B) make installcheck EXTRA_REGRESS_OPTS="--use-existing --host=/tmp --port=15433"'
-         || chr(10)||'  (C) pg_regress overlay_branch_user overlay_branch_basic \'
+         || 'The 2 correct ways to invoke these tests (DON''T `cd test/` first):'
+         || chr(10)||chr(10)||'  (A) make installcheck EXTRA_REGRESS_OPTS="--use-existing --host=/tmp --port=15433"'
+         || chr(10)||'  (B) pg_regress overlay_branch_user overlay_branch_basic \'
          || chr(10)||'         --inputdir=./test --outputdir=./test_output \'
          || chr(10)||'         --temp-config=$(pwd)/test/temp_instance_shared_libs.conf \'
          || chr(10)||'         --bindir=$(pg_config --bindir)'
@@ -90,7 +89,7 @@ UPDATE public.products SET price = 100 WHERE id = 1;
 DELETE FROM public.products WHERE id = 2;
 
 -- ===== §3. Read in the branch (Main ⊕ Delta via SRF overlay_main_plus_delta) =====
--- Note: V1 does not yet inject a CustomScan / BranchScan node for SeqScan
+-- Note: the extension does not yet inject a CustomScan / BranchScan node for SeqScan
 -- transparently; to see the combined view users call this SRF.
 
 SELECT * FROM overlay_branch.overlay_main_plus_delta('public.products')
@@ -140,7 +139,7 @@ FROM public.products;
 SELECT state FROM public.pg_branch WHERE branch_name='agent_workspace';
 
 -- =====================================================================
--- ===== Part 5: BranchScan MVP (SELECT * FROM table automatically
+-- ===== Part 5: BranchScan (SELECT * FROM table automatically
 -- ===== returns MAIN⊕branch-delta — no more SRF boilerplate).
 -- =====================================================================
 
@@ -204,7 +203,7 @@ FROM overlay_branch.overlay_main_plus_delta('public.bs_user')
 SELECT string_agg(id::text||'='||name||':'||color, ',' ORDER BY id) AS cs_row_picture
 FROM public.bs_user;
 
--- 5.7c Equality assertion — this is the BranchScan MVP contract.
+-- 5.7c Equality assertion — this is the BranchScan contract.
 SELECT CASE
          WHEN (SELECT string_agg((r).id::text||'='||(r).name||':'||(r).color, ',' ORDER BY (r).id)
                FROM overlay_branch.overlay_main_plus_delta('public.bs_user')
@@ -226,7 +225,7 @@ SELECT CASE WHEN color = 'green' AND id = 10 THEN 'PASS:BS_OVERRIDE_VISIBLE'
             ELSE 'FAIL:'||id::text||':'||COALESCE(color,'NULL') END AS s57e_override
 FROM public.bs_user WHERE id = 10;
 
--- 5.7f ORDER BY walks through Sort → CustomScan (ensures the MVP path
+-- 5.7f ORDER BY walks through Sort → CustomScan (ensures the BranchScan path
 --      override has not leaked an IndexScan into the transparent SELECT).
 EXPLAIN (COSTS OFF, SUMMARY OFF) SELECT * FROM public.bs_user ORDER BY id DESC;
 SELECT id, name FROM public.bs_user ORDER BY id DESC;

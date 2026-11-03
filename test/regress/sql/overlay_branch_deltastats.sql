@@ -1,0 +1,157 @@
+/*
+ * overlay_branch_deltastats.sql — B1 delta-size observability
+ *
+ * See doc/internals.md §5.6 for the design.  Two read-only products expose
+ * how large a branch delta has grown:
+ *
+ *   * branch_delta_stats(branch_name) — a read-only SETOF function returning
+ *     one row per (branch, relation) that has delta rows, with per-op counts,
+ *     payload bytes, MAIN size and the resulting amplification.  It exposes
+ *     counts / byte sizes only, never delta row content, and (like
+ *     list_branches) reads the administrator-only delta catalog under
+ *     SECURITY INVOKER.
+ *   * overlay_branch.delta_size_warn_rows / .delta_size_check_interval — an
+ *     amortized, fail-open WARNING emitted from the single delta-write choke
+ *     point (overlay_delta_insert) once a branch's delta first exceeds the
+ *     threshold.
+ *
+ * Purpose / Coverage / Dependencies
+ *   Purpose:
+ *     Pin the observable contract of the B1 stats function + throttled WARNING.
+ *   Coverage:
+ *     A — per-(branch, relation) counts: delta_rows / insert / update / delete,
+ *         payload/main/amplification presence, correct relation name.
+ *     B — one row per relation: a second touched table adds a second row.
+ *     C — unknown branch and NULL argument return zero rows (STRICT).
+ *     D — a plain (non-administrator) role is denied on the delta catalog,
+ *         exactly as with list_branches() (R22, SECURITY INVOKER).
+ *     E — throttled WARNING: fires exactly once, on the write that first
+ *         pushes the delta past the threshold, and stays silent afterwards.
+ *   Dependencies:
+ *     Requires shared_preload_libraries='overlay_branch' (see test/README.md).
+ *
+ * Style rules (identical to the sibling regression files so pg_regress
+ * expected .out files stay diff-stable across machines/runs):
+ *   * No \meta commands, no timestamps/OIDs/ctid/xmin in SELECT output.
+ *   * Byte sizes / amplification are environment-dependent, so only their
+ *     presence is asserted — never an exact value.
+ */
+
+-- ===== 0. Prerequisite guard =====
+DO $$
+DECLARE
+  _s text := current_setting('shared_preload_libraries', true);
+  _msg text;
+BEGIN
+  IF _s NOT LIKE '%overlay_branch%' THEN
+    _msg := 'Postmaster started WITHOUT shared_preload_libraries=''overlay_branch''.  '
+         || 'Use `make installcheck` or pass '
+         || '--temp-config=$(pwd)/temp_instance_shared_libs.conf to pg_regress.';
+    RAISE EXCEPTION '%', _msg;
+  END IF;
+END $$;
+
+-- ===== Idempotent cleanup =====
+SET client_min_messages = warning;
+DROP TABLE IF EXISTS public.ob_ds, public.ob_ds2 CASCADE;
+DROP EXTENSION IF EXISTS overlay_branch CASCADE;
+RESET client_min_messages;
+
+CREATE EXTENSION IF NOT EXISTS overlay_branch;
+SET client_min_messages = WARNING;
+
+-- ===== Fixtures =====
+CREATE TABLE public.ob_ds  (k int PRIMARY KEY, v text);
+CREATE TABLE public.ob_ds2 (k int PRIMARY KEY, v text);
+INSERT INTO public.ob_ds  VALUES (1, 'a'), (2, 'b'), (3, 'c');
+INSERT INTO public.ob_ds2 VALUES (1, 'a');
+ANALYZE public.ob_ds;
+ANALYZE public.ob_ds2;
+
+SELECT overlay_branch.create_branch('ds_b1');
+SELECT overlay_branch.use_branch('ds_b1');
+
+-- Delta edits on ob_ds: 2 INSERT + 1 UPDATE + 1 DELETE = 4 rows.
+INSERT INTO public.ob_ds VALUES (10, 'x');        -- I
+INSERT INTO public.ob_ds VALUES (11, 'y');        -- I
+UPDATE public.ob_ds SET v = 'a2' WHERE k = 1;     -- U
+DELETE FROM public.ob_ds  WHERE k = 2;            -- D
+
+-- ============================================================
+-- A. per-(branch, relation) counts
+-- ============================================================
+SELECT branch_name, relation, delta_rows, delta_insert, delta_update, delta_delete
+  FROM public.branch_delta_stats('ds_b1');
+
+-- Byte-size / amplification columns are environment-dependent: assert presence
+-- (and non-negativity) only.
+SELECT (delta_payload_bytes > 0) AS payload_nonzero,
+       (main_bytes > 0)          AS main_nonzero,
+       (amplification IS NOT NULL) AS amp_present
+  FROM public.branch_delta_stats('ds_b1');
+
+-- ============================================================
+-- B. one row per touched relation
+-- ============================================================
+INSERT INTO public.ob_ds2 VALUES (20, 'z');       -- I on the 2nd table
+
+SELECT count(*) AS rel_rows FROM public.branch_delta_stats('ds_b1');
+SELECT string_agg(relation, ',' ORDER BY relation) AS relations
+  FROM public.branch_delta_stats('ds_b1');
+
+-- ============================================================
+-- C. unknown branch / NULL argument -> zero rows
+-- ============================================================
+SELECT count(*) AS unknown_rows FROM public.branch_delta_stats('ds_no_such_branch');
+SELECT count(*) AS null_rows    FROM public.branch_delta_stats(NULL);
+
+-- ============================================================
+-- D. plain role denied on the administrator-only delta catalog (R22)
+-- ============================================================
+DO $$BEGIN
+    EXECUTE 'CREATE ROLE regress_ds_probe LOGIN';
+EXCEPTION WHEN duplicate_object THEN NULL; END$$;
+
+SET ROLE regress_ds_probe;
+DO $$
+BEGIN
+    BEGIN
+        PERFORM * FROM public.branch_delta_stats('ds_b1');
+        RAISE EXCEPTION 'FAIL_DS_D1_NO_ERROR';
+    EXCEPTION WHEN insufficient_privilege THEN
+        NULL;   /* expected 42501 */
+    END;
+END $$;
+RESET ROLE;
+SELECT 'PASS:DS_D1_PLAIN_ROLE_DENIED' AS ds_d1;
+
+DROP ROLE IF EXISTS regress_ds_probe;
+
+-- ============================================================
+-- E. throttled WARNING from the delta-write choke point
+-- ============================================================
+SELECT overlay_branch.use_branch(NULL);           -- leave ds_b1
+
+INSERT INTO public.ob_ds VALUES (100, 'main');    -- MAIN write, not a delta write
+
+SELECT overlay_branch.create_branch('ds_warn');
+SELECT overlay_branch.use_branch('ds_warn');
+
+SET overlay_branch.delta_size_warn_rows = 3;
+SET overlay_branch.delta_size_check_interval = 1;
+
+INSERT INTO public.ob_ds VALUES (101, 'w1');      -- delta n=1, no warning
+INSERT INTO public.ob_ds VALUES (102, 'w2');      -- delta n=2, no warning
+INSERT INTO public.ob_ds VALUES (103, 'w3');      -- delta n=3, at threshold
+INSERT INTO public.ob_ds VALUES (104, 'w4');      -- delta n=4 > 3 -> WARNING
+INSERT INTO public.ob_ds VALUES (105, 'w5');      -- already warned -> silent
+
+SELECT 'PASS:DS_E1_WARN_ONCE' AS ds_e1;
+
+RESET overlay_branch.delta_size_warn_rows;
+RESET overlay_branch.delta_size_check_interval;
+
+-- ===== Cleanup =====
+SELECT overlay_branch.use_branch(NULL);
+DROP TABLE IF EXISTS public.ob_ds2;
+DROP TABLE IF EXISTS public.ob_ds;

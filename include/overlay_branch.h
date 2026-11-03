@@ -27,7 +27,7 @@
 #define BRANCH_MODE_SNAPSHOT	"snapshot"
 
 /* ----------
- * V3 FR2: Branch-level Advisory Lock magic key.
+ * FR2: Branch-level Advisory Lock magic key.
  *
  * int64 key layout (exactly matches PG's native SET_LOCKTAG_ADVISORY form
  * used by pg_advisory_xact_lock(int8)):
@@ -139,7 +139,7 @@ typedef struct BranchContext
 	char		mode[16];		/* "live" or "snapshot" */
 	TimestampTz	created_at;		/* branch creation time */
 	Oid			owner;			/* branch owner (from pg_branch.owner) */
-	/* ===== V3 multi-session fields (append-only, keep ABI compat) ===== */
+	/* ===== multi-session fields (append-only, keep ABI compat) ===== */
 	struct SnapshotData *branch_main_snapshot;	/* NULL=live; non-NULL=snapshot frozen MAIN reads */
 	bool		snapshot_registered;			/* true iff UnregisterSnapshot is pending */
 	uint32		invalidation_counter;			/* FR4: throttle SPI re-checks */
@@ -175,7 +175,7 @@ typedef struct BranchExecContext
 extern BranchExecContext *ob_get_exec_context(void);
 
 /* ----------
- * TypedKey (REVIEW-260926/R14 MVP):
+ * TypedKey (REVIEW-260926/R14):
  *   Per-column typed primary-key value used for BranchScan comparisons
  *   that MUST match PostgreSQL's native type equality semantics (BPCHAR
  *   r-trim, NUMERIC precision-insensitive equals, TIMESTAMPTZ absolute
@@ -222,7 +222,7 @@ typedef struct DeltaTuple
 	char	   *old_version;	/* base version for conflict check */
 	bytea	   *tuple_data;		/* serialized new tuple (NULL for delete) */
 	bool		emitted;		/* Step4b: has this entry been output in the main pass? */
-	/* ===== V3 append-only fields (ABI-safe) — typed pk, REVIEW-260926/R14 ===== */
+	/* ===== append-only fields (ABI-safe) — typed pk, REVIEW-260926/R14 ===== */
 	TypedKey  *typed_pk;		/* NULL=fallback strcmp(dt->key); non-NULL=typed comparison */
 	int			typed_pk_n;		/* -1=uninitialised, else length of typed_pk[] */
 } DeltaTuple;
@@ -236,7 +236,7 @@ extern bool overlay_branch_enabled;
 extern bool overlay_keyless_tables;	/* experimental: ctid identity for no-PK tables */
 
 /* ----------
- * V3 multi-session tuning GUCs
+ * multi-session tuning GUCs
  * ----------
  */
 extern int	ob_invalidation_check_threshold;	/* every N is_active() calls → SPI check */
@@ -246,6 +246,8 @@ extern bool	ob_apply_batch;						/* apply replays deltas per (relid, op) */
 extern bool	ob_use_shared_mem_pin_table;		/* optional: shmem pin tracking */
 extern bool	ob_in_snapshot_mode_helper;		/* internal: PushActiveSnapshot guard */
 extern int	ob_snapshot_max_hold_minutes;		/* R19 RESTRICTED: snapshot mode max minutes */
+extern int	ob_delta_size_warn_rows;			/* delta rows above which the write path warns (0 = off) */
+extern int	ob_delta_size_check_interval;		/* check delta size once every N delta writes */
 
 /* ----------
  * Recursion-guard globals (owned by overlay_branch.c; written
@@ -304,12 +306,12 @@ extern void			ob_acl_check_lifecycle(ObLifecycleOp op,
 										   const char *branch_name);
 
 /* ----------
- * G01 Branch-scope pre-flight (MVP support matrix fail-fast gate).
+ * G01 Branch-scope pre-flight (support matrix fail-fast gate).
  *
  * Scan current database for all user permanent relations (excludes
  * pg_catalog, information_schema and the extension schema) and
  * raises 0A000 at the FIRST offending relation.  Supported relkinds
- * for MVP are only permanent tables ('r') plus their plain indexes
+ * are only permanent tables ('r') plus their plain indexes
  * ('i') and sequences ('S'); all else plus 7 categories below are
  * RESTRICTED.  This avoids silent data corruption when apply-time
  * semantics do not match MAIN-side behaviour (e.g. FKs fire MAIN

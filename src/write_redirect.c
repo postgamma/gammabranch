@@ -18,8 +18,10 @@
 #include "overlay_branch.h"
 
 #include "access/heapam.h"
+#include "access/genam.h"
 #include "access/htup_details.h"
 #include "access/table.h"
+#include "catalog/index.h"
 #include "catalog/namespace.h"
 #include "catalog/pg_type.h"
 #include "executor/executor.h"
@@ -136,6 +138,109 @@ ob_project_returning(ResultRelInfo *rri, TupleTableSlot *scanSlot,
 }
 
 /* ----------------------------------------------------------------
+ * ob_resolve_upsert_arbiter
+ *
+ *   Resolve the ON CONFLICT arbiter of a keyless UPSERT.  Returns the
+ *   column numbers of the single UNIQUE index the statement targets,
+ *   or false when it does not resolve to exactly one plain-column
+ *   UNIQUE index (several candidate indexes, or an expression /
+ *   partial index key).  Callers treat false as "refuse with 0A000":
+ *   the 2-phase conflict detector cannot be rebound to such a key.
+ * ----------------------------------------------------------------
+ */
+static bool
+ob_resolve_upsert_arbiter(ResultRelInfo *rri, AttrNumber **attnos_out,
+						  int *n_out)
+{
+	List	   *arbiters = rri->ri_onConflictArbiterIndexes;
+	Oid			idxoid;
+	Relation	idxrel;
+	IndexInfo  *ii;
+	AttrNumber *attnos;
+	int			n;
+	int			i;
+
+	if (arbiters == NIL || list_length(arbiters) != 1)
+		return false;
+
+	idxoid = linitial_oid(arbiters);
+	idxrel = index_open(idxoid, AccessShareLock);
+	ii = BuildIndexInfo(idxrel);
+	n = ii->ii_NumIndexAttrs;
+
+	if (n <= 0)
+	{
+		index_close(idxrel, AccessShareLock);
+		return false;
+	}
+
+	attnos = (AttrNumber *) palloc(sizeof(AttrNumber) * n);
+	for (i = 0; i < n; i++)
+	{
+		AttrNumber	a = ii->ii_IndexAttrNumbers[i];
+
+		if (a <= 0)
+		{
+			pfree(attnos);
+			index_close(idxrel, AccessShareLock);
+			return false;
+		}
+		attnos[i] = a;
+	}
+
+	index_close(idxrel, AccessShareLock);
+	*attnos_out = attnos;
+	*n_out = n;
+	return true;
+}
+
+/* ----------------------------------------------------------------
+ * ob_slot_col_text
+ *
+ *   Render one column of a (possibly virtual) slot as text via the
+ *   column's output function, and report NULL.  Mirrors the UPSERT
+ *   Phase II slot read: a virtual slot must be read through
+ *   tts_values/tts_isnull after widening tts_nvalid, never through
+ *   slot_getattr (which would materialize and corrupt by-ref content).
+ * ----------------------------------------------------------------
+ */
+static char *
+ob_slot_col_text(Relation rel, TupleTableSlot *slot, AttrNumber attno,
+				 bool *isnull)
+{
+	TupleDesc	reldesc = RelationGetDescr(rel);
+	int			attidx = attno - 1;
+	Oid			typ;
+	Oid			outfunc;
+	bool		isvarlena;
+	Datum		d;
+
+	typ = TupleDescAttr(reldesc, attidx)->atttypid;
+	getTypeOutputInfo(typ, &outfunc, &isvarlena);
+
+	if (TTS_IS_VIRTUAL(slot))
+	{
+		if (slot->tts_nvalid < attno)
+		{
+			TupleDesc	std = slot->tts_tupleDescriptor;
+
+			if (std)
+				slot->tts_nvalid = std->natts;
+		}
+		d = slot->tts_values[attidx];
+		*isnull = slot->tts_isnull[attidx];
+	}
+	else
+	{
+		d = slot_getattr(slot, attno, isnull);
+	}
+
+	if (*isnull)
+		return NULL;
+	return OidOutputFunctionCall(outfunc, d);
+}
+
+/* ----------------------------------------------------------------
  * ob_expr_has_ctid_var
  *
  *   True if the expression tree references the ctid system column
@@ -189,12 +294,12 @@ mt_state_result_rel(ModifyTableState *mt, int i)
 /* ----------------------------------------------------------------
  * r21_check_insert_preconditions
  *
- *   R21 MVP pre-check pass for INSERT-path rows (called when the
+ *   R21 pre-check pass for INSERT-path rows (called when the
  *   final promotion decision is INSERT, i.e. promo=1 would be set).
  *   Raises native PostgreSQL errors BEFORE any delta or MAIN write
  *   happens so the transaction has no partial modifications.
  *
- *   Checks performed (MVP scope – single PK table only):
+ *   Checks performed (single PK table only):
  *     1. NOT NULL : every attnotnull=true (non-dropped, user) column
  *                   in `slot` must be non-NULL → ERRCODE_NOT_NULL_VIOLATION
  *     2. PK UNIQUE (MAIN side)  : same PK must not already exist in
@@ -203,7 +308,7 @@ mt_state_result_rel(ModifyTableState *mt, int i)
  *                                 the ACTIVE pure-delta (op I/U rows)
  *                                 → ERRCODE_UNIQUE_VIOLATION
  *
- *   Fail-open safe: if there is no single-column PK the MVP scope is
+ *   Fail-open safe: if there is no single-column PK the scope is
  *   not applicable and we return silently (the only supported scope of
  *   overlay_branch is single-PK heap tables anyway so this path only
  *   triggers for the catalog DML bypass in create_branch etc.)
@@ -260,7 +365,7 @@ r21_check_insert_preconditions(Relation rel, TupleTableSlot *slot,
 					 errmsg("null value in column \"%s\" of relation \"%s\" violates not-null constraint",
 							NameStr(att->attname),
 							RelationGetRelationName(rel)),
-					 errdetail("Failing row contains an R21 MVP pre-check violation on INSERT path.")));
+					 errdetail("Failing row contains an R21 pre-check violation on INSERT path.")));
 		}
 	}
 
@@ -416,13 +521,13 @@ r21_check_insert_preconditions(Relation rel, TupleTableSlot *slot,
  *   Semantics preserved from the original monolithic L824-L1208:
  *     • Step7 DML guard runs over mt_nrels + es_range_table entries
  *     • CMD_UPDATE / CMD_DELETE:
- *         – no RETURNING support (MVP)
+ *         – no RETURNING support
  *         – extract ctid from junk slot → re-fetch clean MAIN slot
  *         – capture old_version (ctid+xmin token) BEFORE mutation
  *         – for UPDATE, merge SET-values by column NAME into clean slot
  *         – serialize_pk + serialize_tuple → overlay_delta_insert
  *     • CMD_INSERT:
- *         – no RETURNING support (MVP)
+ *         – no RETURNING support
  *         – serialize_pk + serialize_tuple per row → overlay_delta_insert
  *     • ob_write_redirect_done label placed AFTER
  *       prev/standard_ExecutorRun so catalog/non-redirected DML falls
@@ -444,7 +549,7 @@ overlay_executor_run_intercept(QueryDesc *queryDesc,
 	extern TupleTableSlot *fetch_tuple_by_ctid(Relation rel, const char *ctid_cstr,
 											   MemoryContext result_cxt);
 
-	/* V3 Layer1 + FR4: DML path MUST raise ERROR if the branch has been
+	/* Layer1 + FR4: DML path MUST raise ERROR if the branch has been
 	 * applied/discarded in another session — DQL path gets NOTICE + MAIN
 	 * fallback only, but drift-writes to MAIN are 100% disallowed, so we
 	 * call with for_dml=true BEFORE the plain is_active() check so the
@@ -526,7 +631,7 @@ overlay_executor_run_intercept(QueryDesc *queryDesc,
 			if (has_managed_rel)
 				ereport(ERROR,
 						(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
-						 errmsg("overlay_branch MVP does not support MERGE inside a branch (R06 WR-stage blocked)"),
+						 errmsg("overlay_branch does not support MERGE inside a branch (R06 WR-stage blocked)"),
 						 errhint("Rework MERGE as separate INSERT/UPDATE/DELETE statements.")));
 		}
 
@@ -655,7 +760,7 @@ overlay_executor_run_intercept(QueryDesc *queryDesc,
 				return false;
 		}
 
-		/* FIX-I: ModifyingCTE MVP guard (MUST run BEFORE Non-DML return!)
+		/* FIX-I: ModifyingCTE guard (MUST run BEFORE Non-DML return!)
 		 *
 		 * If plannedstmt has ModifyingCTE (INSERT/UPDATE/DELETE in WITH
 		 * list wrapped in outer SELECT), then queryDesc->operation is
@@ -670,14 +775,14 @@ overlay_executor_run_intercept(QueryDesc *queryDesc,
 		 * hasModifyingCTE flag is set by the planner exactly for this
 		 * case.  Proper fix requires intercepting *inner* ModifyTable
 		 * nodes inside CTE subplans (non-trivial refactor of WR loop).
-		 * MVP: explicit ERROR with helpful hint — silent corruption is
+		 * Explicit ERROR with helpful hint — silent corruption is
 		 * NEVER acceptable, regardless of CmdType. */
 		if (queryDesc->plannedstmt != NULL &&
 			queryDesc->plannedstmt->hasModifyingCTE)
 		{
 			ereport(ERROR,
 					(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
-					 errmsg("overlay_branch MVP does not support data-modifying statements inside WITH (CTE) clauses"),
+					 errmsg("overlay_branch does not support data-modifying statements inside WITH (CTE) clauses"),
 					 errhint("Rewrite WITH (UPDATE/DELETE/INSERT ... RETURNING) SELECT ... "
 							 "using a TEMP TABLE to collect RETURNING rows:\n"
 							 "  CREATE TEMP TABLE _r AS UPDATE t SET ... RETURNING ...;\n"
@@ -685,7 +790,7 @@ overlay_executor_run_intercept(QueryDesc *queryDesc,
 		}
 
 		/* Non-DML CmdType: after throttled(false) DQL check + ModifyingCTE
-		 * MVP guard we have nothing to redirect — fall through to standard
+		 * guard we have nothing to redirect — fall through to standard
 		 * executor so SELECTs, DECLARE CURSORs, etc. run normally on MAIN. */
 		if (!dml_split)
 			return false;
@@ -830,7 +935,7 @@ overlay_executor_run_intercept(QueryDesc *queryDesc,
 			}
 		}
 
-		/* --- Single target only (MVP) --- */
+		/* --- Single target only --- */
 		if (mt->mt_nrels == 1 && list_length(plan->resultRelations) == 1)
 		{
 			ResultRelInfo *rri = mt_state_result_rel(mt, 0);
@@ -1047,7 +1152,7 @@ overlay_executor_run_intercept(QueryDesc *queryDesc,
 									{
 										ereport(ERROR,
 												(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
-												 errmsg("overlay_branch MVP does not support UPDATE that modifies primary key columns (R03 pk-mutation blocked)"),
+												 errmsg("overlay_branch does not support UPDATE that modifies primary key columns (R03 pk-mutation blocked)"),
 												 errdetail("Target relation has primary key column \"%s\"; attempting to SET it would desync the delta key from the post-image.",
 														   rname),
 												 errhint("To change a PK value inside a branch, DELETE the old row then INSERT a new row with the desired key.  Those two DML are both properly redirected to the delta store.")));
@@ -1072,7 +1177,7 @@ overlay_executor_run_intercept(QueryDesc *queryDesc,
 									 * column wasn't mentioned in SET
 									 * targetlist" — so the old value
 									 * remained in the post-image.
-									 * That is an MVP semantic bug.  Fix
+									 * That is a semantic bug.  Fix
 									 * below: if the column IS in the
 									 * SET targetlist (we already found
 									 * it by name in the junkdesc),
@@ -1176,11 +1281,11 @@ overlay_executor_run_intercept(QueryDesc *queryDesc,
 				 * through the plan's qual.  Qual-hits → write UPDATE/DELETE
 				 * delta.  This eliminates the earlier regression where a
 				 * no-qual foreach would tombstone ALL pure-delta rows. */
-				/* MVP pure-delta UPDATE/DELETE ExecQual pass: for every
+				/* pure-delta UPDATE/DELETE ExecQual pass: for every
 				 * pure-delta INSERT row still alive in this branch,
 				 * reconstruct a TupleTableSlot and run it through
 				 * subplan->qual (ExecQual).  Qual-hits → write DELETE delta
-				 * (UPDATE pure-delta is MVP-out-of-scope for SET merge,
+				 * (UPDATE pure-delta is out-of-scope for SET merge,
 				 * skipped, documented below).  This eliminates the earlier
 				 * regression where a no-qual foreach would tombstone ALL
 				 * pure-delta rows.
@@ -1465,10 +1570,10 @@ overlay_executor_run_intercept(QueryDesc *queryDesc,
 								MemoryContextSwitchTo(oldcxt);
 							}
 #if PURE_DELTA_STEP >= 8
-							/* MVP safety guard: only run pure-delta write path if
+							/* safety guard: only run pure-delta write path if
 							 * there is an explicit WHERE (scan qual OR scan-type
 							 * specific extra qual non-NULL).  Full-table DML
-							 * (DELETE FROM t / UPDATE t SET ...) is MVP-out-of-scope
+							 * (DELETE FROM t / UPDATE t SET ...) is out-of-scope
 							 * for pure-delta rows; an unqualified DML has no quals
 							 * anywhere in the plan tree, so the naive pass would
 							 * tombstone every pure-delta INSERT causing silent
@@ -1842,7 +1947,7 @@ overlay_executor_run_intercept(QueryDesc *queryDesc,
 												{
 													ereport(ERROR,
 														(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
-														 errmsg("overlay_branch MVP does not support UPDATE that modifies primary key columns on pure-delta rows (R03 pk-mutation blocked)"),
+														 errmsg("overlay_branch does not support UPDATE that modifies primary key columns on pure-delta rows (R03 pk-mutation blocked)"),
 														 errdetail("SET target column \"%s\" is part of the relation primary key.",
 														           rname),
 														 errhint("To change a PK on a pure-delta row, DELETE it, then INSERT a new row with the desired new primary key.  Both DELETE and INSERT DML are fully supported for pure-delta rows.")));
@@ -2013,6 +2118,8 @@ overlay_executor_run_intercept(QueryDesc *queryDesc,
 				int32		bid = overlay_branch_get_current_id();
 				Oid			relid = RelationGetRelid(rel);
 				int			pk_attno = 0;
+				AttrNumber *arb_attnos = NULL;
+				int			arb_natts = 0;
 				OnConflictAction oc_action = ONCONFLICT_NONE;
 				ProjectionInfo *oc_proj = NULL;
 				ExprState  *oc_where = NULL;
@@ -2050,14 +2157,20 @@ overlay_executor_run_intercept(QueryDesc *queryDesc,
 						oc_action = ONCONFLICT_NOTHING;
 					}
 				}
-				/* keyless ctid mode has no PK to arbitrate ON CONFLICT against;
-				 * the 2-phase UPSERT conflict detector is PK-only.  Reject
-				 * explicitly (0A000) rather than silently mis-promoting. */
+				/* keyless ctid mode has no PK to arbitrate ON CONFLICT
+				 * against; resolve the statement's UNIQUE arbiter instead
+				 * and rebind the 2-phase detector to its columns.  A
+				 * keyless UPSERT whose arbiter is not exactly one
+				 * plain-column UNIQUE index is refused (0A000) rather than
+				 * silently mis-promoted. */
 				if (!overlay_relation_has_pk(rel) && oc_action != ONCONFLICT_NONE)
-					ereport(ERROR,
-							(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
-							 errmsg("overlay_branch: INSERT ... ON CONFLICT (UPSERT) is not supported on a table without a PRIMARY KEY (overlay_branch.keyless_tables=on)"),
-							 errhint("Add a PRIMARY KEY, or rewrite the statement as a plain INSERT / UPDATE / DELETE.")));
+				{
+					if (!ob_resolve_upsert_arbiter(rri, &arb_attnos, &arb_natts))
+						ereport(ERROR,
+								(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+								 errmsg("overlay_branch: INSERT ... ON CONFLICT (UPSERT) on a table without a PRIMARY KEY requires exactly one UNIQUE arbiter index"),
+								 errhint("Add a PRIMARY KEY, or target exactly one UNIQUE constraint.")));
+				}
 
 				{
 					const char *pk_colname_dummy = NULL;
@@ -2073,6 +2186,7 @@ overlay_executor_run_intercept(QueryDesc *queryDesc,
 				char	   *pk;
 				char	   *tdata;
 				char	   *old_version = NULL;
+				char	   *pure_delta_key = NULL;
 				int			promotion = 0; /* 0=skip 1=INSERT 2=UPDATE(main) 3=UPDATE(pure) */
 				TupleTableSlot *pre_image_slot = NULL;
 				bytea	   *pure_tuple_bytes = NULL;
@@ -2115,29 +2229,94 @@ overlay_executor_run_intercept(QueryDesc *queryDesc,
 				/* ---------- Phase I: Pure delta conflict lookup ---------- */
 				if (oc_action != ONCONFLICT_NONE)
 				{
-					Datum		vals_pure[3];
-					static const Oid argtypes_pure[3] = {INT4OID, OIDOID, TEXTOID};
+					Datum	   *vals_pure;
+					Oid		   *argtypes_pure;
+					char	   *sql_pure;
+					int			nargs_pure;
 					int			ret2;
 					bool		in_pure_delta = false;
 					MemoryContext oldmc;
+					int			i;
 
 					oldmc = NULL;
-					/* WR-1a: branch_id/relid/key bound as $1..$3. */
-					vals_pure[0] = Int32GetDatum(bid);
-					vals_pure[1] = ObjectIdGetDatum(relid);
-					vals_pure[2] = CStringGetTextDatum(pk);
+
+					if (arb_natts > 0)
+					{
+						/* Keyless UPSERT: probe a delta row's stored image
+						 * on the arbiter columns (the ctid key is not known
+						 * yet) and carry d.key back for the promo=3 reuse. */
+						StringInfoData wbuf;
+
+						initStringInfo(&wbuf);
+						nargs_pure = 2 + arb_natts;
+						argtypes_pure = (Oid *) palloc(sizeof(Oid) * nargs_pure);
+						vals_pure = (Datum *) palloc(sizeof(Datum) * nargs_pure);
+						argtypes_pure[0] = INT4OID;
+						vals_pure[0] = Int32GetDatum(bid);
+						argtypes_pure[1] = OIDOID;
+						vals_pure[1] = ObjectIdGetDatum(relid);
+						for (i = 0; i < arb_natts; i++)
+						{
+							AttrNumber	attno = arb_attnos[i];
+							Form_pg_attribute att = TupleDescAttr(RelationGetDescr(rel),
+																  attno - 1);
+							bool		cn = false;
+							char	   *ct = ob_slot_col_text(rel, slot, attno, &cn);
+
+							appendStringInfo(&wbuf,
+											 " AND (jsonb_populate_record(NULL::%s, "
+											 "convert_from(d.tuple_data, 'UTF8')::jsonb)).%s "
+											 "IS NOT DISTINCT FROM $%d::text::%s",
+											 quote_qualified_identifier(
+												 get_namespace_name(RelationGetNamespace(rel)),
+												 RelationGetRelationName(rel)),
+											 quote_identifier(NameStr(att->attname)),
+											 i + 3,
+											 format_type_be(att->atttypid));
+							argtypes_pure[i + 2] = TEXTOID;
+							vals_pure[i + 2] = cn ? (Datum) 0 : CStringGetTextDatum(ct);
+							if (ct != NULL)
+								pfree(ct);
+						}
+						sql_pure = psprintf(
+							"SELECT d.op, d.old_version, d.tuple_data, d.key FROM "
+							OBTABLE_DELTA " d WHERE d.branch_id = $1 AND d.relid = $2 "
+							"AND (d.op = 'I' OR d.op = 'U')%s LIMIT 1", wbuf.data);
+						pfree(wbuf.data);
+					}
+					else
+					{
+						/* PK path: probe on the serialized PK (unchanged). */
+						nargs_pure = 3;
+						argtypes_pure = (Oid *) palloc(sizeof(Oid) * 3);
+						vals_pure = (Datum *) palloc(sizeof(Datum) * 3);
+						argtypes_pure[0] = INT4OID;
+						argtypes_pure[1] = OIDOID;
+						argtypes_pure[2] = TEXTOID;
+						vals_pure[0] = Int32GetDatum(bid);
+						vals_pure[1] = ObjectIdGetDatum(relid);
+						vals_pure[2] = CStringGetTextDatum(pk);
+						sql_pure = pstrdup(
+							"SELECT d.op, d.old_version, d.tuple_data FROM "
+							OBTABLE_DELTA " d WHERE d.branch_id = $1 AND d.relid = $2 "
+							"AND d.key = $3 AND (d.op = 'I' OR d.op = 'U') LIMIT 1");
+					}
 
 					overlay_overlay_helper_enter();
 					overlay_write_redirect_exit();
-					ret2 = ob_spi_exec_params(
-						"SELECT d.op, d.old_version, d.tuple_data FROM " OBTABLE_DELTA " d "
-						"WHERE d.branch_id = $1 AND d.relid = $2 AND d.key = $3 "
-						"AND (d.op = 'I' OR d.op = 'U') LIMIT 1",
-						true, 0, 3, argtypes_pure, vals_pure, NULL);
-					pfree(DatumGetPointer(vals_pure[2]));
-					in_pure_delta = (ret2 == SPI_OK_SELECT);
+					ret2 = ob_spi_exec_params(sql_pure, true, 0, nargs_pure,
+											  argtypes_pure, vals_pure, NULL);
 					overlay_write_redirect_enter();
 					overlay_overlay_helper_exit();
+					pfree(sql_pure);
+					/* $1/$2 are pass-by-value; only the text payloads (and
+					 * NULL arbiter columns passed as (Datum) 0) remain. */
+					for (i = 2; i < nargs_pure; i++)
+						if (DatumGetPointer(vals_pure[i]) != NULL)
+							pfree(DatumGetPointer(vals_pure[i]));
+					pfree(vals_pure);
+					pfree(argtypes_pure);
+					in_pure_delta = (ret2 == SPI_OK_SELECT);
 
 					if (in_pure_delta && SPI_tuptable != NULL && SPI_processed >= 1)
 					{
@@ -2145,7 +2324,6 @@ overlay_executor_run_intercept(QueryDesc *queryDesc,
 						char	   *oldver_txt;
 						char	   *td_hex;
 						int			hexlen;
-						int			i;
 
 						/* FIX-H1: use SPI_getvalue (not SPI_getbinval) for
 						 * all columns.  For op/old_version (TEXT) this is
@@ -2216,7 +2394,34 @@ overlay_executor_run_intercept(QueryDesc *queryDesc,
 							pre_image_slot = reconstruct_slot_from_delta(
 								rel, pure_tuple_bytes,
 								queryDesc->estate->es_query_cxt);
+							/* old_version / pure_delta_key MUST outlive the
+							 * SPI_finish() below: the current context here is
+							 * the SPI proc context, which SPI_finish tears
+							 * down, and the loop tail later pfree()s both.
+							 * Anchor them in es_query_cxt, exactly like
+							 * pure_tuple_bytes above; otherwise the tail
+							 * frees a dangling pointer (invalid-pfree PANIC
+							 * once a pure-delta row carries a real
+							 * old_version, i.e. it was written by an UPDATE). */
+							oldmc = MemoryContextSwitchTo(
+								queryDesc->estate->es_query_cxt);
 							old_version = oldver_txt ? pstrdup(oldver_txt) : NULL;
+							if (arb_natts > 0)
+							{
+								/* Keep the existing delta key so promo=3
+								 * updates that row rather than inserting a
+								 * fresh synthetic-key duplicate. */
+								char	   *k_txt = SPI_getvalue(SPI_tuptable->vals[0],
+																  SPI_tuptable->tupdesc, 4);
+
+								if (k_txt != NULL)
+								{
+									pure_delta_key = pstrdup(k_txt);
+									pfree(k_txt);
+								}
+							}
+							MemoryContextSwitchTo(oldmc);
+							oldmc = NULL;
 							promotion = 0; /* pure-only mark; combined with
 											* Phase II below */
 
@@ -2229,78 +2434,124 @@ overlay_executor_run_intercept(QueryDesc *queryDesc,
 				}
 
 				/* ---------- Phase II: MAIN heap ctid lookup (MAIN-FIRST) --- */
-				if (oc_action != ONCONFLICT_NONE && pk_attno > 0)
+				if (oc_action != ONCONFLICT_NONE && (pk_attno > 0 || arb_natts > 0))
 				{
-					TupleDesc	reldesc;
-					int			pk_attidx = pk_attno - 1;
-					Oid			pk_type;
+					TupleDesc	reldesc = RelationGetDescr(rel);
 					int			ret3;
-					char	   *sql2;
-					bool		pk_isnull = false;
-					Datum		pkdatum;
-					Datum		vals_main2[1];
-					static const Oid argtypes_main2[1] = {TEXTOID};
+					char	   *sql2 = NULL;
+					Datum	   *vals_main2 = NULL;
+					Oid		   *argtypes_main2 = NULL;
+					int			nargs_main2 = 0;
+					bool		probe_ok = true;
+					int			i;
 					MemoryContext oldmc;
 
-					reldesc = RelationGetDescr(rel);
-					pk_type = TupleDescAttr(reldesc, pk_attidx)->atttypid;
-
-					/* TTS safe read: direct tts_values access.  UPSERT
-					 * VALUES subplan returns TTSOpsVirtual slots; we
-					 * MUST use tts_values[attidx] / tts_isnull[attidx]
-					 * directly (after ensuring tts_nvalid >= attno)
-					 * instead of slot_getattr / slot_getallattrs which
-					 * would MATERIALIZE the virtual slot and corrupt
-					 * its by-ref contents. */
-					if (TTS_IS_VIRTUAL(slot))
+					if (arb_natts > 0)
 					{
-						if (slot->tts_nvalid < (AttrNumber) (pk_attidx + 1))
+						/* Keyless UPSERT: match a MAIN row on the arbiter
+						 * columns (the ctid key is not known up front). */
+						StringInfoData wbuf;
+
+						initStringInfo(&wbuf);
+						nargs_main2 = arb_natts;
+						argtypes_main2 = (Oid *) palloc(sizeof(Oid) * nargs_main2);
+						vals_main2 = (Datum *) palloc(sizeof(Datum) * nargs_main2);
+						for (i = 0; i < arb_natts; i++)
 						{
-							TupleDesc	std = slot->tts_tupleDescriptor;
-							if (std)
-								slot->tts_nvalid = std->natts;
+							AttrNumber	attno = arb_attnos[i];
+							Form_pg_attribute att = TupleDescAttr(reldesc, attno - 1);
+							bool		cn = false;
+							char	   *ct = ob_slot_col_text(rel, slot, attno, &cn);
+
+							appendStringInfo(&wbuf,
+											 "%s%s IS NOT DISTINCT FROM $%d::text::%s",
+											 (i == 0) ? " WHERE " : " AND ",
+											 quote_identifier(NameStr(att->attname)),
+											 i + 1,
+											 format_type_be(att->atttypid));
+							argtypes_main2[i] = TEXTOID;
+							vals_main2[i] = cn ? (Datum) 0 : CStringGetTextDatum(ct);
+							if (ct != NULL)
+								pfree(ct);
 						}
-						pkdatum = slot->tts_values[pk_attidx];
-						pk_isnull = slot->tts_isnull[pk_attidx];
-					}
-					else
-					{
-						pkdatum = slot_getattr(slot, pk_attno, &pk_isnull);
-					}
-
-					if (pk_isnull)
-					{
-						/* PK cannot be NULL for valid conflict detection.
-						 * If user passes PK=NULL, this is a plain insert.
-						 * promotion remains 0/1 from Phase I. */
-					}
-					else
-					{
-						Oid			pk_out_func;
-						bool		pk_is_varlena;
-						char   *pkval_txt;
-						getTypeOutputInfo(pk_type, &pk_out_func, &pk_is_varlena);
-						pkval_txt = OidOutputFunctionCall(pk_out_func, pkdatum);
-
-						/* WR-1a: PK value bound as $1; relname/colname/type inline. */
-						sql2 = psprintf("SELECT ctid FROM %s WHERE (%s) = $1::text::%s LIMIT 1",
+						sql2 = psprintf("SELECT ctid FROM %s%s LIMIT 1",
 										quote_qualified_identifier(
 											get_namespace_name(RelationGetNamespace(rel)),
 											RelationGetRelationName(rel)),
-										quote_identifier(NameStr(
-											TupleDescAttr(reldesc, pk_attidx)->attname)),
-										format_type_be(pk_type));
-						vals_main2[0] = CStringGetTextDatum(pkval_txt);
-						pfree(pkval_txt);
+										wbuf.data);
+						pfree(wbuf.data);
+					}
+					else
+					{
+						int			pk_attidx = pk_attno - 1;
+						Oid			pk_type = TupleDescAttr(reldesc, pk_attidx)->atttypid;
+						bool		pk_isnull = false;
+						Datum		pkdatum;
 
+						/* TTS safe read: direct tts_values access.  UPSERT
+						 * VALUES subplan returns TTSOpsVirtual slots; we
+						 * MUST use tts_values[attidx] / tts_isnull[attidx]
+						 * directly (after ensuring tts_nvalid >= attno)
+						 * instead of slot_getattr / slot_getallattrs which
+						 * would MATERIALIZE the virtual slot and corrupt
+						 * its by-ref contents. */
+						if (TTS_IS_VIRTUAL(slot))
+						{
+							if (slot->tts_nvalid < (AttrNumber) (pk_attidx + 1))
+							{
+								TupleDesc	std = slot->tts_tupleDescriptor;
+								if (std)
+									slot->tts_nvalid = std->natts;
+							}
+							pkdatum = slot->tts_values[pk_attidx];
+							pk_isnull = slot->tts_isnull[pk_attidx];
+						}
+						else
+						{
+							pkdatum = slot_getattr(slot, pk_attno, &pk_isnull);
+						}
+
+						if (pk_isnull)
+						{
+							/* PK cannot be NULL for valid conflict detection.
+							 * If user passes PK=NULL, this is a plain insert.
+							 * promotion remains 0/1 from Phase I. */
+							probe_ok = false;
+						}
+						else
+						{
+							Oid			pk_out_func;
+							bool		pk_is_varlena;
+							char	   *pkval_txt;
+
+							getTypeOutputInfo(pk_type, &pk_out_func, &pk_is_varlena);
+							pkval_txt = OidOutputFunctionCall(pk_out_func, pkdatum);
+
+							/* WR-1a: PK value bound as $1; relname/colname/type inline. */
+							sql2 = psprintf("SELECT ctid FROM %s WHERE (%s) = $1::text::%s LIMIT 1",
+											quote_qualified_identifier(
+												get_namespace_name(RelationGetNamespace(rel)),
+												RelationGetRelationName(rel)),
+											quote_identifier(NameStr(
+												TupleDescAttr(reldesc, pk_attidx)->attname)),
+											format_type_be(pk_type));
+							nargs_main2 = 1;
+							argtypes_main2 = (Oid *) palloc(sizeof(Oid));
+							vals_main2 = (Datum *) palloc(sizeof(Datum));
+							argtypes_main2[0] = TEXTOID;
+							vals_main2[0] = CStringGetTextDatum(pkval_txt);
+							pfree(pkval_txt);
+						}
+					}
+
+					if (probe_ok)
+					{
 						overlay_overlay_helper_enter();
 						overlay_write_redirect_exit();
-						ret3 = ob_spi_exec_params(sql2, true, 0, 1,
+						ret3 = ob_spi_exec_params(sql2, true, 0, nargs_main2,
 												  argtypes_main2, vals_main2, NULL);
 						overlay_write_redirect_enter();
 						overlay_overlay_helper_exit();
-						pfree(sql2);
-						pfree(DatumGetPointer(vals_main2[0]));
 
 						if (ret3 == SPI_OK_SELECT && SPI_tuptable != NULL &&
 							SPI_processed >= 1)
@@ -2338,6 +2589,20 @@ overlay_executor_run_intercept(QueryDesc *queryDesc,
 						}
 						SPI_finish();
 					}
+
+					/* Release the probe arrays (NULL arbiter columns were
+					 * passed as (Datum) 0 and must not be freed). */
+					if (sql2 != NULL)
+						pfree(sql2);
+					if (vals_main2 != NULL)
+					{
+						for (i = 0; i < nargs_main2; i++)
+							if (DatumGetPointer(vals_main2[i]) != NULL)
+								pfree(DatumGetPointer(vals_main2[i]));
+						pfree(vals_main2);
+					}
+					if (argtypes_main2 != NULL)
+						pfree(argtypes_main2);
 				}
 
 				/* ================================================================
@@ -2535,12 +2800,35 @@ overlay_executor_run_intercept(QueryDesc *queryDesc,
 						tdata = overlay_serialize_tuple(rel, post_image);
 
 						{
+							char	   *delta_key = pk;
+							char	   *anchored_key = NULL;
 							MemoryContext oldmc;
+
+							/* Keyless UPSERT writes under the conflicted
+							 * row's identity, not the VALUES slot's (which
+							 * would mint a fresh synthetic key and duplicate
+							 * the row on read): a pure-delta hit reuses the
+							 * existing delta key + version, a MAIN hit
+							 * re-anchors to that row's ctid. */
+							if (pure_delta_key != NULL)
+								delta_key = pure_delta_key;
+							else if (!overlay_relation_has_pk(rel) &&
+									 main_ctid != NULL)
+							{
+								anchored_key =
+									overlay_anchor_key_from_ctid(main_ctid);
+								if (anchored_key != NULL)
+									delta_key = anchored_key;
+							}
+
 							oldmc = MemoryContextSwitchTo(
 								queryDesc->estate->es_query_cxt);
-							overlay_delta_insert(bid, relid, pk,
+							overlay_delta_insert(bid, relid, delta_key,
 												 DELTA_OP_UPDATE, old_version, tdata);
 							MemoryContextSwitchTo(oldmc);
+
+							if (anchored_key != NULL)
+								pfree(anchored_key);
 						}
 						ninserted++;
 
@@ -2646,8 +2934,13 @@ overlay_executor_run_intercept(QueryDesc *queryDesc,
 				pfree(pk);
 				if (tdata) pfree(tdata);
 				if (old_version) pfree(old_version);
+				if (pure_delta_key) pfree(pure_delta_key);
 				ExecClearTuple(slot);
 			}
+
+				/* Statement-scoped arbiter column list (keyless UPSERT). */
+				if (arb_attnos != NULL)
+					pfree(arb_attnos);
 
 				if (has_returning && queryDesc->dest != NULL)
 				{
@@ -2750,7 +3043,7 @@ ob_write_redirect_done:
 								"detected for a managed table inside an active branch "
 								"(A3/A5 WR-choke abort; drift-write to MAIN prevented)"),
 						 errhint("This statement uses a plan shape not certified "
-								 "by overlay_branch MVP.  Please rewrite as a plain "
+								 "by overlay_branch.  Please rewrite as a plain "
 								 "INSERT/UPDATE/DELETE against one heap relation with "
 								 "an explicit PRIMARY KEY.")));
 		}

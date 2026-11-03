@@ -29,10 +29,9 @@ DECLARE
 BEGIN
   IF _s NOT LIKE '%overlay_branch%' THEN
     _msg := 'Postmaster started WITHOUT shared_preload_libraries=''overlay_branch''.  '
-         || 'The 3 correct ways to invoke these tests (DON''T `cd test/` first):'
-         || chr(10)||chr(10)||'  (A) make check                    <- temp-instance, hooks auto-loaded'
-         || chr(10)||'  (B) make installcheck EXTRA_REGRESS_OPTS="--use-existing --host=/tmp --port=15433"'
-         || chr(10)||'  (C) pg_regress overlay_branch_advanced \'
+         || 'The 2 correct ways to invoke these tests (DON''T `cd test/` first):'
+         || chr(10)||chr(10)||'  (A) make installcheck EXTRA_REGRESS_OPTS="--use-existing --host=/tmp --port=15433"'
+         || chr(10)||'  (B) pg_regress overlay_branch_advanced \'
          || chr(10)||'         --inputdir=./test --outputdir=./test_output \'
          || chr(10)||'         --temp-config=$(pwd)/test/temp_instance_shared_libs.conf \'
          || chr(10)||'         --bindir=$(pg_config --bindir)'
@@ -214,13 +213,13 @@ SELECT indexrelid::regclass::text AS delta_index
 
 SELECT CASE WHEN count(*) = 1 AND bool_and(indisprimary)
             THEN 'PASS:V1_DELTA_ONLY_PKEY'
-            ELSE 'FAIL:V1 index_count=' || count(*) END AS v1
+            ELSE 'FAIL: index_count=' || count(*) END AS v1
   FROM pg_index
  WHERE indrelid = 'overlay_branch.pg_branch_delta'::regclass;
 
 -- no 2-column (branch_id, relid) index may exist (name-independent)
 SELECT CASE WHEN count(*) = 0 THEN 'PASS:V1_NO_REDUNDANT_RELID_IDX'
-            ELSE 'FAIL:V1 redundant=' || string_agg(i.indexrelid::regclass::text, ',')
+            ELSE 'FAIL: redundant=' || string_agg(i.indexrelid::regclass::text, ',')
        END AS v2
   FROM pg_index i
   JOIN pg_attribute a1 ON a1.attrelid = i.indrelid AND a1.attnum = i.indkey[0]
@@ -240,17 +239,17 @@ SELECT overlay_branch.use_branch('bs_V_br');
 INSERT INTO public.bs_V_t SELECT 1000 + g, g FROM generate_series(1,2000) g;
 
 SELECT CASE WHEN count(*) = 2100 THEN 'PASS:V2_OVERLAY_COUNT_2100'
-            ELSE 'FAIL:V2 count=' || count(*) END AS v3
+            ELSE 'FAIL: count=' || count(*) END AS v3
   FROM public.bs_V_t;
 SELECT CASE WHEN v = 500 THEN 'PASS:V2_PURE_ROW_VISIBLE'
-            ELSE 'FAIL:V2 v=' || COALESCE(v::text,'NULL') END AS v4
+            ELSE 'FAIL: v=' || COALESCE(v::text,'NULL') END AS v4
   FROM public.bs_V_t WHERE id = 1500;
 
 -- probe hit: UPDATE an existing delta key keeps exactly one delta row
 UPDATE public.bs_V_t SET v = 1501 WHERE id = 1500;
 SELECT CASE WHEN count(*) = 1 AND min(v) = 1501
             THEN 'PASS:V2_DELTA_UPDATE_ONE_ROW'
-            ELSE 'FAIL:V2 rows=' || count(*) END AS v5
+            ELSE 'FAIL: rows=' || count(*) END AS v5
   FROM public.bs_V_t WHERE id = 1500;
 
 -- probe conflict: duplicate PK inside the branch must still ERROR 23505
@@ -258,7 +257,7 @@ INSERT INTO public.bs_V_t VALUES (1500, 1);
 
 SELECT overlay_branch.use_branch(NULL);
 SELECT CASE WHEN count(*) = 100 THEN 'PASS:V2_MAIN_PRISTINE_100'
-            ELSE 'FAIL:V2 count=' || count(*) END AS v6
+            ELSE 'FAIL: count=' || count(*) END AS v6
   FROM public.bs_V_t;
 
 SELECT overlay_branch.discard_branch('bs_V_br');

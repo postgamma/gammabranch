@@ -208,7 +208,7 @@ ob_acl_check_lifecycle(ObLifecycleOp op, const char *branch_name)
 }
 
 /* ================================================================
- * §G01 Branch-scope pre-flight (MVP support matrix fail-fast gate).
+ * §G01 Branch-scope pre-flight (support matrix fail-fast gate).
  *
  * Implementation notes:
  *   We could walk pg_class via systable_beginscan(SysCacheRel) but a
@@ -228,7 +228,7 @@ ob_acl_check_lifecycle(ObLifecycleOp op, const char *branch_name)
  *   shown (like a standard compiler).
  * ================================================================ */
 /* ================================================================
- * G01 Branch-scope pre-flight (MVP support matrix fail-fast gate).
+ * G01 Branch-scope pre-flight (support matrix fail-fast gate).
  *
  * Implementation notes:
  *   - NO WITH-CTEs in SPI queries (we debugged WITH CTE + SPI_execute
@@ -394,14 +394,14 @@ ob_check_branch_scope(void)
 	{
 		ereport(ERROR,
 				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
-				 errmsg("MVP overlay branch cannot be created because this database contains at least one table in an unsupported category (G01 support matrix)"),
+				 errmsg("overlay branch cannot be created because this database contains at least one table in an unsupported category (G01 support matrix)"),
 				 errdetail("First unsupported relation: %s", detail),
-				 errhint("Remove or rename the relation, or exclude its schema from the overlay scope.  MVP RESTRICTED categories: FKs, user triggers, partitions, table inheritance, UNLOGGED tables, GENERATED STORED columns, VIEWs/MATVIEWs/FDW tables, or any relkind other than ordinary table ('r'), sequence ('S'), or btree index ('i').")));
+				 errhint("Remove or rename the relation, or exclude its schema from the overlay scope.  RESTRICTED categories: FKs, user triggers, partitions, table inheritance, UNLOGGED tables, GENERATED STORED columns, VIEWs/MATVIEWs/FDW tables, or any relkind other than ordinary table ('r'), sequence ('S'), or btree index ('i').")));
 	}
 	pfree(sql.data);
 }
 
-/* ============ V3 FR5: per-branch frozen snapshot cache (TopMC hash) ============
+/* ============ FR5: per-branch frozen snapshot cache (TopMC hash) ============
  * snapshot for snapshot-mode branches that have been entered at least once.
  *
  * Why a global cache instead of just ctx->branch_main_snapshot:
@@ -526,7 +526,7 @@ ob_snapshot_cache_remove(int32 bid)
 		pfree(ent->frozen);
 }
 
-/* ============ I8.2 V3: session-local per-bid mode cache ============
+/* ============ I8.2: session-local per-bid mode cache ============
  *
  * Replaces catalog UPDATE pg_branch.mode in use_branch() with a pure
  * session-local bid → last-mode hash.
@@ -659,7 +659,7 @@ static void ob_apply_relation_batch(ObApplyRelInfo *ri, int32 bid, List *deltas,
  * §G06 minimal leak prevention: detect whether the current database has any publication
  *   - puball=true (FOR ALL TABLES), or
  *   - pubschema=true and the publication has FOR TABLES IN SCHEMA over the overlay_branch schema
- * Match on either case emits WARNING (does not block normal MVP use; S26 productization may upgrade to ERROR).
+ * Match on either case emits WARNING (does not block normal use; S26 productization may upgrade to ERROR).
  * Access control: SPI SELECT pg_publication; if the table is missing (--without-publication build) silently skip.
  * Throttling: the 5 sites on the same connection (create/enter/exit/apply/discard) warn only once per process,
  * avoiding a flood on every use_branch().
@@ -1344,7 +1344,7 @@ overlay_branch_create_internal(const char *branch_name)
 	return new_branch_id;
 }
 /* ------------------------------------------------------------------
- * V3 snapshot lifecycle helpers
+ * snapshot lifecycle helpers
  * ------------------------------------------------------------------ */
 void
 ob_ensure_unregister_snapshot(BranchContext *ctx)
@@ -1422,7 +1422,7 @@ ob_install_snapshot_for_mode(BranchContext *ctx, const char *mode)
 	{
 		Snapshot	existing;
 
-		/* --- V3 FR5 freeze semantics: once a branch is first entered
+		/* --- FR5 freeze semantics: once a branch is first entered
 		 * in snapshot mode, its frozen MAIN snapshot is stored in the
 		 * global bid-keyed hash. Subsequent re-entries (use_branch('',
 		 * snapshot) on the SAME bid) MUST reuse the original capture
@@ -1458,7 +1458,7 @@ ob_install_snapshot_for_mode(BranchContext *ctx, const char *mode)
 			Size subxipoff;
 			Size size_alloc;
 
-			/* PERFORMANCE TODO (V3.x): long-lived snapshot holds back
+			/* PERFORMANCE TODO: long-lived snapshot holds back
 			 * xmin horizon / VACUUM. Correctness first; add max-hold
 			 * GUC + HINT later.
 			 *
@@ -1477,7 +1477,7 @@ ob_install_snapshot_for_mode(BranchContext *ctx, const char *mode)
 			oldcxt = MemoryContextSwitchTo(TopMemoryContext);
 			copied = (Snapshot) palloc(size_alloc);
 			memcpy(copied, cur_snap, sizeof(SnapshotData));
-			/* ---- V3 CRITICAL REGISTRATION PSEUDO-PIN (T5 pitfall fix)
+			/* ---- CRITICAL REGISTRATION PSEUDO-PIN (T5 pitfall fix)
 			 *
 			 * PG PopActiveSnapshot() [snapmgr.c L753-755] frees the
 			 * Snapshot (via FreeSnapshot) when BOTH
@@ -1531,7 +1531,7 @@ ob_install_snapshot_for_mode(BranchContext *ctx, const char *mode)
 void
 overlay_branch_use_internal(const char *branch_name)
 {
-	/* V3 T8 contract: 1-arg use_branch(name) (explicit SQL call) ALWAYS
+	/* T8 contract: 1-arg use_branch(name) (explicit SQL call) ALWAYS
 	 * resolves mode = 'live' regardless of any prior session-local mode
 	 * cache entry.  Mode-preserve applies ONLY to the GUC RESTORE path
 	 * (assign hook overlay_branch.c), which calls
@@ -1706,14 +1706,14 @@ overlay_branch_use_with_mode_internal(const char *branch_name, const char *mode)
 		 * total/pk/hash drift → 55000 immediately (no side effects). */
 		ob_registry_check_current_schema(real_branch_id, "use_branch");
 
-		/* V3 FR2 V1 (I8.1 L1 2026-09-17 dry-run fix): use_branch NO LONGER
+		/* FR2 (I8.1 L1 2026-09-17 dry-run fix): use_branch NO LONGER
 		 * takes SHARED advisory lock.
 		 *
 		 * Rationale (locked in doc/internals.md §3.3):
 		 * Old V0: use=SHARED, apply=EXCLUSIVE → two sessions
 		 *   S1=SHARED + S2=SHARED then S1=EXCLUSIVE-upgrade + S2=EXCLUSIVE-upgrade
 		 *   = PostgreSQL classic shared→exclusive upgrade DEADLOCK 40P01.
-		 * V1 fix: (a) use_branch = NO LOCK (just read catalog + install GUC/snapshot).
+		 * Fix: (a) use_branch = NO LOCK (just read catalog + install GUC/snapshot).
 		 *          (b) apply_branch/discard_branch = FIRST run FR3 CAS
 		 *              (UPDATE pg_branch SET state={applying,discarding} WHERE state='active'
 		 *               — row-level UPDATE itself is 1-winner atomic CAS;
@@ -1809,7 +1809,7 @@ overlay_branch_is_active(void)
 {
 	extern bool overlay_branch_enabled;
 
-	/* V3 FR4: run throttled invalidation check on every public "are we on
+	/* FR4: run throttled invalidation check on every public "are we on
 	 * a branch?" guard.  DQL path only (for_dml=false) so the caller —
 	 * BranchScan, rel_ok, ddl_ok, planner shortcuts — all get a soft
 	 * NOTICE + MAIN-fallback kickout.  The DML hard-ERROR path is
@@ -2392,7 +2392,7 @@ overlay_branch_apply_internal(const char *branch_name)
 	 * block other apply/discard operations on unrelated branches. */
 	ob_registry_check_current_schema(bid, "apply_branch");
 
-	/* V3 FR2: take branch-level EXCLUSIVE advisory lock BEFORE any catalog
+	/* FR2: take branch-level EXCLUSIVE advisory lock BEFORE any catalog
 	 * UPDATE / RowExclusiveLock on user tables, so we strictly follow
 	 * Advisory → (catalog locks + user RowExclusiveLock) deadlock order.
 	 * With ExclusiveLock held, the ACTIVE state check below and the later
@@ -2415,7 +2415,7 @@ overlay_branch_apply_internal(const char *branch_name)
 		overlay_guard_ereport_fail("apply_branch", NULL, branch_name, reason);
 	}
 
-	/* V3 FR3: CAS transition to transient state='applying' BEFORE any 3-pass writes, to
+	/* FR3: CAS transition to transient state='applying' BEFORE any 3-pass writes, to
 	 * guarantee no other session can sneak in a delta-write while we are halfway
 	 * between D-pass and I-pass (which would cause silent data loss — see
 	 * doc/internals.md §3.4).
@@ -2658,7 +2658,7 @@ overlay_branch_apply_internal(const char *branch_name)
 	}
 
 	ob_broadcast_state_change(bid, BRANCH_STATE_APPLIED);
-	/* V3 FR5: branch is APPLIED now — evict its frozen MAIN snapshot
+	/* FR5: branch is APPLIED now — evict its frozen MAIN snapshot
 	 * from the per-bid hash cache (if any) and free the TopMC
 	 * CopySnapshot chunk.  After apply, bid no longer ACTIVE so no
 	 * future snapshot-mode entry can reference it.  Safe if cache
@@ -2775,7 +2775,7 @@ overlay_branch_discard_internal(const char *branch_name)
 											branch_name));
 	}
 
-	/* V3 FR2: take branch-level EXCLUSIVE advisory lock BEFORE the first
+	/* FR2: take branch-level EXCLUSIVE advisory lock BEFORE the first
 	 * catalog UPDATE, so discard serialises vs concurrent apply/discard
 	 * on same bid AND obeys Advisory → catalog RowExclusiveLock order
 	 * (prevents deadlock). */
@@ -2844,7 +2844,7 @@ overlay_branch_discard_internal(const char *branch_name)
 	 * delta CASCADE succeed — other sessions may be LISTENing on this
 	 * branch via NOTIFY even if *this* session isn't currently on it. */
 	ob_broadcast_state_change(bid, BRANCH_STATE_DISCARDED);
-	/* V3 FR5: branch DISCARDED — evict frozen snapshot cache for bid
+	/* FR5: branch DISCARDED — evict frozen snapshot cache for bid
 	 * (if any) and free TopMC CopySnapshot.  After discard, bid no
 	 * longer ACTIVE so no future snapshot-mode reference possible. */
 	ob_snapshot_cache_remove(bid);
@@ -3705,8 +3705,9 @@ apply_relation_insert_pass(ObApplyRelInfo *ri, DeltaTuple *dt,
  * statements; it aborts the apply and rolls the whole transaction back, so
  * nothing is partially applied.
  *
- * Relations without a PRIMARY KEY, and relations whose deltas carry a base
- * image ("_base", the R15/R18 HOT-update guard), stay on the per-row replay.
+ * Keyless relations join on their ctid anchor ("A:<blk>:<off>") instead of a
+ * PK; relations whose deltas carry a base image ("_base", the R15/R18
+ * HOT-update guard) stay on the per-row replay.
  * ================================================================ */
 
 /* TOKEN(alias) - canonical MAIN-row CAS token, byte-identical to the
@@ -3742,6 +3743,29 @@ ob_batch_pkjoin_expr(ObApplyRelInfo *ri, const char *delta_alias,
 	return buf.data;
 }
 
+/*
+ * IDENTITYJOIN(delta_alias, main_alias) - the batch join on the row identity.
+ *
+ * PK relations use the JSON-array key (ob_batch_pkjoin_expr).  Keyless
+ * relations have no PK column, so the join decodes the tagged physical key:
+ *   "A:<blk>:<off>" -> main.ctid = '(blk,off)'::tid
+ *   "S:<seq>"       -> no MAIN anchor; the CASE yields NULL, which never
+ *                      matches a ctid, so the row is treated as branch-only
+ *                      (pure INSERT).
+ */
+static char *
+ob_batch_identity_join_expr(ObApplyRelInfo *ri, const char *delta_alias,
+							const char *main_alias)
+{
+	if (ri->n_pk > 0)
+		return ob_batch_pkjoin_expr(ri, delta_alias, main_alias);
+
+	return psprintf("%s.ctid = CASE WHEN substr(%s.key, 1, 2) = 'A:' "
+					"THEN (('(' || replace(substr(%s.key, 3), ':', ',') || ')')::tid) "
+					"ELSE NULL END",
+					main_alias, delta_alias, delta_alias);
+}
+
 /* First conflicting delta row for one operation, as reported by the
  * validation SELECT.  All string fields are palloc'd in TopMemoryContext. */
 typedef struct ObBatchConflict
@@ -3773,7 +3797,7 @@ ob_batch_validate(ObApplyRelInfo *ri, int32 bid, char op)
 	c.main_missing = false;
 	c.main_ver = NULL;
 
-	pkjoin = ob_batch_pkjoin_expr(ri, "d", "m");
+	pkjoin = ob_batch_identity_join_expr(ri, "d", "m");
 	token = ob_batch_token_expr("m");
 
 	initStringInfo(&sql);
@@ -3937,7 +3961,7 @@ ob_batch_delete_pass(ObApplyRelInfo *ri, int32 bid, uint64 expected)
 	int			ret;
 	uint64		n;
 
-	pkjoin = ob_batch_pkjoin_expr(ri, "d", "m");
+	pkjoin = ob_batch_identity_join_expr(ri, "d", "m");
 	token = ob_batch_token_expr("m");
 
 	initStringInfo(&sql);
@@ -3974,7 +3998,7 @@ ob_batch_update_pass(ObApplyRelInfo *ri, int32 bid, uint64 expected)
 	int			ret;
 	uint64		n;
 
-	pkjoin = ob_batch_pkjoin_expr(ri, "s", "m");
+	pkjoin = ob_batch_identity_join_expr(ri, "s", "m");
 	token = ob_batch_token_expr("m");
 
 	initStringInfo(&sql);
@@ -4014,7 +4038,7 @@ ob_batch_insert_pass(ObApplyRelInfo *ri, int32 bid, uint64 expected)
 	int			ret;
 	uint64		n;
 
-	pkjoin = ob_batch_pkjoin_expr(ri, "d", "m");
+	pkjoin = ob_batch_identity_join_expr(ri, "d", "m");
 
 	initStringInfo(&sql);
 	appendStringInfo(&sql,
@@ -4096,12 +4120,10 @@ ob_apply_batch_can_use(ObApplyRelInfo *ri, List *deltas)
 	if (!ob_apply_batch)
 		return false;
 
-	/* Keyless tables have no PK column to join the delta key against. */
-	if (ri->n_pk <= 0)
-		return false;
-
-	/* The R15/R18 base-image compare stays row-scoped: one delta carrying a
-	 * "_base" key sends the whole relation down the per-row replay. */
+	/* Both PK and keyless relations batch: the join key differs (JSON PK vs
+	 * ctid anchor, see ob_batch_identity_join_expr).  The R15/R18 base-image
+	 * compare stays row-scoped: one delta carrying a "_base" key sends the
+	 * whole relation down the per-row replay. */
 	foreach(lc, deltas)
 	{
 		DeltaTuple *dt = (DeltaTuple *) lfirst(lc);

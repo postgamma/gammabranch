@@ -65,7 +65,7 @@ CREATE TABLE @extschema@.pg_branch_delta (
 -- ============================================================
 -- §Gx / A7: Schema-epoch registry.
 --
---   MVP anti-drift hard guard: at create_branch() time, we scan every
+--   anti-drift hard guard: at create_branch() time, we scan every
 --   user permanent table currently in the database (same filtering
 --   rules as G01 create_branch scope: no system namespaces, no ext
 --   schema, no objects owned by this extension) and record, for each
@@ -137,7 +137,7 @@ GRANT SELECT, INSERT, DELETE ON @extschema@.pg_branch_registry TO PUBLIC;
 -- Tables created during extension install have a relid satisfying FirstNormalObjectId; a pinned
 -- OID scheme is also infeasible (CREATE EXTENSION uses GetNewObjectId()).
 --
--- Therefore G06 MVP can only rely on RUNTIME detection + documentation:
+-- Therefore G06 can only rely on RUNTIME detection + documentation:
 --   - E-2 ob_g06_check_publication_leak_throttled() at create/enter/apply/
 --     discard entry points finds puball=true or pubschema containing the overlay_branch schema
 --     and emits WARNING (S26 productization may upgrade to ERROR);
@@ -201,7 +201,7 @@ COMMENT ON COLUMN @extschema@.pg_branch.col_signature
 
 
 -- ============================================================
--- G01 MVP support-matrix create_branch scope RESTRICTED list.
+-- G01 support-matrix create_branch scope RESTRICTED list.
 --
 --   overlay_branch_create_internal runs ob_check_branch_scope() as
 --   its FIRST executable statement after static name-length validation
@@ -248,9 +248,9 @@ COMMENT ON FUNCTION @extschema@.use_branch(name) IS
 
 -- ============================================================
 -- 2-parameter use_branch(name, mode) with MVCC mode override.
---   mode = 'live'    : reads on MAIN use current snapshot (V2 behaviour)
+--   mode = 'live'    : reads on MAIN use current snapshot (live behaviour)
 --   mode = 'snapshot': reads on MAIN freeze at the snapshot taken when
---                      this function is called; see V3 docs.
+--                      this function is called; see the documentation.
 -- OVERLOAD RESOLUTION NOTE: mode has NO SQL DEFAULT so use_branch('foo')
 --   UNIQUELY resolves to the 1-parameter form above; without this PG 17
 --   raises "ERROR: function use_branch(unknown) is not unique".
@@ -263,9 +263,9 @@ SET search_path = @extschema@, pg_catalog;
 
 COMMENT ON FUNCTION @extschema@.use_branch(name, text) IS
 'Enter a branch with an explicit MVCC mode.
-mode = ''live''    : reads on MAIN use current snapshot (V2 behaviour).
+mode = ''live''    : reads on MAIN use current snapshot (live behaviour).
 mode = ''snapshot'': reads on MAIN freeze at the MVCC snapshot taken
-                     when this function is called; see V3 docs.';
+                     when this function is called; see the documentation.';
 
 CREATE FUNCTION @extschema@.current_branch()
 RETURNS name
@@ -286,14 +286,14 @@ LANGUAGE C STRICT VOLATILE
 SET search_path = @extschema@, pg_catalog;
 
 -- NOTE: list_branches is intentionally implemented in pure SQL rather
--- than C for MVP Step 1.  The naive C SRF had a number of stability
+-- than C for Step 1.  The naive C SRF had a number of stability
 -- problems (deep-copying SPI datum values by hand is error-prone and
 -- produced SIGSEGV / all-NULL rows in several builds).  The query
 -- here is semantically identical to what the C stub used to do: a
 -- LEFT JOIN between pg_branch and the per-branch delta count.  Since
 -- the extension's catalog tables live in @extschema@ and we run with
 -- the fixed search_path, this SQL version is also read-only and
--- needs no upgrade to V2 to be composable with later Step code.
+-- needs no upgrade to remain composable with later Step code.
 CREATE FUNCTION @extschema@.overlay_branch_cached_mode(bid integer)
 RETURNS text
 AS 'MODULE_PATHNAME', 'overlay_branch_cached_mode'
@@ -338,12 +338,75 @@ AS $$
 $$;
 
 -- ============================================================
+-- §5.6 B1: branch_delta_stats(branch_name) — read-only delta-size
+-- observability.  Returns one row per (branch, relation) that has
+-- delta rows, exposing counts and byte sizes only (never delta row
+-- content).  Access mirrors list_branches(): it reads the delta
+-- catalog, which is administrator-only per R22, so SECURITY INVOKER
+-- is retained and a plain user gets permission denied, exactly as
+-- with list_branches().  See doc/internals.md §5.6.
+-- ============================================================
+DROP FUNCTION IF EXISTS @extschema@.branch_delta_stats(name);
+CREATE FUNCTION @extschema@.branch_delta_stats(b_name name)
+RETURNS TABLE(
+    branch_name name,
+    relid oid,
+    relation text,
+    delta_rows bigint,
+    delta_insert bigint,
+    delta_update bigint,
+    delta_delete bigint,
+    delta_payload_bytes bigint,
+    main_bytes bigint,
+    amplification numeric
+)
+LANGUAGE sql STABLE STRICT
+SET search_path = @extschema@, pg_catalog
+AS $$
+    WITH stats AS (
+        SELECT d.branch_id,
+               d.relid,
+               count(*)::bigint                                   AS delta_rows,
+               count(*) FILTER (WHERE d.op = 'I')::bigint         AS delta_insert,
+               count(*) FILTER (WHERE d.op = 'U')::bigint         AS delta_update,
+               count(*) FILTER (WHERE d.op = 'D')::bigint         AS delta_delete,
+               (COALESCE(sum(octet_length(d.key)), 0)
+                + COALESCE(sum(octet_length(d.old_version)), 0)
+                + COALESCE(sum(octet_length(d.tuple_data)), 0))::bigint AS payload_bytes
+        FROM @extschema@.pg_branch_delta d
+        GROUP BY d.branch_id, d.relid
+    )
+    SELECT b.branch_name,
+           s.relid,
+           pg_catalog.format('%I.%I', n.nspname, c.relname) AS relation,
+           s.delta_rows,
+           s.delta_insert,
+           s.delta_update,
+           s.delta_delete,
+           s.payload_bytes AS delta_payload_bytes,
+           sz.main_bytes,
+           CASE WHEN sz.main_bytes > 0
+                THEN pg_catalog.round(s.payload_bytes::numeric / sz.main_bytes, 6)
+                ELSE NULL
+           END AS amplification
+    FROM @extschema@.pg_branch b
+    JOIN stats s ON s.branch_id = b.branch_id
+    LEFT JOIN pg_catalog.pg_class c ON c.oid = s.relid
+    LEFT JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace
+    CROSS JOIN LATERAL (
+        SELECT pg_catalog.pg_total_relation_size(s.relid) AS main_bytes
+    ) sz
+    WHERE b.branch_name = b_name
+    ORDER BY s.relid;
+$$;
+
+-- ============================================================
 -- §D4 / A9: get_branch_identity(branch_name) — convenient helper
 -- that returns a ROW of restore-metadata for a named branch, plus
 -- the global A7 schema drift check to confirm the branch can still
 -- be entered in this database.
 --
--- MVP return columns (no C SRF overhead; pure SQL so ABI-stable):
+-- Return columns (no C SRF overhead; pure SQL so ABI-stable):
 --   branch_id, schema_hash, creation_snapshot_xmin, tablespace_list,
 --   col_signature, registry_user_tables, registry_schema_current_match
 -- ============================================================
@@ -425,7 +488,7 @@ $$;
 REVOKE ALL ON FUNCTION @extschema@.get_branch_identity(name) FROM PUBLIC;
 GRANT EXECUTE ON FUNCTION @extschema@.get_branch_identity(name) TO PUBLIC;
 
--- public synonym for UX (match example_sql.md public prefix-less UX)
+-- public synonym for UX (match user_guide.md public prefix-less UX)
 DROP FUNCTION IF EXISTS public.get_branch_identity(name);
 CREATE FUNCTION public.get_branch_identity(b_name name)
 RETURNS TABLE(
@@ -489,7 +552,7 @@ LANGUAGE C STRICT VOLATILE
 SET search_path = @extschema@, pg_catalog;
 
 -- ============================================================
--- V3 Task 2 Layer 1 (FR1 + FR4): throttled catalog recheck
+-- Task 2 Layer 1 (FR1 + FR4): throttled catalog recheck
 --   * overlay_branch_is_active(name) RETURNS bool
 --       - returns ground truth from pg_branch catalog, performing
 --         throttled heavy SPI recheck if enough calls have elapsed
@@ -619,7 +682,7 @@ REVOKE ALL ON public.pg_branch_delta FROM PUBLIC;
 -- Public synonyms for convenience.
 --   Extensions with schema != public must still be usable from
 --   plain `SELECT create_branch('b1')` to match the documented
---   UX in doc/example_sql.md.  Since PostgreSQL has no CREATE
+--   UX in doc/user_guide.md.  Since PostgreSQL has no CREATE
 --   SYNONYM we build SQL-language wrappers in the public schema
 --   that just forward to the real @extschema@ functions.
 --   search_path visibility: wrappers are in public, which is in
@@ -667,7 +730,7 @@ CREATE FUNCTION public.apply_branch(_name name)
 RETURNS void LANGUAGE plpgsql VOLATILE
 SET search_path = @extschema@, pg_catalog
 AS $$
-/* A4 MVP F1 PL/pgSQL empty-branch fast apply return.
+/* A4 F1 PL/pgSQL empty-branch fast apply return.
  *
  * FAST-PATH CONDITIONS (all must be true):
  *   1. branch state = 'active'
@@ -797,12 +860,21 @@ RETURNS TABLE(branch_id integer, branch_name name, owner oid,
 LANGUAGE sql STABLE SET search_path = @extschema@, pg_catalog
 AS $$SELECT * FROM @extschema@.list_branches()$$;
 
+DROP FUNCTION IF EXISTS public.branch_delta_stats(name);
+CREATE FUNCTION public.branch_delta_stats(b_name name)
+RETURNS TABLE(branch_name name, relid oid, relation text,
+              delta_rows bigint, delta_insert bigint, delta_update bigint,
+              delta_delete bigint, delta_payload_bytes bigint,
+              main_bytes bigint, amplification numeric)
+LANGUAGE sql STABLE SET search_path = @extschema@, pg_catalog
+AS $$SELECT * FROM @extschema@.branch_delta_stats(b_name)$$;
+
 -- NOTE: overlay_main_plus_delta() is intentionally NOT wrapped in public
--- for MVP Step 1.  Its RETURNS SETOF record requires a column-definition
+-- for Step 1.  Its RETURNS SETOF record requires a column-definition
 -- list at call time (e.g. FROM overlay_branch.overlay_main_plus_delta('t')
 -- AS x(col type, ...)), which cannot be transparently forwarded through a
 -- SQL-language wrapper.  Users can always qualify with the schema, and
--- Step 4 of the MVP will introduce a more usable signature.
+-- Step 4 will introduce a more usable signature.
 
 -- §G02 S13: lifecycle synonyms are declared SECURITY DEFINER (see the
 -- public-synonyms block above) so callers without @extschema@ SCHEMA
@@ -823,6 +895,7 @@ GRANT EXECUTE ON FUNCTION public.use_branch(name, text)   TO PUBLIC;
 -- Read-only helpers (metadata-only) remain PUBLIC-friendly.
 GRANT EXECUTE ON FUNCTION public.current_branch()         TO PUBLIC;
 GRANT EXECUTE ON FUNCTION public.list_branches()          TO PUBLIC;
+GRANT EXECUTE ON FUNCTION public.branch_delta_stats(name) TO PUBLIC;
 
 GRANT EXECUTE ON FUNCTION @extschema@.overlay_branch_is_active(name) TO PUBLIC;
 GRANT EXECUTE ON FUNCTION @extschema@.overlay_branch_force_invalidation_check() TO PUBLIC;

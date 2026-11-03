@@ -3,7 +3,7 @@
 --
 -- For the CLEAN, user-facing end-to-end happy-path story see the
 -- sibling file overlay_branch_user.sql (public.products +
--- agent_workspace, modelled directly on doc/example_sql.md §0~§4).
+-- agent_workspace, modelled directly on doc/user_guide.md §0~§4).
 --
 -- Parts (each section is internally self-contained so a single diff
 -- row tells you WHICH Step regressed):
@@ -53,10 +53,9 @@ DECLARE
 BEGIN
   IF _s NOT LIKE '%overlay_branch%' THEN
     _msg := 'Postmaster started WITHOUT shared_preload_libraries=''overlay_branch''.  '
-         || 'The 3 correct ways to invoke these tests (DON''T `cd test/` first):'
-         || chr(10)||chr(10)||'  (A) make check                    <- temp-instance, hooks auto-loaded'
-         || chr(10)||'  (B) make installcheck EXTRA_REGRESS_OPTS="--use-existing --host=/tmp --port=15433"'
-         || chr(10)||'  (C) pg_regress overlay_branch_basic \'
+         || 'The 2 correct ways to invoke these tests (DON''T `cd test/` first):'
+         || chr(10)||chr(10)||'  (A) make installcheck EXTRA_REGRESS_OPTS="--use-existing --host=/tmp --port=15433"'
+         || chr(10)||'  (B) pg_regress overlay_branch_basic \'
          || chr(10)||'         --inputdir=./test --outputdir=./test_output \'
          || chr(10)||'         --temp-config=$(pwd)/test/temp_instance_shared_libs.conf \'
          || chr(10)||'         --bindir=$(pg_config --bindir)'
@@ -212,7 +211,7 @@ WHERE branch_id = (SELECT branch_id FROM public.pg_branch WHERE branch_name='b_d
 -- Cleanup b_delta
 SELECT discard_branch('b_delta');
 
--- ========== Part C: Step 4 MVP — I/U/D redirect + Main⊕Delta SRF ==========
+-- ========== Part C: Step 4 — I/U/D redirect + Main⊕Delta SRF ==========
 -- C1. Build baseline Main table
 CREATE TABLE public.t (id INT4 PRIMARY KEY, v TEXT);
 INSERT INTO public.t VALUES (1,'v-base-1'),(2,'v-base-2'),(3,'v-base-3');
@@ -230,7 +229,7 @@ DELETE FROM public.t WHERE id = 2;
 UPDATE public.t SET v = 'v-b1-UPDATED' WHERE id = 1;
 INSERT INTO public.t VALUES (4, 'v-b1-NEW');
 
--- NOTE: BranchScan MVP now injects CustomScan for ordinary SELECT * FROM t
+-- NOTE: BranchScan now injects CustomScan for ordinary SELECT * FROM t
 -- whenever the overlay_branch.current GUC points at an ACTIVE branch,
 -- transparently returning MAIN⊕delta instead of just raw MAIN heap rows.
 -- The zero-pollution checks (C3a) below ASSERT that MAIN heap itself
@@ -605,7 +604,7 @@ SELECT CASE WHEN string_agg(id::text||'='||v, ',' ORDER BY id) = '1=RACE-MAIN-WR
 FROM public.t;
 
 -- =====================================================================
--- ========== Part 6: BranchScan MVP (CustomScan transparently merges
+-- ========== Part 6: BranchScan (CustomScan transparently merges
 -- ========== MAIN⊕delta for plain SELECT).
 -- =====================================================================
 
@@ -678,7 +677,7 @@ FROM srf, cs;
 -- 6.6 Plan shapes for 4 representative SELECT shapes.
 EXPLAIN (COSTS OFF, SUMMARY OFF) SELECT * FROM public.bs_basic;                     -- plain CustomScan
 EXPLAIN (COSTS OFF, SUMMARY OFF) SELECT count(*) FROM public.bs_basic;               -- Aggregate + CustomScan
-EXPLAIN (COSTS OFF, SUMMARY OFF) SELECT * FROM public.bs_basic WHERE id = 2;         -- Filter + CustomScan (MVP: qual NOT pushed)
+EXPLAIN (COSTS OFF, SUMMARY OFF) SELECT * FROM public.bs_basic WHERE id = 2;         -- Filter + CustomScan (qual NOT pushed)
 EXPLAIN (COSTS OFF, SUMMARY OFF) SELECT * FROM public.bs_basic ORDER BY amt DESC;   -- Sort + CustomScan (no IndexScan leak)
 
 -- 6.7 Row-level spot checks against the 4 expected tuples:

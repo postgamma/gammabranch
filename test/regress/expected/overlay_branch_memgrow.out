@@ -84,7 +84,7 @@ ANALYZE ob_mem;
 SELECT overlay_branch.create_branch('ob_mem_b1');
  create_branch 
 ---------------
-             7
+            12
 (1 row)
 
 SELECT overlay_branch.use_branch('ob_mem_b1');

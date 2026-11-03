@@ -60,6 +60,9 @@ extern void overlay_overlay_helper_exit(void);
 #define OBTABLE_DELTA   OBSCHEMA ".pg_branch_delta"
 #define OBTABLE_BRANCH  OBSCHEMA ".pg_branch"
 
+/* B1 §5.6: amortized delta-size nudge, called once per delta write. */
+static void ob_delta_size_warn_check(int32 branch_id);
+
 /* ================================================================
  * Delta Store (6 real SPI functions)
  * ================================================================ */
@@ -236,6 +239,8 @@ overlay_delta_insert(int32 branch_id, Oid relid, const char *key,
 	}
 
 	SPI_finish();
+
+	ob_delta_size_warn_check(branch_id);
 }
 
 void
@@ -519,6 +524,74 @@ overlay_delta_count(int32 branch_id)
 	SPI_finish();
 	pfree(sql.data);
 	return result;
+}
+
+/*
+ * ob_delta_size_warn_check
+ *
+ *	B1 (internals.md §5.6): amortized delta-size nudge.  Runs once per delta
+ *	write, but does real work only when overlay_branch.delta_size_warn_rows > 0
+ *	and the write counter lands on a multiple of
+ *	overlay_branch.delta_size_check_interval.  It then counts the current
+ *	branch's delta rows and emits a single WARNING per session on the first
+ *	overflow, pointing the user at branch_delta_stats().
+ *
+ *	Fail-open: any SPI/catalog error is swallowed so a bookkeeping problem can
+ *	never break user DML.  Both counters are session-local statics (never
+ *	persisted); the default threshold of 0 short-circuits before any SPI.
+ */
+static void
+ob_delta_size_warn_check(int32 branch_id)
+{
+	static uint64 s_writes = 0;
+	static bool s_warned = false;
+	int64		n;
+	const char *branch_name;
+	bool		snap_pushed = false;
+
+	if (ob_delta_size_warn_rows <= 0 || s_warned)
+		return;
+
+	s_writes++;
+	if (ob_delta_size_check_interval <= 0 ||
+		(s_writes % (uint64) ob_delta_size_check_interval) != 0)
+		return;
+
+	PG_TRY();
+	{
+		/* Read the *current* delta size.  The caller's statement snapshot has a
+		 * frozen curcid, so the row this very write just inserted would
+		 * otherwise be invisible and the count would lag by one.  Push the
+		 * latest snapshot (same idiom as overlay_delta_lookup) so the nudge
+		 * reflects the write that triggered it. */
+		PushActiveSnapshot(GetLatestSnapshot());
+		snap_pushed = true;
+		n = overlay_delta_count(branch_id);
+		PopActiveSnapshot();
+		snap_pushed = false;
+	}
+	PG_CATCH();
+	{
+		if (snap_pushed)
+			PopActiveSnapshot();
+		FlushErrorState();
+		return;
+	}
+	PG_END_TRY();
+
+	if (n <= (int64) ob_delta_size_warn_rows)
+		return;
+
+	s_warned = true;
+	branch_name = overlay_branch_get_current_name();
+	ereport(WARNING,
+			(errmsg("overlay_branch: branch \"%s\" delta has reached " INT64_FORMAT
+					" rows (threshold %d); consider apply_branch()/discard_branch() to bound growth",
+					branch_name ? branch_name : "<unknown>",
+					n, ob_delta_size_warn_rows),
+			 errhint("Inspect per-relation delta size with "
+					 "SELECT * FROM branch_delta_stats('%s').",
+					 branch_name ? branch_name : "<unknown>")));
 }
 
 void
@@ -1673,7 +1746,7 @@ overlay_should_redirect(Relation rel)
 	if (nspname != NULL && strcmp(nspname, OBSCHEMA) == 0)
 		return false;
 
-	/* Layer 3: MVP only regular heap tables */
+	/* Layer 3: only regular heap tables */
 	if (rel->rd_rel->relkind != RELKIND_RELATION)
 		return false;
 
@@ -1936,7 +2009,7 @@ overlay_debug_delta_delete_all(PG_FUNCTION_ARGS)
 /*
  * overlay_get_pk_single_attno
  *
- *   Fast return (MVP-limited: attno + column name of the single-column PRIMARY KEY.
+ *   Fast return (attno + column name of the single-column PRIMARY KEY.
  *   Composite PK (indnatts>1) returns false and the Planner takes the full path.
  *   out_pk_attno is the 1-based real attno (matching rd_index->indkey.values[i]);
  *   out_pk_colname points to NameData inside the relcache (caller must not pfree).
@@ -1958,7 +2031,7 @@ overlay_get_pk_single_attno(Relation rel,
 
 	pm = ob_pk_rel_meta(rel);
 
-	/* MVP: only single-column PK supported */
+	/* only single-column PK supported */
 	if (!pm->has_pk || pm->n_pk != 1)
 		return false;
 
@@ -2017,10 +2090,10 @@ overlay_get_pk_attnos_list(Relation rel)
 /*
  * overlay_serialize_pk_from_single_datum
  *
- *   From a single Datum (MVP single-column PK case) build, like overlay_serialize_pk,
+ *   From a single Datum (single-column PK case) build, like overlay_serialize_pk,
  *   a fully byte-compatible JSON array ::text serialization string.
  *
- *   CRITICAL TYPE COERCION NOTE (see p0_pk_oidx_deparse_strategy.md §4):
+ *   CRITICAL TYPE COERCION NOTE (see doc/internals.md §2.3):
  *   The caller passes `con->constvalue` with its OWN declared type
  *   `consttype` (as the parser saw it), which is almost never equal to
  *   `pkatt->atttypid` in real queries:
@@ -2135,7 +2208,7 @@ overlay_serialize_pk_from_single_datum(Relation rel,
 }
 
 /* ====================================================================
- * ===== Typed PK helpers — REVIEW-260926/R14 MVP
+ * ===== Typed PK helpers — REVIEW-260926/R14
  *
  * Perform semantic PostgreSQL-native equality/ordering on the real
  * primary-key column types instead of JSON-text strcmp on dt->key.

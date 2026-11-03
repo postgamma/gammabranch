@@ -33,7 +33,7 @@ BEGIN
     THEN
         RAISE EXCEPTION
             'FAIL:PREQUISITE shared_preload_libraries must include overlay_branch. '
-            'Hint: use the Makefile recipe (make check with --temp-config), '
+            'Hint: use the pg_regress recipe with --temp-config, '
             'NOT bare pg_regress without --temp-config=.../temp_instance_shared_libs.conf.';
     END IF;
 END $$;
@@ -222,7 +222,7 @@ BEGIN
     THEN
         RAISE EXCEPTION
             'FAIL:PREQUISITE shared_preload_libraries must include overlay_branch. '
-            'Hint: use the Makefile recipe (make check with --temp-config), '
+            'Hint: use the pg_regress recipe with --temp-config, '
             'NOT bare pg_regress without --temp-config=.../temp_instance_shared_libs.conf.';
     END IF;
 END $$;
@@ -430,7 +430,7 @@ BEGIN
     THEN
         RAISE EXCEPTION
             'FAIL:PREQUISITE shared_preload_libraries must include overlay_branch. '
-            'Hint: use the Makefile recipe (make check with --temp-config), '
+            'Hint: use the pg_regress recipe with --temp-config, '
             'NOT bare pg_regress without --temp-config=.../temp_instance_shared_libs.conf.';
     END IF;
 END $$;
@@ -732,15 +732,16 @@ SELECT 'PASS:AP1_APPLY_PATH_SECTION_OK' AS ap1_section_ok;
  * 3B folds one relation's deltas into a single validation SELECT plus a
  * single batch DML per operation (D/U/I), removing the per-row planning
  * cost (doc/internals.md §5.5).  GUC overlay_branch.apply_batch (default
- * on) selects the path; relations without a PRIMARY KEY, or whose delta
- * rows carry a "_base" image, fall back to the 3A per-row replay.
+ * on) selects the path; keyless tables join on their ctid anchor, and
+ * relations whose delta rows carry a "_base" image fall back to the 3A
+ * per-row replay.
  *
  * Asserted here:
  *   AP2-1    : D+U+I replay on one relation via the batch path -> state
  *   AP2-2..7 : the six conflict branches of 6.4.6, each raising 0A000 and
  *              leaving MAIN untouched
  *   AP2-8    : orphan-U (pure-delta UPDATE, no MAIN anchor) -> INSERT pass
- *   AP2-9    : keyless fallback still applies with apply_batch=on
+ *   AP2-9    : keyless relation batches through the ctid-anchor join
  *   AP2-10   : differential equivalence - apply_batch off vs on on two
  *              clone tables yields byte-identical results
  * ===================================================================== */
@@ -918,7 +919,7 @@ SELECT CASE WHEN v = 'br9-x' THEN 'PASS:AP2_8_ORPHAN_U_INSERTED'
             ELSE 'FAIL:AP2_8 v=' || COALESCE(v,'NULL') END AS ap2_8
 FROM public.ap2_t WHERE id = 9;
 
--- -------- AP2-9: keyless relation falls back to the per-row replay --------
+-- -------- AP2-9: keyless relation batches via the ctid-anchor join --------
 DROP TABLE public.ap2_t;
 SET overlay_branch.keyless_tables = on;
 CREATE TABLE public.ap2_kn (v text);

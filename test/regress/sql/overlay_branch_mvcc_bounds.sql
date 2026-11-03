@@ -1,5 +1,5 @@
 /*
- * overlay_branch_mvcc_bounds.sql — V3 MVCC advanced boundary/concurrency semantics/FR6/FR7 regression.
+ * overlay_branch_mvcc_bounds.sql — MVCC advanced boundary/concurrency semantics/FR6/FR7 regression.
  *
  * COVERAGE (formerly overlay_branch_mvcc.sql SECTION L/M/N/O/P/Q, single-session self-contained):
  *   SECTION L — FR2 Branch Advisory Lock key equivalence: C-side use_branch(SHARED) ↔ SQL-side
@@ -27,7 +27,7 @@ BEGIN
     THEN
         RAISE EXCEPTION
             'FAIL:PREQUISITE shared_preload_libraries must include overlay_branch. '
-            'Hint: use the Makefile recipe (make check with --temp-config), '
+            'Hint: use the pg_regress recipe with --temp-config, '
             'NOT bare pg_regress without --temp-config=.../temp_instance_shared_libs.conf.';
     END IF;
 END $$;
@@ -99,7 +99,7 @@ SELECT state = 'discarded' AS l4_state_after_discard
 SELECT 'PASS:L0_FR2_ENTRY' AS section_l_marker;
 
 /* ================================================================
- * SECTION M: V3 FR3 Layer-3 applying transient state + delta-write Guard
+ * SECTION M: FR3 Layer-3 applying transient state + delta-write Guard
  * (L3 single-session sanity only — cross-session apply-vs-write races live
  * in T8 pg_isolation_regress specs ob_fr3_applying_delta_blocked.spec).
  *
@@ -270,7 +270,7 @@ SET client_min_messages = WARNING;
 SELECT 'PASS:M0_FR3_SANITY_OK' AS section_m_status;
 
 /* =================================================================
- * ---------- SECTION N: V3 FR5 SNAPSHOT Mode MAIN Freeze (T5) ----------
+ * ---------- SECTION N: FR5 SNAPSHOT Mode MAIN Freeze (T5) ----------
  * (L3 single-session sanity ONLY — real cross-session freeze tests in
  *  T8 pg_isolation_regress specs ob_fr5_snapshot_freeze.spec).
  *
@@ -510,7 +510,7 @@ SELECT 'PASS:O0_COVERAGE_GAPS_9_BRANCHES_FILLED' AS section_o_status;
 /* ================================================================
  * SECTION P: FR6 BranchScan ReScan Fresh Materialization (T6)
  * ================================================================
- * Background: V2 `ob_branchscan_rescan` was a cursor-reset stub that
+ * Background: `ob_branchscan_rescan` was a cursor-reset stub that
  * kept the materialised slot list untouched.  Any ReScan (e.g. a
  * NestedLoop join driver iterating multiple outer tuples over our
  * CustomScan inner child, a future SCROLL cursor calling
@@ -582,7 +582,7 @@ SET client_min_messages = WARNING;
  *     verified at L1 pg_isolation_regress in T8 using explicit S1/S2
  *     plan gating that avoids the deparse-outer-Var crash.
  *
- * L3 FR6 coverage strategy for Section P (correctness-equivalent MVP)
+ * L3 FR6 coverage strategy for Section P (correctness-equivalent)
  * -------------------------------------------------------------------
  * Because every standalone SELECT in pg_regress builds a FRESH plan
  * tree with a NEW CustomScanState node whose ExecCustomScan enters the
@@ -790,7 +790,7 @@ SELECT 'PASS:Q2_FR7_CANCELLED_CORRECTNESS_OK' AS q2_fr7_cancelled_status;
 
 
 /* ================================================================
- * ======  Section: A4 performance MVP  ======
+ * ======  Section: A4 performance  ======
  * 5 PASS markers:
  *   A4_1  empty apply    < 500 ms
  *   A4_2  empty discard < 500 ms

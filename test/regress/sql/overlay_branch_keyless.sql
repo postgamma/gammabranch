@@ -26,9 +26,19 @@
  *            and leaves the independently-committed MAIN write intact.
  *   Part E — GUC ON does NOT disturb the PK code path (regression): a
  *            normal PK table still uses PK identity.
- *   Part F — OUT-OF-SCOPE (cluster-stability risk, deliberately not
- *            implemented): INSERT ... ON CONFLICT (UPSERT) on a keyless
- *            table is rejected with 0A000.
+ *   Part F — keyless UPSERT (INSERT ... ON CONFLICT): the two-phase
+ *            detector is rebound to the statement's UNIQUE arbiter
+ *            columns (single- or multi-column); DO NOTHING skips, DO
+ *            UPDATE rewrites a MAIN or a branch-born row in place (no
+ *            synthetic duplicate), and an arbiter that is not one
+ *            plain-column UNIQUE index is still rejected with 0A000.
+ *   Part G — read-side version-chain resolution (B2): after a concurrent
+ *            MAIN rewrite moves an anchored row's ctid, an overlay SELECT
+ *            still shows the branch edit over the moved row (no silent
+ *            drop), while apply keeps refusing the stale anchor (0A000).
+ *   Part H — set-based apply coverage (B3): the keyless delta replays
+ *            through the ctid-anchor batch join; the batch and per-row
+ *            replays are byte-identical (differential off vs on).
  *
  * Style rules (identical to the sibling regression files so pg_regress
  * expected .out files stay diff-stable across machines/runs):
@@ -46,7 +56,7 @@ DECLARE
 BEGIN
   IF _s NOT LIKE '%overlay_branch%' THEN
     _msg := 'Postmaster started WITHOUT shared_preload_libraries=''overlay_branch''.  '
-         || 'Use `make check` (temp-instance, hooks auto-loaded) or pass '
+         || 'Use `make installcheck` or pass '
          || '--temp-config=$(pwd)/temp_instance_shared_libs.conf to pg_regress.';
     RAISE EXCEPTION '%', _msg;
   END IF;
@@ -55,7 +65,8 @@ END $$;
 -- ===== Idempotent cleanup =====
 SET client_min_messages = warning;
 DROP TABLE IF EXISTS public.kn_off, public.kn_on, public.kn_race,
-                     public.kn_pk,  public.kn_ups CASCADE;
+                     public.kn_pk,  public.kn_ups, public.kn_ups2,
+                     public.kn_move CASCADE;
 DROP EXTENSION IF EXISTS overlay_branch CASCADE;
 RESET client_min_messages;
 CREATE EXTENSION IF NOT EXISTS overlay_branch;
@@ -233,33 +244,212 @@ FROM public.kn_pk;
 SELECT discard_branch('kn_pk_br');
 
 /* =====================================================================
- * Part F — OUT-OF-SCOPE: keyless UPSERT is rejected (0A000).
- *   The 2-phase ON CONFLICT detector is PK-only; silently mis-promoting
- *   would risk cluster-level corruption, so the feature is refused
- *   rather than approximated (design §6 / §8).  A UNIQUE arbiter (but no
- *   PRIMARY KEY) is what makes the ON CONFLICT clause reach a real
- *   arbiter index, and therefore what triggers the explicit rejection.
+ * Part F — keyless UPSERT (INSERT ... ON CONFLICT) is supported (B4).
+ *   A no-PK table arbitrates on the UNIQUE constraint the statement
+ *   names, not on the ctid identity that keys the delta.  The redirect
+ *   rebinds the PK path's two-phase detector to the arbiter columns: a
+ *   delta hit reuses the existing delta key/version, a MAIN hit
+ *   re-anchors to that row's ctid, and an arbiter that is not exactly
+ *   one plain-column UNIQUE index stays refused (0A000).
  * ===================================================================== */
 CREATE TABLE public.kn_ups (id int UNIQUE, v text);
-INSERT INTO public.kn_ups VALUES (1, 'a');
+INSERT INTO public.kn_ups VALUES (1, 'a'), (2, 'b');
 SELECT create_branch('kn_ups_br') AS id_kn_ups_br;
 SELECT use_branch('kn_ups_br');
+
+-- F.1 DO NOTHING over a MAIN conflict is a no-op: the overlay still shows
+--     the MAIN image and no delta row is minted.
+INSERT INTO public.kn_ups VALUES (1, 'IGNORED') ON CONFLICT (id) DO NOTHING;
+SELECT CASE WHEN string_agg(id::text||'='||v, ',' ORDER BY id) = '1=a,2=b'
+            THEN 'PASS:F1_UPSERT_DO_NOTHING_SKIP'
+            ELSE 'FAIL:F1_UPSERT_DO_NOTHING:'||string_agg(id::text||'='||v, ',' ORDER BY id) END AS f1
+FROM public.kn_ups;
+
+-- F.2 DO UPDATE over a MAIN conflict rewrites the row inside the branch
+--     (anchored to the MAIN row's ctid, not a synthetic key).
+INSERT INTO public.kn_ups VALUES (2, 'b2') ON CONFLICT (id) DO UPDATE SET v = EXCLUDED.v;
+SELECT CASE WHEN string_agg(id::text||'='||v, ',' ORDER BY id) = '1=a,2=b2'
+            THEN 'PASS:F2_UPSERT_DO_UPDATE_OVERLAY'
+            ELSE 'FAIL:F2_UPSERT_DO_UPDATE:'||string_agg(id::text||'='||v, ',' ORDER BY id) END AS f2
+FROM public.kn_ups;
+
+-- F.3 A second DO UPDATE on the same conflicting row reuses the delta key
+--     (no synthetic duplicate): still exactly two rows.
+INSERT INTO public.kn_ups VALUES (2, 'b3') ON CONFLICT (id) DO UPDATE SET v = EXCLUDED.v;
+SELECT CASE WHEN count(*) = 2 AND string_agg(id::text||'='||v, ',' ORDER BY id) = '1=a,2=b3'
+            THEN 'PASS:F3_UPSERT_REPEAT_SAME_KEY'
+            ELSE 'FAIL:F3_UPSERT_REPEAT:'||count(*)||':'||string_agg(id::text||'='||v, ',' ORDER BY id) END AS f3
+FROM public.kn_ups;
+
+-- F.4 No conflict → plain branch INSERT (synthetic key).
+INSERT INTO public.kn_ups VALUES (3, 'c') ON CONFLICT (id) DO UPDATE SET v = EXCLUDED.v;
+-- F.5 UPSERT over a branch-born row (delta-only) updates it in place.
+INSERT INTO public.kn_ups VALUES (3, 'c2') ON CONFLICT (id) DO UPDATE SET v = EXCLUDED.v;
+SELECT CASE WHEN count(*) = 3 AND string_agg(id::text||'='||v, ',' ORDER BY id) = '1=a,2=b3,3=c2'
+            THEN 'PASS:F5_UPSERT_BRANCH_BORN'
+            ELSE 'FAIL:F5_UPSERT_BRANCH_BORN:'||count(*)||':'||string_agg(id::text||'='||v, ',' ORDER BY id) END AS f5
+FROM public.kn_ups;
+
+-- F.6 MAIN stays pristine.
+SELECT use_branch(NULL);
+RESET overlay_branch.current;
+SET overlay_branch.current = '';
+SELECT CASE WHEN string_agg(id::text||'='||v, ',' ORDER BY id) = '1=a,2=b'
+            THEN 'PASS:F6_UPSERT_MAIN_PRISTINE'
+            ELSE 'FAIL:F6_UPSERT_MAIN:'||string_agg(id::text||'='||v, ',' ORDER BY id) END AS f6
+FROM public.kn_ups;
+
+-- F.7 apply materializes the branch image onto MAIN.
+SELECT apply_branch('kn_ups_br');
+SELECT CASE WHEN string_agg(id::text||'='||v, ',' ORDER BY id) = '1=a,2=b3,3=c2'
+            THEN 'PASS:F7_UPSERT_APPLIED'
+            ELSE 'FAIL:F7_UPSERT_APPLIED:'||string_agg(id::text||'='||v, ',' ORDER BY id) END AS f7
+FROM public.kn_ups;
+
+-- F.8 An arbiter that does not resolve to one plain-column UNIQUE index
+--     (here an expression index) stays refused with 0A000.
+CREATE TABLE public.kn_expr (lc text);
+CREATE UNIQUE INDEX kn_expr_lc ON public.kn_expr (lower(lc));
+INSERT INTO public.kn_expr VALUES ('a');
+SELECT create_branch('kn_expr_br') AS id_kn_expr_br;
+SELECT use_branch('kn_expr_br');
 DO $$
 BEGIN
-  INSERT INTO public.kn_ups VALUES (1, 'b') ON CONFLICT (id) DO NOTHING;
-  RAISE NOTICE 'FAIL:F1_KEYLESS_UPSERT_WAS_ALLOWED';
+  INSERT INTO public.kn_expr VALUES ('A') ON CONFLICT (lower(lc)) DO NOTHING;
+  RAISE NOTICE 'FAIL:F8_KEYLESS_EXPR_UPSERT_WAS_ALLOWED';
 EXCEPTION
-  WHEN SQLSTATE '0A000' THEN RAISE NOTICE 'PASS:F1_KEYLESS_UPSERT_0A000';
-  WHEN OTHERS           THEN RAISE NOTICE 'FAIL:F1_KEYLESS_UPSERT_OTHER_SQLSTATE=%', SQLSTATE;
+  WHEN SQLSTATE '0A000' THEN RAISE NOTICE 'PASS:F8_KEYLESS_EXPR_UPSERT_0A000';
+  WHEN OTHERS           THEN RAISE NOTICE 'FAIL:F8_KEYLESS_EXPR_UPSERT_OTHER=%', SQLSTATE;
 END $$;
 SELECT use_branch(NULL);
 RESET overlay_branch.current;
 SET overlay_branch.current = '';
-SELECT discard_branch('kn_ups_br');
+SELECT discard_branch('kn_expr_br');
+
+-- F.9 A multi-column UNIQUE arbiter is accepted (it is still exactly one
+--     plain-column UNIQUE index): the detector probes every arbiter column,
+--     a MAIN hit overwrites one row and a no-hit lands a synthetic insert.
+CREATE TABLE public.kn_ups2 (a int, b int, v text, UNIQUE (a, b));
+INSERT INTO public.kn_ups2 VALUES (1, 1, 'x');
+SELECT create_branch('kn_ups2_br') AS id_kn_ups2_br;
+SELECT use_branch('kn_ups2_br');
+INSERT INTO public.kn_ups2 VALUES (1, 1, 'x2') ON CONFLICT (a, b) DO UPDATE SET v = EXCLUDED.v;
+INSERT INTO public.kn_ups2 VALUES (2, 2, 'y') ON CONFLICT (a, b) DO UPDATE SET v = EXCLUDED.v;
+SELECT CASE WHEN string_agg(a::text||','||b::text||'='||v, ';' ORDER BY a, b) = '1,1=x2;2,2=y'
+            THEN 'PASS:F9_KEYLESS_MULTICOL_UPSERT'
+            ELSE 'FAIL:F9_KEYLESS_MULTICOL_UPSERT:'||string_agg(a::text||','||b::text||'='||v, ';' ORDER BY a, b) END AS f9
+FROM public.kn_ups2;
+SELECT use_branch(NULL);
+RESET overlay_branch.current;
+SET overlay_branch.current = '';
+SELECT apply_branch('kn_ups2_br');
+SELECT CASE WHEN string_agg(a::text||','||b::text||'='||v, ';' ORDER BY a, b) = '1,1=x2;2,2=y'
+            THEN 'PASS:F9_KEYLESS_MULTICOL_APPLIED'
+            ELSE 'FAIL:F9_KEYLESS_MULTICOL_APPLIED:'||string_agg(a::text||','||b::text||'='||v, ';' ORDER BY a, b) END AS f9b
+FROM public.kn_ups2;
+
+/* =====================================================================
+ * Part G — read-side version-chain resolution (B2): a concurrent MAIN
+ * rewrite moves an anchored row's ctid; an overlay SELECT re-anchors it
+ * along the t_ctid chain and still shows the branch edit, while apply
+ * keeps refusing the now-stale anchor.
+ * ===================================================================== */
+SET overlay_branch.keyless_tables = on;
+CREATE TABLE public.kn_move (v text);
+INSERT INTO public.kn_move VALUES ('m1'), ('m2');
+SELECT create_branch('kn_move_br') AS id_kn_move_br;
+SELECT use_branch('kn_move_br');
+
+-- G.1 Branch UPDATE anchors id-row 'm1' to its current MAIN ctid.
+UPDATE public.kn_move SET v = 'm1-branch' WHERE v = 'm1';
+
+-- G.2 Step back to MAIN and rewrite the same row: this writes a NEW tuple
+--     version at a different ctid, leaving a dangling t_ctid link at the
+--     old line pointer (the branch anchor).
+SELECT use_branch(NULL);
+RESET overlay_branch.current;
+SET overlay_branch.current = '';
+UPDATE public.kn_move SET v = 'M1-MAIN' WHERE v = 'm1';
+
+-- G.3 Re-enter and READ: the stale anchor is chased down the version chain
+--     to the row's current ctid, so the branch edit shows over the moved row.
+SELECT use_branch('kn_move_br');
+SELECT CASE WHEN string_agg(v, ',' ORDER BY v) = 'm1-branch,m2'
+            THEN 'PASS:G3_REANCHORED_READ'
+            ELSE 'FAIL:G3_READ:'||string_agg(v, ',' ORDER BY v) END AS g3
+FROM public.kn_move;
+
+-- G.4 Read-only guarantee: apply still cannot locate the stale anchor and
+--     raises a conflict, so the independently-committed MAIN write survives.
+DO $$
+BEGIN
+  PERFORM overlay_branch.apply_branch('kn_move_br');
+  RAISE NOTICE 'FAIL:G4_APPLY_WAS_EXPECTED_TO_CONFLICT';
+EXCEPTION WHEN OTHERS THEN RAISE NOTICE 'PASS:G4_APPLY_CONFLICT_RAISED';
+END $$;
+SELECT use_branch(NULL);
+RESET overlay_branch.current;
+SET overlay_branch.current = '';
+
+-- G.5 MAIN keeps the moved, independently-committed image.
+SELECT CASE WHEN string_agg(v, ',' ORDER BY v) = 'M1-MAIN,m2'
+            THEN 'PASS:G5_MAIN_MOVED_IMAGE'
+            ELSE 'FAIL:G5_MAIN:'||string_agg(v, ',' ORDER BY v) END AS g5
+FROM public.kn_move;
+
+-- G.6 Discard the conflicted branch.
+SELECT discard_branch('kn_move_br');
+
+/* =====================================================================
+ * Part H — set-based apply coverage (B3): a keyless delta replays through
+ * the ctid-anchor batch join (apply_batch=on).  Two identically-populated
+ * tables run the same D+U+I edits, one replayed per-row and one batched;
+ * the resulting images must be byte-identical.
+ * ===================================================================== */
+SET overlay_branch.keyless_tables = on;
+CREATE TABLE public.kn_da (v text);
+CREATE TABLE public.kn_db (v text);
+INSERT INTO public.kn_da VALUES ('k1'), ('k2'), ('k3');
+INSERT INTO public.kn_db VALUES ('k1'), ('k2'), ('k3');
+
+-- H.1 clone A replayed with apply_batch = off (legacy per-row).
+SET overlay_branch.apply_batch = off;
+SELECT create_branch('kn_da_br') AS id_kn_da_br;
+SELECT use_branch('kn_da_br');
+DELETE FROM public.kn_da WHERE v = 'k2';
+UPDATE public.kn_da SET v = 'k1-br' WHERE v = 'k1';
+INSERT INTO public.kn_da VALUES ('kn-ins');
+SELECT use_branch(NULL);
+RESET overlay_branch.current;
+SET overlay_branch.current = '';
+SELECT apply_branch('kn_da_br');
+
+-- H.2 clone B replayed with apply_batch = on (set-based ctid-anchor join).
+SET overlay_branch.apply_batch = on;
+SELECT create_branch('kn_db_br') AS id_kn_db_br;
+SELECT use_branch('kn_db_br');
+DELETE FROM public.kn_db WHERE v = 'k2';
+UPDATE public.kn_db SET v = 'k1-br' WHERE v = 'k1';
+INSERT INTO public.kn_db VALUES ('kn-ins');
+SELECT use_branch(NULL);
+RESET overlay_branch.current;
+SET overlay_branch.current = '';
+SELECT apply_branch('kn_db_br');
+
+-- H.3 Both replays agree, and match the expected post-image.
+SELECT CASE WHEN a.s = b.s AND a.s = 'k1-br,k3,kn-ins'
+            THEN 'PASS:H_KEYLESS_BATCH_EQUIV'
+            ELSE 'FAIL:H off=' || COALESCE(a.s,'NULL') || ' on=' || COALESCE(b.s,'NULL')
+       END AS h
+FROM  (SELECT string_agg(v, ',' ORDER BY v) AS s FROM public.kn_da) a,
+      (SELECT string_agg(v, ',' ORDER BY v) AS s FROM public.kn_db) b;
+RESET overlay_branch.apply_batch;
 
 -- ===== Teardown =====
 RESET overlay_branch.keyless_tables;
 SET client_min_messages = warning;
 DROP TABLE IF EXISTS public.kn_off, public.kn_on, public.kn_race,
-                     public.kn_pk,  public.kn_ups CASCADE;
+                     public.kn_pk,  public.kn_ups, public.kn_ups2,
+                     public.kn_expr, public.kn_move, public.kn_da,
+                     public.kn_db CASCADE;
 RESET client_min_messages;

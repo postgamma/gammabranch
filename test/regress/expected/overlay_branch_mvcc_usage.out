@@ -1,5 +1,5 @@
 /*
- * overlay_branch_mvcc_usage.sql — V3 MVCC basic usage + parameter semantics + threshold/GUC/boundary regression.
+ * overlay_branch_mvcc_usage.sql — MVCC basic usage + parameter semantics + threshold/GUC/boundary regression.
  *
  * COVERAGE (originally overlay_branch_mvcc.sql PART A-F + SECTION B-K, single session self-contained):
  *   PART A-F     — 2-param use_branch mode/signature/snapshot semantics/exit/default roundtrip
@@ -25,7 +25,7 @@ BEGIN
     THEN
         RAISE EXCEPTION
             'FAIL:PREQUISITE shared_preload_libraries must include overlay_branch. '
-            'Hint: use the Makefile recipe (make check with --temp-config), '
+            'Hint: use the pg_regress recipe with --temp-config, '
             'NOT bare pg_regress without --temp-config=.../temp_instance_shared_libs.conf.';
     END IF;
 END $$;
@@ -92,7 +92,7 @@ FROM pg_extension WHERE extname = 'overlay_branch';
  PASS:A5 extversion=0.1
 (1 row)
 
--- ========== PART B V2 zero regression ==========
+-- ========== PART B zero regression ==========
 SELECT create_branch('b_live1');
  create_branch 
 ---------------
@@ -611,7 +611,7 @@ SELECT count(*) = 3 AS pre_main_rowcount FROM t_inv;
 (1 row)
 
 -- C2. Flip state manually (simulates "another session discarded us")
---     NOTE: In V3 we moved the GUC side-effects from check_hook to
+--     NOTE: We moved the GUC side-effects from check_hook to
 --     assign_hook (T5 pitfall #3).  The old "PERFORM set_config('',true)"
 --     here was a workaround for check-hook side-effects during the SPI
 --     UPDATE below; with pure-validation check_hook + assign_hook that
@@ -1099,7 +1099,7 @@ SELECT state = 'discarded' AS h3_state_discarded
 
 /* ============================================================
  * SECTION I: Non-current branch DISCARD broadcasts NOTIFY too
- *   V1 bug fixed in T2: discard_branch used to only send NOTIFY when
+ *   Bug fixed in T2: discard_branch used to only send NOTIFY when
  *   `leaving_current == true`.  FR1 requires: even when we discard a
  *   branch that THIS session is NOT currently use()ing, other sessions
  *   on that branch MUST receive the DISCARDED NOTIFY (so they kick out).
@@ -1192,7 +1192,7 @@ SELECT current_branch() = '' AS i5_after_discard_current_empty;
 (1 row)
 
 /* ============================================================
- * SECTION J: V3 GUC SET/SHOW + Throttle Parameter Change Efficacy
+ * SECTION J: GUC SET/SHOW + Throttle Parameter Change Efficacy
  *   4 GUC registered in _PG_init.  Verify:
  *     J1. SHOW 4 GUCs = their documented defaults
  *         (threshold=32, interval_ms=100, apply_strict_pins=on,

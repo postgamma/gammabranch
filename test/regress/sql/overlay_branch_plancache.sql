@@ -40,10 +40,9 @@ DECLARE
 BEGIN
   IF _s NOT LIKE '%overlay_branch%' THEN
     _msg := 'Postmaster started WITHOUT shared_preload_libraries=''overlay_branch''.  '
-         || 'The 3 correct ways to invoke these tests (DON''T `cd test/` first):'
-         || chr(10)||chr(10)||'  (A) make check                    <- temp-instance, hooks auto-loaded'
-         || chr(10)||'  (B) make installcheck EXTRA_REGRESS_OPTS="--use-existing --host=/tmp --port=15433"'
-         || chr(10)||'  (C) pg_regress overlay_branch_plancache \'
+         || 'The 2 correct ways to invoke these tests (DON''T `cd test/` first):'
+         || chr(10)||chr(10)||'  (A) make installcheck EXTRA_REGRESS_OPTS="--use-existing --host=/tmp --port=15433"'
+         || chr(10)||'  (B) pg_regress overlay_branch_plancache \'
          || chr(10)||'         --inputdir=./test --outputdir=./test_output \'
          || chr(10)||'         --temp-config=$(pwd)/test/temp_instance_shared_libs.conf \'
          || chr(10)||'         --bindir=$(pg_config --bindir)'

@@ -2,7 +2,7 @@
  * overlay_branch_scan_pk.sql — BranchScan P0/P1/P2 primary-key core-path regression.
  *
  * COVERAGE (originally overlay_branch_advanced.sql Section A/B/C/E, single session self-contained):
- *   Section A — BS_PK_LOOKUP P0 PK-IndexScan MVP on bs_user:
+ *   Section A — BS_PK_LOOKUP P0 PK-IndexScan on bs_user:
  *               INT4 PK + 9 kinds of WHERE pk=?/IN/BETWEEN/ANY/IS NULL/<>2; fast-path assertion
  *   Section B — PK Physics bs_basic: NUMERIC PK + tag column, BranchScan + apply 100% overlap
  *               (overlay vs apply vs MAIN three-way EXCEPT equal); fast-path assertion PK=O(1)
@@ -33,10 +33,9 @@ DECLARE
 BEGIN
   IF _s NOT LIKE '%overlay_branch%' THEN
     _msg := 'Postmaster started WITHOUT shared_preload_libraries=''overlay_branch''.  '
-         || 'The 3 correct ways to invoke these tests (DON''T `cd test/` first):'
-         || chr(10)||chr(10)||'  (A) make check                    <- temp-instance, hooks auto-loaded'
-         || chr(10)||'  (B) make installcheck EXTRA_REGRESS_OPTS="--use-existing --host=/tmp --port=15433"'
-         || chr(10)||'  (C) pg_regress overlay_branch_advanced \'
+         || 'The 2 correct ways to invoke these tests (DON''T `cd test/` first):'
+         || chr(10)||chr(10)||'  (A) make installcheck EXTRA_REGRESS_OPTS="--use-existing --host=/tmp --port=15433"'
+         || chr(10)||'  (B) pg_regress overlay_branch_advanced \'
          || chr(10)||'         --inputdir=./test --outputdir=./test_output \'
          || chr(10)||'         --temp-config=$(pwd)/test/temp_instance_shared_libs.conf \'
          || chr(10)||'         --bindir=$(pg_config --bindir)'
@@ -51,7 +50,7 @@ DROP TABLE IF EXISTS public.bs_basic;
 DROP EXTENSION IF EXISTS overlay_branch CASCADE;
 RESET client_min_messages;
 -- =====================================================================
--- ===== Section A: BS_PK_LOOKUP  — P0 PK-IndexScan MVP on bs_user =====
+-- ===== Section A: BS_PK_LOOKUP  — P0 PK-IndexScan on bs_user =====
 -- =====================================================================
 CREATE EXTENSION overlay_branch;
 CREATE TABLE public.bs_user (id INT4 PRIMARY KEY, name TEXT, color TEXT);
@@ -603,7 +602,7 @@ FROM public.bs_ret WHERE id IN (30, 31);
 (1 row)
 
 -- C.3 UPDATE ... RETURNING id, name, amt
---     (MAIN-only ids: 2,5 exist in MAIN.  pure-delta UPDATE/DELETE is MVP NOP
+--     (MAIN-only ids: 2,5 exist in MAIN.  pure-delta UPDATE/DELETE is a NOP
 --      until the new ExecQual pass crash is root-caused + fixed.)
 UPDATE public.bs_ret SET
   amt = CASE id WHEN 2 THEN 200.00 WHEN 5 THEN 500.00 ELSE amt END,
@@ -641,7 +640,7 @@ FROM public.bs_ret WHERE id = 2;
 (1 row)
 
 -- C.4 DELETE ... RETURNING id, name, amt  (MAIN-only id=1; id=10/11/20/30/31
---     are pure delta rows, MVP NOP for DELETE until crash fixed)
+--     are pure delta rows, a NOP for DELETE until crash fixed)
 DELETE FROM public.bs_ret WHERE id IN (1, 99999)
 RETURNING id, name, amt;
  id | name | amt  

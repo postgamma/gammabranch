@@ -8,7 +8,7 @@
 --     contention, so we can collect a full 60s TPS report.
 --   * enter-branch-first order: use_branch() executed BEFORE any DML,
 --     so WR hook can route writes to delta; MAIN baseline (aid 1..10000)
---     remains unpolluted by WR writes (V3 main_leak_rows invariant).
+--     remains unpolluted by WR writes (main_leak_rows invariant).
 --   * roles per client (:client_id % 10):
 --       0..5 → WR writer   (60%)
 --       6..7 → branch switcher live/snapshot parity (20%, absorbed)

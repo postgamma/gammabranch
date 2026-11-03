@@ -24,7 +24,7 @@ comparison, A/B change rehearsal.
 -- 0) Prerequisite: the extension is created and postgresql.conf sets shared_preload_libraries='overlay_branch'
 CREATE EXTENSION IF NOT EXISTS overlay_branch;
 
--- 1) Create an ordinary table with a primary key (DML tables need a PK by default; PK-less tables require an experimental GUC, see "Current status")
+-- 1) Create an ordinary table with a primary key (DML tables need a PK by default; PK-less tables require an experimental GUC, see "Limitations")
 CREATE TABLE products (id INT PRIMARY KEY, name TEXT NOT NULL, price INT NOT NULL);
 INSERT INTO products VALUES (1,'Apple',10), (2,'Banana',5), (3,'Cherry',20);
 
@@ -57,7 +57,7 @@ SELECT apply_branch('my_draft');
 ```
 
 For full scenarios (Snapshot vs Live, cross-session kickout, pure delta,
-RETURNING, UPSERT, DDL restrictions, ...) see [doc/example\_sql.md](doc/example_sql.md).
+RETURNING, UPSERT, DDL restrictions, ...) see [doc/user\_guide.md](doc/user_guide.md).
 
 ## Design overview
 
@@ -65,37 +65,19 @@ No kernel changes: a CustomScan + planner hook plus two catalog tables
 (`pg_branch` / `pg_branch_delta`) provide an MVCC-layer incremental overlay.
 
 ```text
-┌──────────────────────────────────────────────────────────────┐
-│ User session:  SELECT · INSERT · UPDATE · DELETE             │
-└──────────────────────────────────────────────────────────────┘
-                                │
-┌──────────────────────────────────────────────────────────────┐
-│ _PG_init() hooks  (extension must be preloaded)              │
-│   ExecutorRun        →  redirect DML into the branch delta   │
-│   set_rel_pathlist   →  inject BranchScan (CustomScan)       │
-│   ProcessUtility     →  gate DDL / COPY FROM / MERGE         │
-└──────────────────────────────────────────────────────────────┘
-                                │
-                 ┌──────────────┴─────────────┐
-                 ▼                            ▼
-    ┌─────────────────────────┐  ┌─────────────────────────┐
-    │ BranchScan (CustomScan) │  │ Write Redirect          │
-    │ MAIN ⊕ Delta overlay    │  │ UPSERT · RETURNING      │
-    └─────────────────────────┘  └─────────────────────────┘
-                 │                            │
-                 └──────────────┬─────────────┘
-                                │
-┌──────────────────────────────────────────────────────────────┐
-│ Delta Store:  serialize rows · old_version token · plan cache│
-└──────────────────────────────────────────────────────────────┘
-                                │
-                 ┌──────────────┴─────────────┐
-                 ▼                            ▼
-    ┌─────────────────────────┐  ┌─────────────────────────┐
-    │ MAIN heap tables        │  │ pg_branch               │
-    │ never written           │  │ pg_branch_delta         │
-    │ while in a branch       │  │ (catalog tables)        │
-    └─────────────────────────┘  └─────────────────────────┘
+Client SQL
+    │
+    ▼
+_PG_init() hooks
+  - set_rel_pathlist  -> BranchScan
+  - ExecutorRun       -> Write Redirect
+  - ProcessUtility    -> DDL / COPY / MERGE gate
+    │
+    ├─ read path  -> BranchScan -> MAIN ⊕ Delta
+    └─ write path -> redirect   -> Delta Store
+                                  │
+                                  ├─ MAIN heap tables
+                                  └─ pg_branch / pg_branch_delta
 ```
 
 For the internal design — the read/write overlay architecture, the BranchScan
@@ -107,7 +89,7 @@ performance notes and the key invariants — see
 
 | Document                                  | Description                                                                                           |
 | ----------------------------------------- | ----------------------------------------------------------------------------------------------------- |
-| [doc/example\_sql.md](doc/example_sql.md) | **User-facing**: the full SQL interface with expected output                                          |
+| [doc/user\_guide.md](doc/user_guide.md)  | **User-facing**: the full SQL interface with expected output                                          |
 | [doc/internals.md](doc/internals.md)      | Internal implementation: architecture, BranchScan, concurrency, keyless ctid, performance, invariants |
 
 ## Repository layout
@@ -117,8 +99,8 @@ gammabranch/
 ├── include/          # C headers
 ├── src/              # C sources (6 files)
 ├── test/
-│   ├── regress/      # L3 pg_regress (20 suites)
-│   ├── isolation/    # L1 pg_isolation_regress (12 specs)
+│   ├── regress/      # L3 pg_regress (21 suites)
+│   ├── isolation/    # L1 pg_isolation_regress (15 specs)
 │   └── bench/        # L2 pgbench stress harness
 ├── doc/              # Design and example documents
 ├── overlay_branch--0.1.sql
@@ -133,9 +115,7 @@ gammabranch/
 > so far). Other major versions are not yet validated — support will be added here
 > as each one is tested.
 
-Two layouts are supported:
-
-**A. Standalone repository (PGXS, recommended)**
+This is a standalone PGXS extension:
 
 ```bash
 git clone git@github.com:postgamma/gammabranch.git
@@ -143,16 +123,6 @@ cd gammabranch
 # requires the pg_config shipped by postgresql-server-dev-17 to be on PATH
 make USE_PGXS=1
 sudo make USE_PGXS=1 install
-```
-
-**B. Inside a PostgreSQL source tree (contrib layout)**
-
-```bash
-# place this directory at <pg_src>/contrib/overlay_branch
-cd <pg_src>
-./configure --prefix=<install_dir> --enable-cassert --enable-debug
-cd contrib/overlay_branch
-make -j4 && make install
 ```
 
 > ⚠️ Before use you must set `shared_preload_libraries = 'overlay_branch'` in
@@ -167,22 +137,19 @@ CREATE EXTENSION overlay_branch;
 ## Running the tests
 
 ```bash
-# Standalone repository (PGXS): `make check` is unsupported; run installcheck against a running instance instead
+# `make check` is unsupported by PGXS; run installcheck against a running instance instead
 make USE_PGXS=1 install                 # install the extension
 # make sure the instance sets shared_preload_libraries='overlay_branch' and has been restarted
 make USE_PGXS=1 installcheck            # L3 + L1
-
-# Inside a PostgreSQL source tree: `make check` spins up its own temporary instance
-make check
 ```
 
-> `make check` / `make installcheck` need a real, installed UTF-8 locale on the
+> `make installcheck` needs a real, installed UTF-8 locale on the
 > host (`LC_ALL=C.utf8`); a missing locale aborts with `invalid locale settings`,
 > and forcing `LANG=C` produces bogus column-width differences.
 
 ## Limitations
 
-This is a v0.1 MVP with a deliberately narrow scope. The main limits:
+This is a v0.1 release with a deliberately narrow scope. The main limits:
 
 - Managed tables must be plain heap tables with a single-column `PRIMARY KEY`.
   - Partitioned / foreign tables, views, materialized views, foreign keys, multi-column PKs and non-PK `UNIQUE` constraints are rejected at `create_branch` time. 
