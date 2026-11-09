@@ -186,7 +186,9 @@ BEGIN
     END IF;
   END;
 
-  PERFORM overlay_branch.discard_branch('br_r10_applied');
+  -- br_r10_applied is now in the terminal 'applied' state and has no
+  -- cleanup API; discard_branch() on it is a documented error (covered by
+  -- the mvcc_bounds suite), so we deliberately leave it alone here.
 
   -- R03: UPDATE SET pk (same branch) → 0A000
   PERFORM overlay_branch.create_branch('br_r10_pk');

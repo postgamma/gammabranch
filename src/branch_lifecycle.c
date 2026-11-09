@@ -1624,6 +1624,19 @@ overlay_branch_use_with_mode_internal(const char *branch_name, const char *mode)
 		return;
 	}
 
+	/* REPEATABLE READ / SERIALIZABLE unsupported (doc/internals.md §3.1).
+	 * A session branch view is only correct under READ COMMITTED
+	 * per-statement snapshots: a transaction snapshot would be pinned for
+	 * the whole view and could not observe a concurrent apply/discard.  The
+	 * branch-exit path (empty name) returns above and stays allowed. */
+	if (IsolationUsesXactSnapshot())
+		ereport(ERROR,
+			(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+			 errmsg("overlay_branch: use_branch() is not supported in a "
+					"REPEATABLE READ or SERIALIZABLE transaction"),
+			 errhint("Use READ COMMITTED, or commit and call use_branch() "
+					 "in a new READ COMMITTED transaction.")));
+
 	{
 		int ret;
 		char *esc_name;
@@ -1636,69 +1649,66 @@ overlay_branch_use_with_mode_internal(const char *branch_name, const char *mode)
 		esc_name = quote_literal_cstr(branch_name);
 		initStringInfo(&sql);
 
-		resetStringInfo(&sql);
+		/* Resolve id + state in ONE statement: branch_name is unique, so
+		 * LIMIT 1 is exact.  Splitting existence / state / id into three
+		 * lookups would open a TOCTOU window in which a concurrent
+		 * apply/discard could flip the state between the checks. */
 		appendStringInfo(&sql,
-				 "SELECT 1 FROM " OBTABLE_BRANCH " WHERE branch_name = %s LIMIT 1",
-				 esc_name);
-		ret = SPI_execute(sql.data, true, 1);
-		if (ret != SPI_OK_SELECT || SPI_processed == 0)
-		{
-			SPI_finish();
-			if (SPI_processed == 0)
-				ereport(ERROR,
-					(errcode(ERRCODE_UNDEFINED_OBJECT),
-					 errmsg("branch \"%s\" does not exist", branch_name)));
-			else
-				ereport(ERROR,
-					(errcode(ERRCODE_INTERNAL_ERROR),
-					 errmsg("overlay_branch: SPI existence check failed ret=%d", ret)));
-		}
-
-		resetStringInfo(&sql);
-		appendStringInfo(&sql,
-				 "SELECT 1 FROM " OBTABLE_BRANCH " "
-				 "WHERE branch_name = %s AND state = '%s' LIMIT 1",
-				 esc_name, BRANCH_STATE_ACTIVE);
-		ret = SPI_execute(sql.data, true, 1);
-		if (ret != SPI_OK_SELECT || SPI_processed == 0)
-		{
-			SPI_finish();
-			if (SPI_processed == 0)
-				ereport(ERROR,
-					(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
-					 errmsg("branch \"%s\" is not active", branch_name),
-					 errhint("Create a fresh branch, or use DISCARD BRANCH to clean up.")));
-			else
-				ereport(ERROR,
-					(errcode(ERRCODE_INTERNAL_ERROR),
-					 errmsg("overlay_branch: SPI state check failed ret=%d", ret)));
-		}
-
-		resetStringInfo(&sql);
-		appendStringInfo(&sql,
-				 "SELECT branch_id FROM " OBTABLE_BRANCH " "
+				 "SELECT branch_id, state FROM " OBTABLE_BRANCH " "
 				 "WHERE branch_name = %s LIMIT 1",
 				 esc_name);
 		ret = SPI_execute(sql.data, true, 1);
-		if (ret != SPI_OK_SELECT || SPI_processed != 1)
+		if (ret != SPI_OK_SELECT)
 		{
 			SPI_finish();
 			ereport(ERROR,
 				(errcode(ERRCODE_INTERNAL_ERROR),
-				 errmsg("overlay_branch: could not fetch branch_id for '%s' SPI ret=%d n=%lu",
-					branch_name, ret, (unsigned long) SPI_processed)));
+				 errmsg("overlay_branch: SPI branch lookup failed ret=%d", ret)));
+		}
+		if (SPI_processed == 0)
+		{
+			SPI_finish();
+			ereport(ERROR,
+				(errcode(ERRCODE_UNDEFINED_OBJECT),
+				 errmsg("branch \"%s\" does not exist", branch_name)));
 		}
 
 		{
 			bool isnull;
-			real_branch_id = DatumGetInt32(
-				SPI_getbinval(SPI_tuptable->vals[0], SPI_tuptable->tupdesc,
-						 1, &isnull));
-			if (isnull)
-				elog(ERROR, "overlay_branch: branch_id for '%s' is NULL", branch_name);
-		}
+			Datum d;
+			char *st;
+			bool state_active;
 
-		SPI_finish();
+			d = SPI_getbinval(SPI_tuptable->vals[0], SPI_tuptable->tupdesc,
+							  1, &isnull);
+			if (isnull)
+			{
+				SPI_finish();
+				elog(ERROR, "overlay_branch: branch_id for '%s' is NULL",
+					 branch_name);
+			}
+			real_branch_id = DatumGetInt32(d);
+
+			d = SPI_getbinval(SPI_tuptable->vals[0], SPI_tuptable->tupdesc,
+							  2, &isnull);
+			if (isnull)
+			{
+				SPI_finish();
+				elog(ERROR, "overlay_branch: state for '%s' is NULL",
+					 branch_name);
+			}
+			/* st lives in the SPI proc context: consumed here, freed by
+			 * SPI_finish() below. */
+			st = TextDatumGetCString(d);
+			state_active = (strcmp(st, BRANCH_STATE_ACTIVE) == 0);
+			SPI_finish();
+
+			if (!state_active)
+				ereport(ERROR,
+					(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
+					 errmsg("branch \"%s\" is not active", branch_name),
+					 errhint("Create a fresh branch, or use DISCARD BRANCH to clean up.")));
+		}
 
 		/* §Gx / A7: schema drift guard.  Before we install ANY branch
 		 * state (ctx / snapshot / cache / GUC), re-scan current DB
@@ -2392,15 +2402,28 @@ overlay_branch_apply_internal(const char *branch_name)
 	 * block other apply/discard operations on unrelated branches. */
 	ob_registry_check_current_schema(bid, "apply_branch");
 
-	/* FR2: take branch-level EXCLUSIVE advisory lock BEFORE any catalog
+	/* FR2/FR3: take branch-level EXCLUSIVE advisory lock BEFORE any catalog
 	 * UPDATE / RowExclusiveLock on user tables, so we strictly follow
 	 * Advisory → (catalog locks + user RowExclusiveLock) deadlock order.
-	 * With ExclusiveLock held, the ACTIVE state check below and the later
-	 * UPDATE pg_branch state→applied / DELETE pg_branch_delta are fully
-	 * serialised vs any concurrent apply/discard on the same bid. */
+	 * The acquire is NON-BLOCKING (doc/internals.md §3.3): if a delta writer
+	 * holds ShareLock, or another apply/discard holds ExclusiveLock, we fail
+	 * fast instead of waiting — a blocking acquire would recreate the classic
+	 * ShareLock→ExclusiveLock upgrade deadlock.  Self-deadlock is impossible
+	 * because apply/discard never hold ShareLock themselves. */
 	if (bid <= 0)
 		elog(ERROR, "overlay_branch: apply found invalid branch_id=%d", bid);
-	ob_take_branch_advisory_lock(bid, ExclusiveLock);
+	if (!ob_try_branch_advisory_lock(bid, ExclusiveLock))
+	{
+		if (state) pfree(state);
+		pfree(esc_name);
+		ereport(ERROR,
+				(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
+				 errmsg("overlay_branch: apply_branch(\"%s\") cannot acquire the branch lock",
+						branch_name),
+				 errdetail("Another apply/discard is in progress, or in-flight "
+						   "delta writers have not yet committed."),
+				 errhint("Retry once the conflicting transaction ends.")));
+	}
 
 	if (state == NULL || strcmp(state, BRANCH_STATE_ACTIVE) != 0)
 	{
@@ -2628,6 +2651,25 @@ overlay_branch_apply_internal(const char *branch_name)
 					 errmsg("overlay_branch: apply final UPDATE pg_branch failed for '%s' SPI ret=%d",
 							branch_name, ret)));
 		}
+		/* CAS parity with the Step0 active→applying transition: the final
+		 * applying→applied UPDATE must touch exactly one row.  A zero-row
+		 * result means the state was already moved externally; treat it as
+		 * a refusal rather than silently reporting a successful apply. */
+		if (SPI_processed != 1)
+		{
+			SPI_finish();
+			pfree(sql_final.data);
+			if (state) pfree(state);
+			pfree(esc_name);
+			list_free(relids);
+			ereport(ERROR,
+					(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
+					 errmsg("overlay_branch: apply final transition to \"%s\" refused"
+							" for '%s' (SPI_processed=%lu != 1)",
+							BRANCH_STATE_APPLIED, branch_name,
+							(unsigned long) SPI_processed),
+					 errhint("Branch state changed externally during apply.")));
+		}
 		SPI_finish();
 
 		resetStringInfo(&sql_final);
@@ -2775,13 +2817,25 @@ overlay_branch_discard_internal(const char *branch_name)
 											branch_name));
 	}
 
-	/* FR2: take branch-level EXCLUSIVE advisory lock BEFORE the first
+	/* FR2/FR3: take branch-level EXCLUSIVE advisory lock BEFORE the first
 	 * catalog UPDATE, so discard serialises vs concurrent apply/discard
 	 * on same bid AND obeys Advisory → catalog RowExclusiveLock order
-	 * (prevents deadlock). */
+	 * (prevents deadlock).  NON-BLOCKING acquire (doc/internals.md §3.3):
+	 * a delta writer holding ShareLock, or another apply/discard, makes us
+	 * fail fast rather than wait (no ShareLock→ExclusiveLock upgrade). */
 	if (bid <= 0)
 		elog(ERROR, "overlay_branch: discard found invalid branch_id=%d", bid);
-	ob_take_branch_advisory_lock(bid, ExclusiveLock);
+	if (!ob_try_branch_advisory_lock(bid, ExclusiveLock))
+	{
+		SPI_finish();
+		ereport(ERROR,
+				(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
+				 errmsg("overlay_branch: discard_branch(\"%s\") cannot acquire the branch lock",
+						branch_name),
+				 errdetail("Another apply/discard is in progress, or in-flight "
+						   "delta writers have not yet committed."),
+				 errhint("Retry once the conflicting transaction ends.")));
+	}
 
 	/* 2) UPDATE state -> discarded */
 	resetStringInfo(&sql);
@@ -2799,6 +2853,19 @@ overlay_branch_discard_internal(const char *branch_name)
 				(errcode(ERRCODE_INTERNAL_ERROR),
 				 errmsg("overlay_branch: discard update pg_branch failed for '%s' SPI ret=%d",
 						branch_name, ret)));
+	}
+	/* CAS parity with apply_branch Step0: the active→discarded UPDATE must
+	 * touch exactly one row.  A zero-row result means the branch was already
+	 * moved out of ACTIVE externally; refuse instead of reporting success. */
+	if (SPI_processed != 1)
+	{
+		SPI_finish();
+		ereport(ERROR,
+				(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
+				 errmsg("overlay_branch: discard_branch(\"%s\") CAS state transition refused"
+						" (SPI_processed=%lu != 1); branch no longer ACTIVE",
+						branch_name, (unsigned long) SPI_processed),
+				 errhint("Branch state was changed externally between SELECT and UPDATE.")));
 	}
 
 	/* 3) CASCADE: delete all delta rows for this branch_id */

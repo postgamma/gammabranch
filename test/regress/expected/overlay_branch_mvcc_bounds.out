@@ -1313,8 +1313,7 @@ CONTEXT:  PL/pgSQL function inline_code_block line 7 at RAISE
 /* Teardown Q-2 fixture */
 SELECT discard_branch('bs_t8_q2');
 ERROR:  overlay_branch: cannot discard_branch inside active branch "bs_t8_q2": branch "bs_t8_q2" is not active (already discarded or applied); discard cannot be called twice on the same branch
-CONTEXT:  SQL statement "SELECT overlay_branch.discard_branch(_name)"
-PL/pgSQL function public.discard_branch(name) line 36 at PERFORM
+CONTEXT:  SQL function "discard_branch" statement 1
 DROP TABLE public.q2_t;
 /* Final L3 PASS marker for the zero-regression gate baseline. */
 SELECT 'PASS:Q2_FR7_CANCELLED_CORRECTNESS_OK' AS q2_fr7_cancelled_status;

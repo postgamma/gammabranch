@@ -1,12 +1,13 @@
 # ob_applying_freeze.spec — L1 pg_isolation_regress (T8)
-# FR3 applying-transient-state delta-write freeze.
-# I8.4: apply split into TWO steps — s1_apply_cas (BEGIN+SET LOCAL sleep=2+apply; NO COMMIT)
-# then s2_delta steps in WHILE apply is still mid-flight (pg_sleep for 2s inside
-# apply after CAS to applying).  s2_delta tries use+INSERT.  Two valid outcomes:
-#   (a) FR3 state='applying' seen by delta gate → ERROR "state is applying, cannot write"
-#   (b) FR2 Exclusive advisory blocks (s2 step shows `<waiting ...>`); after s1 COMMITs
-#       → state='applied' → ERROR "branch not active"  (also correct; no MAIN leak).
-# In both cases MAIN final rows must be exactly 110 (s2's row never merged).
+# FR2/FR3: a delta write racing an in-flight apply must be frozen.
+# I8.4: apply is split into two steps so s2 can probe WHILE apply is mid-flight —
+# s1_apply_cas runs BEGIN + SET LOCAL sleep=2 + apply and does NOT commit; the
+# sleep widens the window after s1 has taken the branch ExclusiveLock.  s2's
+# INSERT then blocks on the delta writer's ShareLock (s2_delta shows
+# `<waiting ...>`).  When s1 COMMITs (state 'applied'), s2's state re-check reads
+# the fresh committed state and rejects the write with ERROR 55000 — s2's row is
+# neither merged into MAIN nor left as an orphan delta row.
+# Assertions: MAIN stays at exactly 110 rows AND the branch delta is empty.
 
 setup
 {
@@ -53,15 +54,19 @@ setup { SET client_min_messages = WARNING; }
 step "s2_delta" {
     SELECT overlay_branch.use_branch('bs_freeze', 'live');
     INSERT INTO public.t8_apply VALUES (200, 'WR_by_s2_should_freeze');
-    SELECT 1 AS s2_ok;
 }
 
 session "s3"
 setup { SET client_min_messages = WARNING; }
 step "s3_verify" { SELECT count(*) AS main_rows FROM public.t8_apply; }
+step "s3_delta"  {
+    SELECT count(*) AS delta_rows
+      FROM overlay_branch.pg_branch_delta d
+      JOIN overlay_branch.pg_branch b USING (branch_id)
+     WHERE b.branch_name = 'bs_freeze';
+}
 
 # Critical ordering: s1_apply_cas (sleeps 2s inside apply) then immediately s2_delta.
-# permutation engine will dispatch s1 then immediately next-step s2 without
-# waiting s1 (unless it sees heavyweight lock), but even if FR2 Exclusive blocks
-# s2_delta is safe: outcome (b) still OK.
-permutation "s1_ctrl_setup" "s1_apply_cas" "s2_delta" "s1_commit" "s3_verify"
+# s2_delta blocks on the writer ShareLock until s1 COMMITs, then its write to the
+# now-'applied' branch is rejected; MAIN stays at 110 and the delta stays empty.
+permutation "s1_ctrl_setup" "s1_apply_cas" "s2_delta" "s1_commit" "s3_verify" "s3_delta"

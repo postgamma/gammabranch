@@ -725,109 +725,24 @@ AS $$SELECT @extschema@.current_branch()$$;
 
 
 
+/* Thin wrappers.  apply_branch/discard_branch MUST always run the canonical
+ * C implementation: it is the only path that takes the branch advisory lock,
+ * CAS-guards the state transition, runs the schema-drift guard, broadcasts
+ * the state change (NOTIFY) and flushes the session snapshot/mode caches.
+ * An SQL fast path for the empty-branch case silently skipped all of that and
+ * could race a concurrent writer into leaving orphan delta rows, so no such
+ * shortcut exists here. */
 DROP FUNCTION IF EXISTS public.apply_branch(name);
 CREATE FUNCTION public.apply_branch(_name name)
-RETURNS void LANGUAGE plpgsql VOLATILE
+RETURNS void LANGUAGE sql VOLATILE
 SET search_path = @extschema@, pg_catalog
-AS $$
-/* A4 F1 PL/pgSQL empty-branch fast apply return.
- *
- * FAST-PATH CONDITIONS (all must be true):
- *   1. branch state = 'active'
- *   2. count(pg_branch_delta) = 0
- *   3. the branch is NOT the currently-entered branch (else C code needs
- *      to reset overlay_branch.current GUC and flush session-level
- *      snapshot/mode caches — a SQL function cannot touch those).
- * Otherwise we fall through to the canonical C implementation.
- * Any exception on the fast path also falls through (absolute correctness).
- */
-DECLARE
-    _bid      integer;
-    _state    text;
-    _cnt      bigint;
-    _current  text;
-BEGIN
-    SELECT branch_id, state INTO STRICT _bid, _state
-      FROM @extschema@.pg_branch WHERE branch_name = _name;
-
-    _current := current_setting('overlay_branch.current', true);
-
-    IF _state = 'active'
-       AND _current IS DISTINCT FROM _name THEN
-
-        SELECT count(*)::bigint INTO STRICT _cnt
-          FROM @extschema@.pg_branch_delta WHERE branch_id = _bid;
-
-        IF _cnt = 0 THEN
-            BEGIN
-                UPDATE @extschema@.pg_branch
-                   SET state = 'applying'
-                 WHERE branch_id = _bid AND state = 'active';
-                IF NOT FOUND THEN
-                    RAISE EXCEPTION 'fast apply lost race to applying';
-                END IF;
-
-                UPDATE @extschema@.pg_branch
-                   SET state = 'applied'
-                 WHERE branch_id = _bid AND state = 'applying';
-                IF NOT FOUND THEN
-                    RAISE EXCEPTION 'fast apply corrupted state jump';
-                END IF;
-
-                DELETE FROM @extschema@.pg_branch_delta WHERE branch_id = _bid;
-                RETURN;
-            EXCEPTION WHEN OTHERS THEN
-                NULL;
-            END;
-        END IF;
-    END IF;
-
-    PERFORM @extschema@.apply_branch(_name);
-END;
-$$;
+AS $$SELECT @extschema@.apply_branch(_name)$$;
 
 DROP FUNCTION IF EXISTS public.discard_branch(name);
 CREATE FUNCTION public.discard_branch(_name name)
-RETURNS void LANGUAGE plpgsql VOLATILE
+RETURNS void LANGUAGE sql VOLATILE
 SET search_path = @extschema@, pg_catalog
-AS $$
-/* Same 3-condition fast path guard as apply_branch. */
-DECLARE
-    _bid      integer;
-    _state    text;
-    _cnt      bigint;
-    _current  text;
-BEGIN
-    SELECT branch_id, state INTO STRICT _bid, _state
-      FROM @extschema@.pg_branch WHERE branch_name = _name;
-
-    _current := current_setting('overlay_branch.current', true);
-
-    IF _state IN ('active','applying')
-       AND _current IS DISTINCT FROM _name THEN
-
-        SELECT count(*)::bigint INTO STRICT _cnt
-          FROM @extschema@.pg_branch_delta WHERE branch_id = _bid;
-
-        IF _cnt = 0 THEN
-            BEGIN
-                UPDATE @extschema@.pg_branch
-                   SET state = 'discarded'
-                 WHERE branch_id = _bid AND state IN ('active','applying');
-                IF NOT FOUND THEN
-                    RAISE EXCEPTION 'fast discard lost race on state';
-                END IF;
-                DELETE FROM @extschema@.pg_branch_delta WHERE branch_id = _bid;
-                RETURN;
-            EXCEPTION WHEN OTHERS THEN
-                NULL;
-            END;
-        END IF;
-    END IF;
-
-    PERFORM @extschema@.discard_branch(_name);
-END;
-$$;
+AS $$SELECT @extschema@.discard_branch(_name)$$;
 
 
 CREATE OR REPLACE FUNCTION public.use_branch(branch_name name, mode text)

@@ -1202,9 +1202,9 @@ SELECT CASE WHEN NOT EXISTS (
             THEN 'PASS:A7_D5B_DISCARD_CASCADE_REGISTRY_EMPTY'
             ELSE 'FAIL:A7_D5B — registry rows still present for discarded branch'
        END AS a7_d5b;
-                             a7_d5b                             
-----------------------------------------------------------------
- FAIL:A7_D5B — registry rows still present for discarded branch
+                   a7_d5b                   
+--------------------------------------------
+ PASS:A7_D5B_DISCARD_CASCADE_REGISTRY_EMPTY
 (1 row)
 
 /* ---- A7_D6: DRIFT — DROP TABLE on MAIN.  Reuse br_a7 (has 2 tabs).
@@ -1271,9 +1271,9 @@ SELECT CASE WHEN NOT EXISTS (
             THEN 'PASS:A7_D6B_DISCARD_CASCADE_REGISTRY_EMPTY'
             ELSE 'FAIL:A7_D6B — registry rows still present after discard'
        END AS a7_d6b;
-                         a7_d6b                          
----------------------------------------------------------
- FAIL:A7_D6B — registry rows still present after discard
+                   a7_d6b                   
+--------------------------------------------
+ PASS:A7_D6B_DISCARD_CASCADE_REGISTRY_EMPTY
 (1 row)
 
 -- Prove post-recreate MAIN is branch-able: fresh br_a7_v2 + first-use

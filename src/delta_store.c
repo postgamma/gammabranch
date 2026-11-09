@@ -72,6 +72,8 @@ overlay_delta_insert(int32 branch_id, Oid relid, const char *key,
 {
 	int			ret;
 	int			gret;
+	LockAcquireResult lres;
+	bool		check_state;
 	bytea	   *td = NULL;
 	Datum		state_values[1];
 	Datum		values[6];
@@ -85,90 +87,140 @@ overlay_delta_insert(int32 branch_id, Oid relid, const char *key,
 	if (branch_id <= 0)
 		elog(ERROR, "overlay_delta_insert: invalid branch_id=%d", branch_id);
 
-	state_values[0] = Int32GetDatum(branch_id);
-	gret = ob_spi_exec_params(
-							 "SELECT branch_id, state FROM " OBTABLE_BRANCH " "
-							 "WHERE branch_id = $1 LIMIT 1",
-							 true, 1, 1, state_argtypes, state_values, NULL);
-	if (gret != SPI_OK_SELECT)
-	{
-		SPI_finish();
-		elog(ERROR, "overlay_delta_insert: bid=%d state lookup SPI ret=%d",
-			 branch_id, gret);
-	}
-	if (SPI_processed == 0)
-	{
-		const char *bn;
-
-		SPI_finish();
-		bn = overlay_branch_get_current_name();
+	/* REPEATABLE READ / SERIALIZABLE unsupported (doc/internals.md §3.1-3.4).
+	 * The cross-session freeze is an advisory lock plus a fresh state re-read;
+	 * under transaction-snapshot isolation every read (even read_only=false)
+	 * is served from the fixed transaction snapshot, so a concurrent
+	 * apply/discard commit could not be observed and this write could append
+	 * an orphan delta row to a now-terminal branch.  Reject up front. */
+	if (IsolationUsesXactSnapshot())
 		ereport(ERROR,
-				(errcode(ERRCODE_UNDEFINED_OBJECT),
-				 errmsg("overlay_delta_insert: branch_id=%d does not exist",
-						branch_id),
-				 errhint("Current session branch: \"%s\". "
-						 "Call create_branch() first.",
-						 bn ? bn : "<none>")));
+				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+				 errmsg("overlay_branch: cannot write to a branch from a "
+						"REPEATABLE READ or SERIALIZABLE transaction"),
+				 errdetail("Branch write freezing relies on re-reading the "
+						   "branch state after an advisory-lock wait; in "
+						   "transaction-snapshot isolation that read cannot "
+						   "see a concurrent apply/discard commit."),
+				 errhint("Use READ COMMITTED, or commit and retry the write "
+						 "in a new READ COMMITTED transaction.")));
+
+	/* FR2/FR3 freeze (doc/internals.md §3.3-3.4).  A delta writer holds a
+	 * SHARE advisory lock on the branch for the rest of the transaction.
+	 * apply/discard take the EXCLUSIVE form non-blocking, so this writer
+	 * blocks behind an in-flight apply/discard and, conversely, makes a
+	 * mid-flight apply fail fast.  This transaction-scoped lock is the only
+	 * cross-session signal for the otherwise MVCC-invisible 'applying'
+	 * state.  Re-acquiring SHARE in the same xact is a no-op. */
+	lres = ob_try_branch_advisory_lock_ex(branch_id, ShareLock);
+	if (lres == LOCKACQUIRE_NOT_AVAIL)
+	{
+		/* An apply/discard held the ExclusiveLock; block until it ends. */
+		ob_take_branch_advisory_lock(branch_id, ShareLock);
+		check_state = true;
 	}
 	else
 	{
-		bool		isnull;
-		Datum		v;
-		char	   *st;
-		MemoryContext oldmc;
+		/* LOCKACQUIRE_OK: first Share this xact, so the branch state must be
+		 * re-read on a fresh snapshot (the statement snapshot may predate a
+		 * concurrent apply commit; see below).  LOCKACQUIRE_ALREADY_HELD: a
+		 * previous delta write this xact already verified the state while
+		 * holding this lock, and the lock pins the state until xact end, so
+		 * the per-row check can be skipped. */
+		check_state = (lres == LOCKACQUIRE_OK);
+	}
 
-		/* mirror apply_branch Step0 pattern: SELECT branch_id, state → state is col 2 */
-		v = SPI_getbinval(SPI_tuptable->vals[0], SPI_tuptable->tupdesc, 2, &isnull);
-		if (isnull)
+	/* The state check must NOT run on the statement's active snapshot: a long
+	 * statement planned before a concurrent apply committed could reach here
+	 * afterwards and still read the stale 'active'.  read_only=false selects
+	 * GetTransactionSnapshot(), recomputed per call under READ COMMITTED. */
+	if (check_state)
+	{
+		state_values[0] = Int32GetDatum(branch_id);
+		gret = ob_spi_exec_params(
+								 "SELECT branch_id, state FROM " OBTABLE_BRANCH " "
+								 "WHERE branch_id = $1 LIMIT 1",
+								 false, 1, 1, state_argtypes, state_values, NULL);
+		if (gret != SPI_OK_SELECT)
 		{
 			SPI_finish();
-			{
-				const char *bn2 = overlay_branch_get_current_name();
-
-				ereport(ERROR,
-						(errcode(ERRCODE_UNDEFINED_OBJECT),
-						 errmsg("overlay_delta_insert: bid=%d has NULL state "
-								"(corrupt pg_branch row)",
-								branch_id),
-						 errhint("Current session branch: \"%s\".",
-								 bn2 ? bn2 : "<none>")));
-			}
+			elog(ERROR, "overlay_delta_insert: bid=%d state lookup SPI ret=%d",
+				 branch_id, gret);
 		}
-		/* Copy the detoasted text C string into the caller's context, which
-		 * outlives SPI_finish() (the raw datum lives in the SPI proc context
-		 * that finish tears down).  Not TopMemoryContext: this string is used
-		 * only here (freed on success, consumed by the ereport on failure),
-		 * so a TopMC copy would leak on every rejected write. */
-		oldmc = MemoryContextSwitchTo(caller_cxt);
-		st = TextDatumGetCString(v);
-		MemoryContextSwitchTo(oldmc);
-		SPI_finish();
-		if (st == NULL || strcmp(st, BRANCH_STATE_ACTIVE) != 0)
+		if (SPI_processed == 0)
 		{
 			const char *bn;
-			const char *saved_st = st ? st : "<NULL>";
 
+			SPI_finish();
 			bn = overlay_branch_get_current_name();
 			ereport(ERROR,
-					(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
-					 errmsg("overlay_branch: cannot write delta rows to branch "
-							"\"%s\" (bid=%d state=%s). "
-							"Writes are only allowed while branch is ACTIVE.",
-							bn ? bn : "<unresolved name>",
-							branch_id, saved_st),
-					 (st && strcmp(st, BRANCH_STATE_APPLYING) == 0
-					  ? errhint("Branch is currently applying. "
-								"Retry apply once the current apply_branch() "
-								"caller has finished.")
-					  : 0),
-					 (st && (strcmp(st, BRANCH_STATE_APPLIED) == 0
-							 || strcmp(st, BRANCH_STATE_DISCARDED) == 0)
-					  ? errhint("Branch is in a terminal state (%s); "
-								"no further writes allowed. Create a new branch.",
-								saved_st)
-					  : 0)));
+					(errcode(ERRCODE_UNDEFINED_OBJECT),
+					 errmsg("overlay_delta_insert: branch_id=%d does not exist",
+							branch_id),
+					 errhint("Current session branch: \"%s\". "
+							 "Call create_branch() first.",
+							 bn ? bn : "<none>")));
 		}
-		if (st) pfree(st);
+		else
+		{
+			bool		isnull;
+			Datum		v;
+			char	   *st;
+			MemoryContext oldmc;
+
+			/* mirror apply_branch Step0 pattern: SELECT branch_id, state → state is col 2 */
+			v = SPI_getbinval(SPI_tuptable->vals[0], SPI_tuptable->tupdesc, 2, &isnull);
+			if (isnull)
+			{
+				SPI_finish();
+				{
+					const char *bn2 = overlay_branch_get_current_name();
+
+					ereport(ERROR,
+							(errcode(ERRCODE_UNDEFINED_OBJECT),
+							 errmsg("overlay_delta_insert: bid=%d has NULL state "
+									"(corrupt pg_branch row)",
+									branch_id),
+							 errhint("Current session branch: \"%s\".",
+									 bn2 ? bn2 : "<none>")));
+				}
+			}
+			/* Copy the detoasted text C string into the caller's context, which
+			 * outlives SPI_finish() (the raw datum lives in the SPI proc context
+			 * that finish tears down).  Not TopMemoryContext: this string is used
+			 * only here (freed on success, consumed by the ereport on failure),
+			 * so a TopMC copy would leak on every rejected write. */
+			oldmc = MemoryContextSwitchTo(caller_cxt);
+			st = TextDatumGetCString(v);
+			MemoryContextSwitchTo(oldmc);
+			SPI_finish();
+			if (st == NULL || strcmp(st, BRANCH_STATE_ACTIVE) != 0)
+			{
+				const char *bn;
+				const char *saved_st = st ? st : "<NULL>";
+
+				bn = overlay_branch_get_current_name();
+				ereport(ERROR,
+						(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
+						 errmsg("overlay_branch: cannot write delta rows to branch "
+								"\"%s\" (bid=%d state=%s). "
+								"Writes are only allowed while branch is ACTIVE.",
+								bn ? bn : "<unresolved name>",
+								branch_id, saved_st),
+						 (st && strcmp(st, BRANCH_STATE_APPLYING) == 0
+						  ? errhint("Branch is currently applying. "
+									"Retry apply once the current apply_branch() "
+									"caller has finished.")
+						  : 0),
+						 (st && (strcmp(st, BRANCH_STATE_APPLIED) == 0
+								 || strcmp(st, BRANCH_STATE_DISCARDED) == 0)
+						  ? errhint("Branch is in a terminal state (%s); "
+									"no further writes allowed. Create a new branch.",
+									saved_st)
+						  : 0)));
+			}
+			if (st) pfree(st);
+		}
 	}
 	if (key == NULL)
 		elog(ERROR, "overlay_delta_insert: key must not be NULL");

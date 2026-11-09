@@ -61,11 +61,12 @@
  *
  * Use sessionLock = false so the lock is tied to the current transaction
  * (auto-released on COMMIT / ABORT, never leaks).
- * dontWait       = false so callers block until granted (or the deadlock
- * detector picks a victim with ERRCODE 40P01, which is the safe behaviour).
  *
- * Same-backend same-xact ShareLock → ExclusiveLock upgrade works correctly in PG
- * (promoted without wait, but we document Section L tests to cover this path).
+ * Two modes are used on the same key (doc/internals.md §3.3):
+ *   - delta writers take ShareLock (blocking) and hold it to end of xact;
+ *   - apply/discard take ExclusiveLock non-blocking, so a conflicting writer
+ *     (or another apply/discard) makes them fail fast instead of waiting and
+ *     forming a ShareLock -> ExclusiveLock upgrade deadlock.
  * ----------
  */
 static inline void
@@ -80,6 +81,35 @@ ob_take_branch_advisory_lock(int32 bid, LOCKMODE lockmode)
 			 bid);
 	SET_LOCKTAG_INT64(tag, key);
 	(void) LockAcquire(&tag, lockmode, false, false);
+}
+
+/* Non-blocking acquire.  Returns the raw LockAcquireResult so callers can tell
+ * a fresh acquire (LOCKACQUIRE_OK) from one already held by this transaction
+ * (LOCKACQUIRE_ALREADY_HELD); LOCKACQUIRE_NOT_AVAIL means a conflicting holder
+ * exists and dontWait refused it.  ob_try_branch_advisory_lock() below is the
+ * boolean view. */
+static inline LockAcquireResult
+ob_try_branch_advisory_lock_ex(int32 bid, LOCKMODE lockmode)
+{
+	int64		key = (int64) OB_MAKE_ADVISORY_KEY(bid);
+	LOCKTAG		tag;
+
+	if (bid <= 0)
+		elog(ERROR,
+			 "overlay_branch: invalid branch_id=%d for advisory lock",
+			 bid);
+	SET_LOCKTAG_INT64(tag, key);
+	return LockAcquire(&tag, lockmode, false, true);
+}
+
+/* Boolean view of ob_try_branch_advisory_lock_ex(): true = held.  Callers that
+ * must tell "newly acquired" from "already held" (the delta-write state-check
+ * fast path, doc/internals.md §3.3) use the _ex form directly. */
+static inline bool
+ob_try_branch_advisory_lock(int32 bid, LOCKMODE lockmode)
+{
+	return (ob_try_branch_advisory_lock_ex(bid, lockmode)
+			!= LOCKACQUIRE_NOT_AVAIL);
 }
 
 static inline void

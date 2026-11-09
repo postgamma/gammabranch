@@ -53,7 +53,7 @@ ISOLATION_OPTS = \
 	--temp-config=$(srcdir)/temp_instance_shared_libs.conf
 
 # L1 pg_isolation_regress concurrency tests (T9 total acceptance).
-ISOLATION = ob_apply_mutex ob_state_inval ob_applying_freeze ob_snapshot_mode ob_branchscan_rescan pure_delta_upsert pure_delta_update pure_delta_delete ob_view_unify_rescan keyless_basic keyless_pure_delta_repeat keyless_apply_conflict keyless_version_chain keyless_upsert keyless_delete_invalidation
+ISOLATION = ob_apply_mutex ob_state_inval ob_applying_freeze ob_snapshot_mode ob_branchscan_rescan pure_delta_upsert pure_delta_update pure_delta_delete ob_view_unify_rescan keyless_basic keyless_pure_delta_repeat keyless_apply_conflict keyless_version_chain keyless_upsert keyless_delete_invalidation ob_rr_reject
 EXTRA_CLEAN += test_output test_output_iso output_iso output_l3 tmp_check tmp_check_iso
 
 # NOTE on test entry points:

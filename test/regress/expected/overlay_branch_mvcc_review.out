@@ -303,7 +303,9 @@ BEGIN
     END IF;
   END;
 
-  PERFORM overlay_branch.discard_branch('br_r10_applied');
+  -- br_r10_applied is now in the terminal 'applied' state and has no
+  -- cleanup API; discard_branch() on it is a documented error (covered by
+  -- the mvcc_bounds suite), so we deliberately leave it alone here.
 
   -- R03: UPDATE SET pk (same branch) → 0A000
   PERFORM overlay_branch.create_branch('br_r10_pk');
@@ -319,8 +321,6 @@ BEGIN
   PERFORM overlay_branch.use_branch(NULL);
   PERFORM overlay_branch.discard_branch('br_r10_pk');
 END $$;
-ERROR:  FAIL_R10_EXPECTED_55000_GOT_XX000 MSG=overlay_branch: SPI state check failed ret=5
-CONTEXT:  PL/pgSQL function inline_code_block line 23 at RAISE
 -- ===== R10 / Final MAIN sanity (assert zero pollution after cycles) =====
 DISCARD ALL;
 SET client_min_messages = WARNING;
@@ -396,7 +396,7 @@ EXECUTE r_ctx_q_green(60);
 SELECT create_branch('b_r_ctx');
  create_branch 
 ---------------
-            45
+            46
 (1 row)
 
 SELECT use_branch('b_r_ctx');
@@ -498,7 +498,7 @@ SELECT CASE WHEN (a.count = b.count) AND (a.sum::numeric = b.sum::numeric) AND (
 SELECT create_branch('b_r_ctx_s07');
  create_branch 
 ---------------
-            46
+            47
 (1 row)
 
 SELECT use_branch('b_r_ctx_s07');
@@ -656,7 +656,7 @@ ANALYZE public.rv_t;
 SELECT create_branch('br_hot_conflict') AS id_br_hot;
  id_br_hot 
 -----------
-        47
+        48
 (1 row)
 
 SELECT use_branch('br_hot_conflict');
@@ -755,7 +755,7 @@ ANALYZE public.rv_t;
 SELECT create_branch('br_token_conflict') AS id_br_token;
  id_br_token 
 -------------
-          48
+          49
 (1 row)
 
 SELECT use_branch('br_token_conflict');
@@ -844,7 +844,7 @@ INSERT INTO public.ap1_t VALUES (1,'m1'),(2,'m2'),(3,'m3');
 SELECT create_branch('br_ap1_pos') AS id_br_ap1_pos;
  id_br_ap1_pos 
 ---------------
-            49
+            50
 (1 row)
 
 SELECT use_branch('br_ap1_pos');
@@ -883,7 +883,7 @@ FROM public.ap1_t;
 SELECT create_branch('br_ap1_del') AS id_br_ap1_del;
  id_br_ap1_del 
 ---------------
-            50
+            51
 (1 row)
 
 SELECT use_branch('br_ap1_del');
@@ -928,7 +928,7 @@ SELECT discard_branch('br_ap1_del');
 SELECT create_branch('br_ap1_upd') AS id_br_ap1_upd;
  id_br_ap1_upd 
 ---------------
-            51
+            52
 (1 row)
 
 SELECT use_branch('br_ap1_upd');
@@ -973,7 +973,7 @@ SELECT discard_branch('br_ap1_upd');
 SELECT create_branch('br_ap1_ins') AS id_br_ap1_ins;
  id_br_ap1_ins 
 ---------------
-            52
+            53
 (1 row)
 
 SELECT use_branch('br_ap1_ins');
@@ -1018,7 +1018,7 @@ SELECT discard_branch('br_ap1_ins');
 SELECT create_branch('br_ap1_ok') AS id_br_ap1_ok;
  id_br_ap1_ok 
 --------------
-           53
+           54
 (1 row)
 
 SELECT use_branch('br_ap1_ok');
@@ -1086,7 +1086,7 @@ INSERT INTO public.ap2_t VALUES (1,'m1'),(2,'m2'),(3,'m3');
 SELECT create_branch('br_ap2_pos') AS id_br_ap2_pos;
  id_br_ap2_pos 
 ---------------
-            54
+            55
 (1 row)
 
 SELECT use_branch('br_ap2_pos');
@@ -1125,7 +1125,7 @@ FROM public.ap2_t;
 SELECT create_branch('br_ap2_dtoken') AS id_br_ap2_dtoken;
  id_br_ap2_dtoken 
 ------------------
-               55
+               56
 (1 row)
 
 SELECT use_branch('br_ap2_dtoken');
@@ -1172,7 +1172,7 @@ INSERT INTO public.ap2_t VALUES (1,'m1'),(2,'m2'),(3,'m3');
 SELECT create_branch('br_ap2_dgone') AS id_br_ap2_dgone;
  id_br_ap2_dgone 
 -----------------
-              56
+              57
 (1 row)
 
 SELECT use_branch('br_ap2_dgone');
@@ -1219,7 +1219,7 @@ INSERT INTO public.ap2_t VALUES (1,'m1'),(2,'m2'),(3,'m3');
 SELECT create_branch('br_ap2_ugone') AS id_br_ap2_ugone;
  id_br_ap2_ugone 
 -----------------
-              57
+              58
 (1 row)
 
 SELECT use_branch('br_ap2_ugone');
@@ -1266,7 +1266,7 @@ INSERT INTO public.ap2_t VALUES (1,'m1'),(2,'m2'),(3,'m3');
 SELECT create_branch('br_ap2_utoken') AS id_br_ap2_utoken;
  id_br_ap2_utoken 
 ------------------
-               58
+               59
 (1 row)
 
 SELECT use_branch('br_ap2_utoken');
@@ -1313,7 +1313,7 @@ INSERT INTO public.ap2_t VALUES (1,'m1'),(2,'m2'),(3,'m3');
 SELECT create_branch('br_ap2_orphan_conf') AS id_br_ap2_orphan_conf;
  id_br_ap2_orphan_conf 
 -----------------------
-                    59
+                    60
 (1 row)
 
 SELECT use_branch('br_ap2_orphan_conf');
@@ -1361,7 +1361,7 @@ INSERT INTO public.ap2_t VALUES (1,'m1'),(2,'m2'),(3,'m3');
 SELECT create_branch('br_ap2_ins_conf') AS id_br_ap2_ins_conf;
  id_br_ap2_ins_conf 
 --------------------
-                 60
+                 61
 (1 row)
 
 SELECT use_branch('br_ap2_ins_conf');
@@ -1408,7 +1408,7 @@ INSERT INTO public.ap2_t VALUES (1,'m1'),(2,'m2'),(3,'m3');
 SELECT create_branch('br_ap2_orphan_ok') AS id_br_ap2_orphan_ok;
  id_br_ap2_orphan_ok 
 ---------------------
-                  61
+                  62
 (1 row)
 
 SELECT use_branch('br_ap2_orphan_ok');
@@ -1448,7 +1448,7 @@ INSERT INTO public.ap2_kn VALUES ('k1'),('k2'),('k3');
 SELECT create_branch('br_ap2_kn') AS id_br_ap2_kn;
  id_br_ap2_kn 
 --------------
-           62
+           63
 (1 row)
 
 SELECT use_branch('br_ap2_kn');
@@ -1498,7 +1498,7 @@ SET overlay_branch.apply_batch = off;
 SELECT create_branch('br_ap2_diff_off') AS id_br_ap2_diff_off;
  id_br_ap2_diff_off 
 --------------------
-                 63
+                 64
 (1 row)
 
 SELECT use_branch('br_ap2_diff_off');
@@ -1528,7 +1528,7 @@ SET overlay_branch.apply_batch = on;
 SELECT create_branch('br_ap2_diff_on') AS id_br_ap2_diff_on;
  id_br_ap2_diff_on 
 -------------------
-                64
+                65
 (1 row)
 
 SELECT use_branch('br_ap2_diff_on');

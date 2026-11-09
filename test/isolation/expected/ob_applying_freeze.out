@@ -1,6 +1,6 @@
 Parsed test spec with 3 sessions
 
-starting permutation: s1_ctrl_setup s1_apply_cas s2_delta s1_commit s3_verify
+starting permutation: s1_ctrl_setup s1_apply_cas s2_delta s1_commit s3_verify s3_delta
 step s1_ctrl_setup: 
     SELECT overlay_branch.create_branch('bs_freeze');
     SELECT overlay_branch.use_branch('bs_freeze', 'live');
@@ -34,22 +34,29 @@ apply_branch
 step s2_delta: 
     SELECT overlay_branch.use_branch('bs_freeze', 'live');
     INSERT INTO public.t8_apply VALUES (200, 'WR_by_s2_should_freeze');
-    SELECT 1 AS s2_ok;
-
+ <waiting ...>
+step s1_commit: COMMIT;
+step s2_delta: <... completed>
 use_branch
 ----------
           
 (1 row)
 
-s2_ok
------
-    1
-(1 row)
-
-step s1_commit: COMMIT;
+ERROR:  overlay_branch: cannot write delta rows to branch "bs_freeze" (bid=5 state=applied). Writes are only allowed while branch is ACTIVE.
 step s3_verify: SELECT count(*) AS main_rows FROM public.t8_apply;
 main_rows
 ---------
       110
+(1 row)
+
+step s3_delta: 
+    SELECT count(*) AS delta_rows
+      FROM overlay_branch.pg_branch_delta d
+      JOIN overlay_branch.pg_branch b USING (branch_id)
+     WHERE b.branch_name = 'bs_freeze';
+
+delta_rows
+----------
+         0
 (1 row)
 

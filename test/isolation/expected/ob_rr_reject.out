@@ -1,0 +1,48 @@
+Parsed test spec with 2 sessions
+
+starting permutation: s1_p1_create s1_p1_rr_begin s1_p1_rr_use s1_p1_rollback
+step s1_p1_create: SELECT overlay_branch.create_branch('bs_rr_use') > 0 AS created;
+created
+-------
+t      
+(1 row)
+
+step s1_p1_rr_begin: BEGIN ISOLATION LEVEL REPEATABLE READ;
+step s1_p1_rr_use: SELECT overlay_branch.use_branch('bs_rr_use', 'live');
+ERROR:  overlay_branch: use_branch() is not supported in a REPEATABLE READ or SERIALIZABLE transaction
+step s1_p1_rollback: ROLLBACK;
+
+starting permutation: s1_p2_enter s1_p2_rc_write s1_p2_rr_begin s1_p2_rr_write s1_p2_rollback ctrl_p2_delta ctrl_p2_main
+step s1_p2_enter: SELECT overlay_branch.create_branch('bs_rr_write') > 0 AS created; SELECT overlay_branch.use_branch('bs_rr_write', 'live');
+created
+-------
+t      
+(1 row)
+
+use_branch
+----------
+          
+(1 row)
+
+step s1_p2_rc_write: INSERT INTO public.t_rr VALUES (1001, 'rc_ok');
+step s1_p2_rr_begin: BEGIN ISOLATION LEVEL REPEATABLE READ;
+step s1_p2_rr_write: INSERT INTO public.t_rr VALUES (1002, 'rr_should_fail');
+ERROR:  overlay_branch: cannot write to a branch from a REPEATABLE READ or SERIALIZABLE transaction
+step s1_p2_rollback: ROLLBACK;
+step ctrl_p2_delta: 
+    SELECT count(*) AS delta_rows
+      FROM overlay_branch.pg_branch_delta d
+      JOIN overlay_branch.pg_branch b USING (branch_id)
+     WHERE b.branch_name = 'bs_rr_write';
+
+delta_rows
+----------
+         1
+(1 row)
+
+step ctrl_p2_main: SELECT count(*) AS main_rows FROM public.t_rr;
+main_rows
+---------
+      100
+(1 row)
+

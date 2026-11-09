@@ -115,9 +115,12 @@ INSERT is additionally returned.
 
 ### 1.3 Apply semantics & conflict detection
 
-`apply_branch` re-validates the branch result and commits it as a new MAIN
-transaction (not `MERGE`) in an independent SPI transaction; any conflict rolls
-everything back. Order is **Pass 1 DELETE** (child→parent FK safe), **Pass 2
+`apply_branch` re-validates the branch result and merges it into MAIN (not
+`MERGE`) **inside the caller's transaction** — there is no autonomous/independent
+SPI transaction; the 3-pass DML and the catalog state updates share the caller's
+xact, so any conflict, error, or crash rolls everything back together (`applying`
+reverts to `active` via MVCC). Order is **Pass 1 DELETE** (child→parent FK safe),
+**Pass 2
 UPDATE** (conflict detection here), **Pass 3 INSERT** (parent→child FK safe).
 
 Conflict detection uses `old_version = "<blk>:<off>-x<xmin>"` (`ctid:xmin`): the
@@ -341,13 +344,26 @@ The iterator's per-row slot and its copies live in a child context reset on ever
 
 ```
 Layer 4  semantic correctness     SNAPSHOT mode MAIN freeze / LIVE mode delta visible
-Layer 3  write-path protection    state in {applying, applied, discarded} rejects delta writes
-Layer 2  xact-level exclusion     branch-level advisory lock; CAS-gated, apply/discard only
+Layer 3  write-path protection    delta write takes the branch ShareLock first; then
+                                  state in {applying, applied, discarded} rejects it
+Layer 2  xact-level exclusion     branch advisory lock: writers ShareLock, apply/discard
+                                  non-blocking ExclusiveLock
 Layer 1  invalidation awareness   NOTIFY + threshold SPI fallback recheck
 ```
 
-Correctness does not hinge on any single layer: Layer 1's NOTIFY is an
-optimization, and Layer 2's advisory lock is auxiliary to the Layer 3 CAS.
+Correctness does not hinge on any single layer. Layer 1's NOTIFY is an
+optimization. The cross-session freeze of `applying` hinges on Layer 2 (the
+writer's `ShareLock`), because Layer 3's state check alone is MVCC-blind to the
+apply transaction's **uncommitted** `applying` version (§3.4).
+
+**Isolation-level requirement.** The freeze rests on an advisory lock plus a
+*fresh* state re-read after any lock wait. Neither mechanism can see past a
+transaction-snapshot snapshot, so the feature requires **READ COMMITTED**. Under
+`REPEATABLE READ` / `SERIALIZABLE` (`IsolationUsesXactSnapshot()`) every read is
+served from the fixed transaction snapshot, a concurrent apply/discard commit
+stays invisible, and a late delta write could slip past the freeze to append an
+orphan row. `use_branch` and the delta-write path therefore reject those
+isolation levels with `0A000` rather than corrupt silently (§3.3, §3.4).
 
 ### 3.2 Layer 1 - cross-session state invalidation
 
@@ -378,23 +394,46 @@ silently.
 ### 3.3 Layer 2 - branch-level advisory lock
 
 The advisory key is a magic high-16-bit namespace OR'd with the low 32-bit
-`branch_id`, mapped onto PG's `pg_advisory_xact_lock(int8)` locktag; only
-`ExclusiveLock` is ever taken, by the apply/discard CAS winner.
+`branch_id`, mapped onto PG's `pg_advisory_xact_lock(int8)` locktag. Two lock
+modes are used on the *same* key, both transaction-scoped (auto-released on
+COMMIT / ABORT):
 
-| | use_branch | apply X | discard X |
+- **`ShareLock` — delta writers.** `overlay_delta_insert` takes it **blocking**
+  at the top of every delta write and holds it for the rest of the transaction.
+  Re-acquiring it in the same xact is a no-op, so a bulk write pays one acquire.
+  The state re-read that follows (§3.4) runs only on a *newly* acquired lock:
+  `LOCKACQUIRE_OK` (first Share this xact) and `LOCKACQUIRE_NOT_AVAIL` (blocked
+  behind an in-flight apply/discard) both re-read; `LOCKACQUIRE_ALREADY_HELD` is
+  skipped, because the held lock pins the state until the transaction ends.
+- **`ExclusiveLock` — the apply/discard CAS winner**, taken **non-blocking**
+  (`dontWait`). A failed acquire raises ERROR 55000 immediately, before the CAS.
+
+| | writer Share | apply X (dontWait) | discard X (dontWait) |
 |---|---|---|---|
-| use_branch (no lock) | compatible | compatible at lock level (kickout via Layer 1/3) | compatible at lock level |
-| apply X | - | conflict | conflict |
-| discard X | - | conflict | conflict |
+| writer Share | compatible | conflict | conflict |
+| apply X | conflict | conflict | conflict |
+| discard X | conflict | conflict | conflict |
 
-`use_branch` takes **no** advisory lock (it only reads state); apply/discard take
-it after resolving the bid and before the state check, always before the first
-user-table `RowExclusiveLock` or catalog UPDATE. Strict order: advisory →
-user-table `RowExclusiveLock` (inside the 3-pass) → catalog locks. The historical
-V0 protocol (use takes `ShareLock`, apply/discard upgrade it) is deleted: two
-upgraders is PostgreSQL's classic 40P01 deadlock with no automatic break. After
-the change no shared→exclusive upgrade edge exists, so the wait-for graph cannot
-cycle; the CAS is the primary mutex and the advisory lock is auxiliary.
+`use_branch` takes **no** advisory lock (it only reads state). apply/discard
+resolve the bid, then acquire the lock before the state check and before the
+first user-table `RowExclusiveLock` or catalog UPDATE. Strict order: advisory →
+user-table `RowExclusiveLock` (inside the 3-pass) → catalog locks.
+
+**Isolation requirement.** `use_branch` and every delta write reject
+`IsolationUsesXactSnapshot()` (REPEATABLE READ / SERIALIZABLE) with `0A000`: the
+lock-then-re-read freeze is meaningless when reads cannot advance past the
+transaction snapshot (§3.1). Leaving branch mode (`use_branch(NULL)`) stays
+allowed — it only cleans up session state.
+
+**Why `dontWait` (and no upgrade edge).** Making apply/discard block on
+`ExclusiveLock` would reintroduce the historical V0 40P01: a session that wrote
+delta (holding `ShareLock`) and then applies/discards the *same* branch requests
+a `ShareLock → ExclusiveLock` upgrade, PostgreSQL's classic unbreakable upgrade,
+and two such sessions deadlock. With a non-blocking acquire the wait-for graph
+has a single direction — **only writers wait (behind an in-flight apply/discard);
+apply and discard never wait** — so it cannot cycle. The trade-off: apply/discard
+fail fast with ERROR 55000 when a writer (or another apply/discard) holds the
+lock, and the user retries once that transaction ends.
 
 ### 3.4 Layer 3 - `applying` transient state + delta-write guard
 
@@ -418,10 +457,34 @@ applies cannot both observe `active`; the final UPDATE predicate is
 makes readers see the pre-UPDATE tuple (`active`). A catch-block restore would
 fight MVCC and could wipe a genuine terminal state.
 
-**delta-insert barrier.** At the top of `overlay_delta_insert`, before any SPI, a
-plain state SELECT (no row lock, to stay usable in a STABLE function) rejects
-`state != 'active'` with ERROR 55000. Every delta write funnels through this one
-function.
+**delta-insert barrier (lock + state).** At the top of `overlay_delta_insert`,
+before any SPI, the writer (1) takes the blocking xact-scoped `ShareLock` (§3.3)
+and (2) runs a state SELECT that rejects `state != 'active'` with ERROR 55000.
+Every delta write funnels through this one function.
+
+The state SELECT **must not** run on the statement's active snapshot. A single
+long statement (e.g. `INSERT ... SELECT pg_sleep(...)`) can take its snapshot
+before a concurrent apply commits and reach the delta write afterwards, at which
+point its statement snapshot still reads the pre-apply `active` while the branch
+is already terminal — the writer would then append an orphan delta row. The
+check therefore reads a **fresh** snapshot (`read_only = false` →
+`GetTransactionSnapshot()`, recomputed per call under READ COMMITTED), not the
+frozen statement snapshot. It is skipped entirely on the
+`LOCKACQUIRE_ALREADY_HELD` fast path (§3.3): a Share taken earlier in the same
+transaction already verified `active` and pins the state until the transaction
+ends.
+
+The lock is what actually freezes `applying` **across sessions**. `applying`
+exists only as the apply transaction's **uncommitted** heap version, so it is
+invisible to every other session's MVCC snapshot — a plain state SELECT cannot
+see it, and `state='applying'` is therefore *not* a cross-session signal on its
+own. An advisory lock, being transaction-scoped rather than MVCC-scoped, is. So a
+writer arriving while an apply is mid-flight blocks on the apply's
+`ExclusiveLock`, resumes only after the apply ends, then reads the committed
+terminal state (`applied`) and is rejected; a writer that got there first makes
+the apply fail fast (its `dontWait` `ExclusiveLock` is refused). Either way the
+invariant holds: no delta row is written while an apply is in progress, and no
+in-flight (uncommitted) delta is ever merged.
 
 ### 3.5 Layer 4 - SNAPSHOT vs LIVE mode
 
@@ -459,8 +522,10 @@ fresh ReScan costs O(|MAIN| + |DELTA|).
 
 ### 3.7 Apply/discard idempotency and the D→U→I replay
 
-The step 1.5 row count is the single winner gate; a loser gets ERROR 55000
-without blocking, and a second apply (or discarding an applied/discarded branch)
+The apply/discard `ExclusiveLock` acquire is non-blocking (§3.3): a concurrent
+apply/discard, or an apply while a delta writer is in flight, fails fast with
+ERROR 55000. Once the lock is held, the step 1.5 CAS row count is the inner
+winner gate; a second apply (or discarding an applied/discarded branch)
 also errors immediately. The delta is replayed as **D → U → I** (delete
 conflicting keys first, then update, then insert) to avoid unique-constraint
 conflicts on insert; conflict detection uses the `ctid:xmin` token re-fetched
@@ -831,8 +896,9 @@ built with set-based DML so `M` stays controllable. Output goes to
    abort path.
 6. **Cross-SPI memory lives in `TopMemoryContext`**, copied out before
    `SPI_finish()`; error-path copies use the caller's context (§2.8).
-7. **`use_branch` takes no lock; apply/discard use CAS** — no shared→exclusive
-   upgrade edge, hence deadlock-free (§3.3).
+7. **Writers hold `ShareLock`, apply/discard a non-blocking `ExclusiveLock`** on
+   the branch advisory key; `use_branch` takes none — only writers ever wait, so
+   there is no upgrade edge and no cycle (§3.3).
 8. **Observers never run destructive cleanup** — kickout runs only on the DML
    path (§3.2).
 9. **Branch identity is bound once per statement** — `bid`/`mode`/`stmt_snap` from
@@ -844,6 +910,13 @@ built with set-based DML so `M` stays controllable. Output goes to
     (§1.3, §3.7).
 12. **Latest-wins delta, no double apply** — the delta PK guarantees one row per
     key; the D→U→I replay NOPs on an empty net change (§3.7, §5.5).
+13. **Branch operations require READ COMMITTED** — `use_branch` and the delta
+    write reject `IsolationUsesXactSnapshot()` (REPEATABLE READ / SERIALIZABLE)
+    with `0A000`; the freeze cannot observe a concurrent commit past a
+    transaction snapshot (§3.1, §3.3).
+14. **The delta-write state check reads a fresh snapshot** — never the statement's
+    active snapshot, which may predate a concurrent apply commit; it re-runs only
+    on a newly acquired `ShareLock` (§3.4).
 
 ### 6.2 Corner cases
 

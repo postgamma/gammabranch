@@ -41,7 +41,7 @@
   - [6.3 Applying Guard + Kickout Invalidation & New Helpers](#63-applying-guard--kickout-invalidation--new-helpers)
   - [6.4 list_branches() Identity and drift guard Fields](#64-list_branches-identity-and-drift-guard-fields)
   - [6.5 get_branch_identity() — Identity and Recovery Binding](#65-get_branch_identity--identity-and-recovery-binding)
-  - [6.6 Fast Return for Empty Branch Apply/Discard](#66-fast-return-for-empty-branch-applydiscard)
+  - [6.6 Isolation Level: READ COMMITTED Required](#66-isolation-level-read-committed-required)
   - [6.7 DDL RESTRICTED Inside an Active Branch](#67-ddl-restricted-inside-an-active-branch)
   - [6.8 No-PK Tables (Experimental Feature)](#68-no-pk-tables-experimental-feature)
   - [6.9 Delta Size Observability](#69-delta-size-observability)
@@ -853,15 +853,19 @@ SELECT current_branch() = '';
  t
 ```
 
-#### 6.3.3 DML Blocking During the Applying State
+#### 6.3.3 DML During the Applying State
 
-While apply_branch() is running, the state first becomes `applying` and changes to `applied` only after the merge succeeds.
-DML in that branch from other sessions is blocked during this window:
+While apply_branch() runs, the target branch holds a branch-level lock until the
+apply transaction ends. A concurrent writer to the same branch first blocks on
+that lock; once apply commits and the branch is `applied`, the writer's state
+re-check rejects the write, so no row is merged into MAIN and no orphan delta row
+is left behind:
 
 ```sql
 INSERT INTO products VALUES (7, 'rush', 1);
-ERROR:  overlay_branch: state of branch "b_large" is 'applying'; write to delta
-             is forbidden while an apply is in progress. Please retry.
+-- blocks until apply_branch() commits, then:
+ERROR:  overlay_branch: cannot write delta rows to branch "b_large" (bid=3 state=applied).
+             Writes are only allowed while branch is ACTIVE.
 HINT:  ERRCODE 55000.
 ```
 
@@ -921,26 +925,27 @@ SELECT * FROM public.get_branch_identity('agent_workspace');
 
 If `registry_schema_current_match = false`, drift exists and apply is not possible; it must be handled manually.
 
-### 6.6 Fast Return for Empty Branch Apply/Discard
+### 6.6 Isolation Level: READ COMMITTED Required
 
-For an empty branch (delta is 0) that is **not currently active**, apply/discard returns quickly and does not emit the `NOTICE: overlay_branch: APPLY BRANCH ...` message:
+Branch operations require **READ COMMITTED**. Inside a `REPEATABLE READ` or `SERIALIZABLE` transaction both entering a branch and writing to an active branch fail with `0A000`:
 
 ```sql
-DO $$
-DECLARE
-    _s timestamp; _ms int;
-BEGIN
-    FOR i IN 1..5 LOOP
-        PERFORM public.create_branch('b_empty_'||i);
-        _s := clock_timestamp();
-        PERFORM public.apply_branch('b_empty_'||i);
-        _ms := round(1000 * EXTRACT(EPOCH FROM (clock_timestamp()-_s)))::int;
-        RAISE NOTICE 'empty apply #% elapsed=% ms', i, _ms;
-    END LOOP;
-END $$;
+BEGIN ISOLATION LEVEL REPEATABLE READ;
+SELECT public.use_branch('b_live');
+-- ERROR:  overlay_branch: use_branch() is not supported in a
+--         REPEATABLE READ or SERIALIZABLE transaction
+
+SELECT public.use_branch('b_live');
+INSERT INTO public.accounts VALUES (999, 1);   -- active branch, READ COMMITTED
+BEGIN ISOLATION LEVEL REPEATABLE READ;
+INSERT INTO public.accounts VALUES (1000, 1);
+-- ERROR:  overlay_branch: cannot write to a branch from a
+--         REPEATABLE READ or SERIALIZABLE transaction
 ```
 
-For non-empty branches or the currently active branch, apply/discard still takes the full path, and all NOTICEs are unchanged.
+The freeze that blocks a writer while an apply/discard is in flight re-reads the branch state after an advisory-lock wait; under a transaction snapshot that read cannot observe a concurrent apply/discard commit. Use READ COMMITTED, or commit and retry in a new READ COMMITTED transaction.
+
+`apply_branch()` / `discard_branch()` always run the same locked path whether the branch delta is empty or not: the branch advisory lock, the atomic state transition, the schema-drift guard, the session cache flush and the state NOTIFY are identical for empty and non-empty branches.
 
 ### 6.7 DDL RESTRICTED Inside an Active Branch
 

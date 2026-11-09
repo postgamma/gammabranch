@@ -72,7 +72,7 @@ Three layers — do **not** force cross-session races into L3.
 #   PGXS does NOT support `make check`; install first, then run against a
 #   running server that has shared_preload_libraries='overlay_branch'.
 make installcheck USE_PGXS=1
-#   accept: L3 "ok 1..21" + "# All 21 tests passed.", L1 15/15, 0 diff
+#   accept: L3 "ok 1..21" + "# All 21 tests passed.", L1 16/16, 0 diff
 ```
 
 - **L2** — `pgbench` stress harness under `test/bench/`, run manually; see
@@ -95,7 +95,7 @@ column-width diffs in `mvcc_review` / `rentry`. Use `LC_ALL=C.utf8`.
    files behind.
 
 **Green-Bar = definition of "delivered"** — ALL of: 0-warning build,
-**two independent clean rebuilds**, and after rebuild #2 L3 21/21 + L1 15/15
+**two independent clean rebuilds**, and after rebuild #2 L3 21/21 + L1 16/16
 with both `diff -r` = 0 lines.
 
 ---

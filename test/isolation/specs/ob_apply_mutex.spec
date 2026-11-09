@@ -1,7 +1,7 @@
 # ob_apply_mutex.spec — L1 pg_isolation_regress (T8)
 # Covers:
-#   P1(AC-A1): dual-apply mutex CAS; loser → kick ERROR "not active (state=applying)"
-#   P2(AC-A3): reverse order apply; no deadlock (FR2: no shared→exclusive upgrade)
+#   P1(AC-A1): dual-apply mutex; the loser fails fast on the branch lock (no wait)
+#   P2(AC-A3): reverse order apply; no deadlock (non-blocking ExclusiveLock, no upgrade edge)
 # I8.2: 2 permutations → 2 unique branch names (setup runs only once per spec).
 
 setup
@@ -67,11 +67,13 @@ step "ctrl_p2_setup" {
 step "ctrl_p1_state" { SELECT state FROM overlay_branch.pg_branch WHERE branch_name='bs_mutex_p1'; }
 step "ctrl_p2_state" { SELECT state FROM overlay_branch.pg_branch WHERE branch_name='bs_mutex_p2'; }
 
-# P1 (AC-A1 dual-apply mutex): both begin+use; s1 apply CAS wins; s2 apply CAS loses.
-# s2 → ERROR "branch bs_mutex_p1 is not active (state=applying)".
+# P1 (AC-A1 dual-apply mutex): both begin+use; s1 apply takes the branch ExclusiveLock
+# first; s2 apply uses a non-blocking acquire and fails fast.
+# s2 → ERROR: apply_branch(...) cannot acquire the branch lock.
 # After s1 commits: ctrl_p1_state = applied.  NO deadlock in permutation anywhere.
 permutation "ctrl_p1_setup" "s1_p1_begin" "s1_p1_use" "s2_p1_begin" "s2_p1_use" "s1_p1_apply" "s2_p1_apply" "s1_p1_commit" "s2_p1_commit" "ctrl_p1_state"
 
 # P2 (AC-A3 reverse order): s1 locks and applies first BEFORE s2 ever use+apply.
-# FR2 protocol guarantees NO shared→exclusive upgrade → no deadlock possible.
+# Apply/discard take a NON-BLOCKING ExclusiveLock, so there is no shared→exclusive
+# upgrade edge and thus no deadlock cycle is possible.
 permutation "ctrl_p2_setup" "s1_p2_begin" "s1_p2_use" "s1_p2_apply" "s2_p2_begin" "s2_p2_use" "s2_p2_apply" "s1_p2_commit" "s2_p2_commit" "ctrl_p2_state"

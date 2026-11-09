@@ -1,9 +1,9 @@
 # T8 L2 pgbench Concurrency Stress Fixture (non-gating, for manual debugging)
 
-> R7 constraint restated: correctness first, performance second. **This L2 fixture is not a `make installcheck` gate** (gates = L1 15/15 isolation specs + L3 21/21 pg_regress), and only needs to be run manually in the following scenarios:
+> R7 constraint restated: correctness first, performance second. **This L2 fixture is not a `make installcheck` gate** (gates = L1 16/16 isolation specs + L3 21/21 pg_regress), and only needs to be run manually in the following scenarios:
 > - When you want to stress-test the FR2 lock protocol under high concurrency (high-frequency CAS winner/loser)
 > - When you want to probabilistically trigger the NOTIFY path (stable long-lived LISTEN)
-> - When you want to reproduce an edge-case race that the L1 15 specs cannot cover
+> - When you want to reproduce an edge-case race that the L1 16 specs cannot cover
 
 ---
 

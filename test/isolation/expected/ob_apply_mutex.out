@@ -39,10 +39,9 @@ apply_branch
             
 (1 row)
 
-step s2_p1_apply: SELECT overlay_branch.apply_branch('bs_mutex_p1'); <waiting ...>
+step s2_p1_apply: SELECT overlay_branch.apply_branch('bs_mutex_p1');
+ERROR:  overlay_branch: apply_branch("bs_mutex_p1") cannot acquire the branch lock
 step s1_p1_commit: COMMIT;
-step s2_p1_apply: <... completed>
-ERROR:  overlay_branch: apply_branch("bs_mutex_p1") CAS state transition refused (SPI_processed=0 != 1); branch no longer ACTIVE)
 step s2_p1_commit: COMMIT;
 step ctrl_p1_state: SELECT state FROM overlay_branch.pg_branch WHERE branch_name='bs_mutex_p1';
 state  
@@ -90,10 +89,9 @@ use_branch
           
 (1 row)
 
-step s2_p2_apply: SELECT overlay_branch.apply_branch('bs_mutex_p2'); <waiting ...>
+step s2_p2_apply: SELECT overlay_branch.apply_branch('bs_mutex_p2');
+ERROR:  overlay_branch: apply_branch("bs_mutex_p2") cannot acquire the branch lock
 step s1_p2_commit: COMMIT;
-step s2_p2_apply: <... completed>
-ERROR:  overlay_branch: apply_branch("bs_mutex_p2") CAS state transition refused (SPI_processed=0 != 1); branch no longer ACTIVE)
 step s2_p2_commit: COMMIT;
 step ctrl_p2_state: SELECT state FROM overlay_branch.pg_branch WHERE branch_name='bs_mutex_p2';
 state  
