@@ -594,28 +594,29 @@ AS 'MODULE_PATHNAME', 'overlay_branch_force_invalidation_check';
 --     3. public.pg_branch view is still readable by PUBLIC (it only
 --        carries metadata: name, state, mode, counts, owner oid).
 --        public.pg_branch_delta view is revoked from PUBLIC — delta
---        rows contain full user-visible data; only the extension's
---        own SPI (running as extension owner / authenticated C code)
---        should read/write it directly.
---     4. public.* lifecycle-function synonyms grant EXECUTE only to
---        overlay_branch_administrators (plus the extension installation
---        owner, which keeps the default usage).  The matching C
---        wrappers perform the SAME check again via ob_acl_check_lifecycle
---        so that direct calls qualified with @extschema@ (which would
---        bypass public synonyms) are still 42501.
+--        rows contain full user-visible data; only the administrator
+--        role may read/write it directly.
+--     4. public.* lifecycle-function synonyms keep PUBLIC EXECUTE so the
+--        enforcement point is single and unambiguous: the C-level
+--        ob_acl_check_lifecycle() gate, which is unharmed by qualification
+--        games (@extschema@ vs public).  Non-admin callers therefore get a
+--        uniform 42501 rather than a raw table-level denial.
 --
 --   Layer 2 (C code):
 --     See branch_lifecycle.c ob_acl_check_lifecycle(OB_OP_*, name).
---     owner column from pg_branch.owner is re-checked inside C code,
---     which means (superuser OR mgmt role OR branch owner) is the final
---     truth-table regardless of how the function was invoked.
+--     The current user is re-checked inside C code, which means
+--     (superuser OR mgmt role) is the final truth-table regardless of
+--     how the function was invoked.
 --
 --   Privilege matrix (explicit because roles may be installed later at
---   upgrade time):
+--   upgrade time).  Branch administration is privileged end to end: the
+--   pg_branch / pg_branch_delta catalogs carry DML only for the
+--   administrator role, so a plainer caller could never complete the
+--   underlying work regardless of the C gate:
 --     create_branch                         -> superuser | mgmt
---     use_branch / use_branch(name, mode)   -> branch owner | superuser | mgmt
+--     use_branch / use_branch(name, mode)   -> superuser | mgmt
 --         EXCEPTION: use_branch(NULL/empty) -> always allowed (exit branch)
---     apply_branch / discard_branch         -> branch owner | superuser | mgmt
+--     apply_branch / discard_branch         -> superuser | mgmt
 --
 -- NOTE: "overlay_branch_administrators" is the ONLY role recognised by
 -- both layers.  DO NOT rename it without also updating the C macro
@@ -627,7 +628,7 @@ BEGIN
     IF NOT EXISTS (SELECT 1 FROM pg_catalog.pg_roles WHERE rolname = 'overlay_branch_administrators') THEN
         CREATE ROLE overlay_branch_administrators NOLOGIN;
         COMMENT ON ROLE overlay_branch_administrators IS
-            'Members may create overlay branches and administer any branch. Owners of a specific branch implicitly have use/apply/discard privileges on their own branch without being added to this role.';
+            'Members may create overlay branches and administer any branch (use/apply/discard). Branch creation and administration are restricted to this role and superusers.';
     END IF;
 END$$;
 
@@ -637,22 +638,20 @@ REVOKE ALL ON SEQUENCE @extschema@.pg_branch_branch_id_seq FROM PUBLIC;
 -- SCHEMA @extschema@ USAGE is GRANTed to PUBLIC so that SECURITY INVOKER
 -- public.* synonym wrappers (which SET search_path TO @extschema@, pg_catalog)
 -- can resolve @extschema@.<c_fn> inside their body even when the caller is
--- a plain non-superuser (branch owner) without any explicit privileges on the
--- extension schema.
+-- a plain non-superuser without any explicit privileges on the extension
+-- schema.
 GRANT USAGE ON SCHEMA @extschema@ TO PUBLIC;
 -- §G02 S13 catalog-level permissions (on top of public.* synonym views):
---   * @extschema@.pg_branch (TABLE) — branch metadata.  MGMT role needs
---     full DML + SELECT because create_branch_internal() INSERTs here as
---     the caller (SPI runs as GetUserId()).  OWNER of a branch needs to
---     SELECT owner at minimum — we open SELECT to PUBLIC because
---     public.pg_branch VIEW already exposes the same columns GRANT SELECT
---     TO PUBLIC below; being explicit on the base table matches
---     ob_user_is_branch_owner's use of the base table in SPI and keeps
---     audit symmetric.
---   * @extschema@.pg_branch_delta (TABLE) + sequence — MGMT only; OWNER
---     read/write of delta rows flows through the C wrappers which are
---     guarded by the owner matrix, but raw table-level access is revoked
---     (matching R22 business-data no-leak).
+--   * @extschema@.pg_branch (TABLE) — branch metadata.  Administrator role
+--     needs full DML + SELECT because create_branch_internal() INSERTs here
+--     as the caller (SPI runs as GetUserId()).  SELECT is opened to PUBLIC
+--     because the public.pg_branch VIEW already exposes the same columns;
+--     the explicit base-table grant keeps audit symmetric.
+--   * @extschema@.pg_branch_delta (TABLE) + sequence — administrator role
+--     only; raw table-level access is revoked from PUBLIC (R22
+--     business-data no-leak).  Branch writes flow through the C wrappers,
+--     which run as the caller, so the administrator role is the single
+--     authority for delta I/O.
 GRANT SELECT, INSERT, UPDATE, DELETE ON TABLE @extschema@.pg_branch       TO overlay_branch_administrators;
 GRANT SELECT                                   ON TABLE @extschema@.pg_branch       TO PUBLIC;
 GRANT SELECT, INSERT, UPDATE, DELETE ON TABLE @extschema@.pg_branch_delta TO overlay_branch_administrators;
@@ -700,7 +699,7 @@ REVOKE ALL ON public.pg_branch_delta FROM PUBLIC;
 --   - A second and non-bypassable ACL check
 --     (ob_acl_check_lifecycle) is run at the TOP of every
 --     C-exported wrapper using GetUserId() — this is the actual
---     owner/superuser/mgmt-role gate, so even the extension
+--     superuser/mgmt-role gate, so even the extension
 --     installation superuser cannot bypass it.
 --   - Metadata-only helpers (current_branch/list_branches/
 --     is_active/force_invalidation_check) stay SECURITY INVOKER
@@ -791,14 +790,11 @@ AS $$SELECT * FROM @extschema@.branch_delta_stats(b_name)$$;
 -- SQL-language wrapper.  Users can always qualify with the schema, and
 -- Step 4 will introduce a more usable signature.
 
--- §G02 S13: lifecycle synonyms are declared SECURITY DEFINER (see the
--- public-synonyms block above) so callers without @extschema@ SCHEMA
--- USAGE can still reach the C wrappers; the non-bypassable ACL check
--- lives at the very top of each C-exported wrapper.  We keep PUBLIC
--- EXECUTE on the synonyms here so that branch OWNERS (not members of
--- overlay_branch_administrators) can still run use/apply/discard_branch
--- on their own branches — the C-level check enforces owner-or-mgmt
--- matrix for every call.
+-- §G02 S13: lifecycle synonyms are declared SECURITY INVOKER with a fixed
+-- search_path, so the C wrappers see the real caller.  PUBLIC EXECUTE is
+-- kept on the synonyms; the non-bypassable ACL check lives at the very top
+-- of each C-exported wrapper, which enforces the superuser/mgmt matrix and
+-- raises a uniform 42501 for everyone else.
 --
 -- Metadata-only helpers stay PUBLIC EXECUTE by default (no-op).
 GRANT EXECUTE ON FUNCTION public.create_branch(name)      TO PUBLIC;

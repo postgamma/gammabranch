@@ -549,6 +549,7 @@ overlay_delta_count(int32 branch_id)
 	StringInfoData sql;
 	int			ret;
 	int64		result = 0;
+	volatile bool did_connect = false;
 
 	initStringInfo(&sql);
 	appendStringInfo(&sql,
@@ -556,22 +557,48 @@ overlay_delta_count(int32 branch_id)
 					 "WHERE branch_id = %d",
 					 branch_id);
 
-	ret = ob_spi_one_shot(sql.data, true, 1);
-	if (ret != SPI_OK_SELECT)
+	/* PG_TRY guarantees our own SPI_connect() is matched by an SPI_finish()
+	 * even when SPI_execute()/SPI_getbinval() raise (e.g. a statement_timeout
+	 * during the count).  Without it the connection frame is left on the SPI
+	 * stack and every later SPI_connect() nests one level deeper, which
+	 * corrupts the memory-context save/restore for the rest of the
+	 * transaction.  did_connect keeps the cleanup scoped to our own level so
+	 * a caller that already had SPI connected is left untouched. */
+	PG_TRY();
 	{
-		SPI_finish();
-		pfree(sql.data);
-		elog(ERROR, "overlay_delta_count: SPI_execute failed ret=%d", ret);
-	}
+		ret = SPI_connect();
+		if (ret != SPI_OK_CONNECT)
+			elog(ERROR, "overlay_branch: SPI_connect failed: %d", ret);
+		did_connect = true;
 
-	if (SPI_processed > 0 && SPI_tuptable != NULL && SPI_tuptable->vals != NULL)
-	{
-		bool	isnull;
-		Datum	d = SPI_getbinval(SPI_tuptable->vals[0],
-								  SPI_tuptable->tupdesc, 1, &isnull);
-		if (!isnull)
-			result = DatumGetInt64(d);
+		/* Deterministic error injection for the SPI cleanup test: raise with
+		 * SPI still connected so the PG_CATCH below is the only thing that
+		 * can close the frame. */
+		if (ob_debug_delta_count_error)
+			elog(ERROR, "overlay_branch: injected delta-count error "
+						"(_debug_delta_count_error)");
+
+		ret = SPI_execute(sql.data, true, 1);
+		if (ret != SPI_OK_SELECT)
+			elog(ERROR, "overlay_delta_count: SPI_execute failed ret=%d", ret);
+
+		if (SPI_processed > 0 && SPI_tuptable != NULL &&
+			SPI_tuptable->vals != NULL)
+		{
+			bool	isnull;
+			Datum	d = SPI_getbinval(SPI_tuptable->vals[0],
+									  SPI_tuptable->tupdesc, 1, &isnull);
+			if (!isnull)
+				result = DatumGetInt64(d);
+		}
 	}
+	PG_CATCH();
+	{
+		if (did_connect)
+			SPI_finish();
+		PG_RE_THROW();
+	}
+	PG_END_TRY();
 
 	SPI_finish();
 	pfree(sql.data);
@@ -599,7 +626,7 @@ ob_delta_size_warn_check(int32 branch_id)
 	static bool s_warned = false;
 	int64		n;
 	const char *branch_name;
-	bool		snap_pushed = false;
+	volatile bool snap_pushed = false;
 
 	if (ob_delta_size_warn_rows <= 0 || s_warned)
 		return;
@@ -936,21 +963,40 @@ reconstruct_slot_from_delta(Relation rel, bytea *tuple_data,
 	htup = SPI_tuptable->vals[0];
 	td_spi = SPI_tuptable->tupdesc;
 
-	for (int a = 0; a < natts; a++)
+	/* td_spi layout is (non-dropped attributes in attnum order), matching the
+	 * colspec built above -- dropped columns were skipped there too.  Map each
+	 * physical attribute to its result column so a dropped column cannot shift
+	 * the columns that follow it (SPI_getbinval returns NULL, not an error, for
+	 * an out-of-range fnumber, so an unmapped read would silently blank the
+	 * tail columns instead of failing loudly).  Same convention as
+	 * fetch_tuple_by_ctid(). */
 	{
-		bool			isnull;
-		Form_pg_attribute ratt = TupleDescAttr(reldesc, a);
-		Datum			d;
+		int			spi_col_idx = 0;
 
-		d = SPI_getbinval(htup, td_spi, a + 1, &isnull);
-		out_slot->tts_isnull[a] = isnull;
-		if (!isnull)
+		for (int a = 0; a < natts; a++)
 		{
-			/* RD-3: reuse the attribute's own attlen/attbyval (kept in sync
-			 * with pg_type) instead of a per-column get_typlenbyval(). */
-			d = datumCopy(d, ratt->attbyval, ratt->attlen);
+			bool			isnull;
+			Form_pg_attribute ratt = TupleDescAttr(reldesc, a);
+			Datum			d;
+
+			if (ratt->attisdropped)
+			{
+				out_slot->tts_isnull[a] = true;
+				out_slot->tts_values[a] = (Datum) 0;
+				continue;
+			}
+
+			spi_col_idx++;
+			d = SPI_getbinval(htup, td_spi, spi_col_idx, &isnull);
+			out_slot->tts_isnull[a] = isnull;
+			if (!isnull)
+			{
+				/* RD-3: reuse the attribute's own attlen/attbyval (kept in sync
+				 * with pg_type) instead of a per-column get_typlenbyval(). */
+				d = datumCopy(d, ratt->attbyval, ratt->attlen);
+			}
+			out_slot->tts_values[a] = isnull ? (Datum) 0 : d;
 		}
-		out_slot->tts_values[a] = d;
 	}
 	ExecStoreVirtualTuple(out_slot);
 	out_slot->tts_nvalid = natts;

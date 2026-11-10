@@ -113,6 +113,15 @@ INSERT INTO products VALUES
 
 > All operations are performed via `public.*` function calls; the schema qualifier may be omitted.
 
+> **Permissions.** Branch administration is privileged. `create_branch`,
+> `use_branch`, `apply_branch` and `discard_branch` require a superuser or a
+> member of the reserved role `overlay_branch_administrators`; any other
+> caller gets `42501 insufficient_privilege`. Leaving a branch
+> (`use_branch(NULL)`) and the read-only metadata helpers
+> (`current_branch` / `list_branches`) are open to everyone. The
+> `pg_branch.owner` column records who created the branch; it is not an
+> authority grant.
+
 ### 1.1 create_branch() — Create a Branch
 
 ```sql
@@ -557,6 +566,7 @@ The following scenarios are **explicitly rejected** (they do not silently pass t
 | DML on a VIEW / MATVIEW / FOREIGN TABLE | Rejected | Intercepted by the guard |
 | **COPY FROM / MERGE / Data-Modifying CTE** | Rejected | `0A000 feature_not_supported` |
 | **UPDATE SET pk_col = ...** (change the primary key) | Rejected | `Updating the PRIMARY KEY column ... is not supported` |
+| **UPSERT ... DO UPDATE SET pk_col = ...** (change the primary key) | Rejected | `overlay_branch does not support UPSERT ON CONFLICT DO UPDATE that modifies primary key columns` |
 | Insufficient privilege to call use/apply/discard/create | Rejected | `42501 insufficient_privilege` |
 
 ### 5.1 UPSERT Implementation Example
@@ -593,6 +603,37 @@ SELECT * FROM products WHERE id = 100;
  id  | name  | price
 -----+-------+-------
  100 | First |     1
+
+-- ON CONFLICT DO UPDATE ... WHERE: the predicate gates the update (both slots
+-- it references -- the existing row and EXCLUDED -- are honored)
+INSERT INTO products VALUES (3, 'Cherry_v3', 333)
+  ON CONFLICT (id) DO UPDATE SET name = EXCLUDED.name, price = EXCLUDED.price
+  WHERE products.price < EXCLUDED.price;
+SELECT * FROM products WHERE id = 3;
+ id |   name    | price
+----+-----------+-------
+  3 | Cherry_v3 |   333
+
+-- Multi-row UPSERT: every conflicting row in the batch is merged against its
+-- own EXCLUDED tuple (works for several conflicting rows in one statement)
+INSERT INTO products VALUES (1, 'Apple2', 20), (3, 'Cherry_v4', 444)
+  ON CONFLICT (id) DO UPDATE SET name = EXCLUDED.name, price = EXCLUDED.price;
+SELECT * FROM products WHERE id IN (1, 3) ORDER BY id;
+ id |   name    | price
+----+-----------+-------
+  1 | Apple2    |    20
+  3 | Cherry_v4 |   444
+
+-- Repeated UPSERT on the same key: the branch delta shadows MAIN, so a second
+-- UPSERT -- or any UPSERT after an UPDATE -- builds on the branch's own latest
+-- value.  Columns absent from the SET list keep that value, not MAIN's.
+UPDATE products SET price = 999 WHERE id = 3;
+INSERT INTO products VALUES (3, 'Cherry_v5', 5)
+  ON CONFLICT (id) DO UPDATE SET name = EXCLUDED.name;
+SELECT * FROM products WHERE id = 3;
+ id |   name    | price
+----+-----------+-------
+  3 | Cherry_v5 |   999
 ```
 
 ### 5.2 Data-Modifying CTE: Explicit ERROR

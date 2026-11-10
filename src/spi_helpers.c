@@ -161,7 +161,7 @@ ob_spi_one_shot(const char *sql, bool read_only, uint64 tcount)
 
 	cret = SPI_connect();
 	if (cret != SPI_OK_CONNECT)
-		elog(ERROR, "overlay_delta: SPI_connect failed: %d", cret);
+		elog(ERROR, "overlay_branch: SPI_connect failed: %d", cret);
 
 	eret = SPI_execute(sql, read_only, tcount);
 	return eret;

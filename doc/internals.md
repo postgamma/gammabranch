@@ -175,15 +175,18 @@ change; `SET col = NULL` is stored as JSON `null`); serialize PK/tuple; write th
 delta row.
 
 **INSERT + UPSERT** does a 2-phase conflict check (delta, then MAIN) and
-dispatches on `(main_hit, pure_hit, oc_action)`:
+dispatches on `(main_hit, pure_hit, oc_action)`. The delta is the latest visible
+version — it shadows MAIN — so a delta hit always wins: both the `WHERE`
+predicate and the `SET` post-image are evaluated against the delta row when one
+exists, never the stale MAIN row.
 
 | main_hit | pure_hit | oc_action | promo | Meaning |
 |---|---|---|---|---|
 | false | false | NONE/DO_UPD/DO_NOTHING | 1 | no conflict → plain INSERT |
 | any | any | DO_NOTHING | 0 | skip |
-| true | false | DO_UPD + WHERE ok | 2 | UPDATE MAIN row |
+| true | false | DO_UPD + WHERE ok | 2 | UPDATE MAIN row (first touch) |
 | false | true | DO_UPD + WHERE ok | 3 | UPDATE pure-delta row |
-| true | true | DO_UPD + WHERE ok | 2 | MAIN wins the tie-break |
+| true | true | DO_UPD + WHERE ok | 3 | delta shadows MAIN |
 
 **Pure-delta post-processing**: rows living only in the delta (op I/U) are never
 seen by the UPDATE/DELETE subplan (which scans only MAIN). A post-pass collects
@@ -194,6 +197,26 @@ inserted rows.
 
 **RETURNING** captures the affected rows into slots in `es_query_cxt` and replays
 them through `dest->receiveSlot()`.
+
+A UPSERT whose `DO UPDATE SET` targetlist touches a PK column is refused
+(`0A000`, promo 2/3) before any delta write: the delta row is keyed by the
+conflict identity (pre-image PK), so a mutated post-image PK would desync
+the delta key from the payload, exactly as on the plain UPDATE path.
+
+**Slot aliasing: `WHERE` evaluation and the promo SET-merge.** Both the
+`DO UPDATE ... WHERE` predicate and the promo 2/3 `SET` projection run with the
+ModifyTable per-tuple `ExprContext` bound to slots the write path does not own:
+`ecxt_scantuple` is the caller's live pre-image slot and `ecxt_innertuple` is
+the plan's EXCLUDED slot (the subplan's current-row slot). Both are consumed
+again afterwards, and on a **multi-row** UPSERT the EXCLUDED slot is the very
+same subplan slot that `ExecProcNode` refills for the *next* row. The evaluation
+must therefore save and restore the incoming `ecxt_*` pointers rather than
+`ExecClearTuple` them. Clearing marks the caller's slot empty — `TupIsNull()`
+then misreports a populated row as NULL (the `WHERE` case), and on the following
+promo 2/3 row it releases the tuple behind the freshly fetched row's EXCLUDED
+values, so a varlena `EXCLUDED.*` read faults on freed memory (the multi-row
+`SET` case, observed as "compression method lz4 not supported"). Any slot handed
+to an `ExprContext` and read afterwards follows this save/restore discipline.
 
 ### 1.7 Incremental read path
 
@@ -222,15 +245,20 @@ a session-private TEMP whitelist. At the very top of the executor intercept,
 `standard_ExecutorRun` without the redirect raises ERROR 55000 (write-through
 choke).
 
-**ACL double-defense** — the SQL layer REVOKEs from PUBLIC and grants only to
-`overlay_branch_administrators` (the `public.*` synonyms are `SECURITY INVOKER`
-with a fixed `search_path`); the C layer runs `ob_acl_check_lifecycle()` as the
-first line of every SQL-callable wrapper, raising 42501 on denial. Effective
-identities: superuser; a member of the reserved NOLOGIN role
-`overlay_branch_administrators`; or the branch owner. CREATE_BRANCH requires
-superuser/mgmt (no self-create, avoiding resource DoS); USE/APPLY/DISCARD also
-allow the owner; exiting to Main is open to everyone. apply/discard are
-idempotent, and a discarded row is kept as `state='discarded'` for audit.
+**ACL double-defense** — branch administration is privileged. The SQL
+layer grants DML on `pg_branch` / `pg_branch_delta` only to
+`overlay_branch_administrators` (delta is revoked from PUBLIC — R22
+business-data no-leak); the C layer runs `ob_acl_check_lifecycle()` as the
+first line of every SQL-callable wrapper, raising a uniform 42501 on
+denial. The `public.*` synonyms are `SECURITY INVOKER` with a fixed
+`search_path` and are not the enforcement point. Effective identities:
+superuser, or a member of the reserved NOLOGIN role
+`overlay_branch_administrators`. CREATE/USE/APPLY/DISCARD all require that
+identity (the branch catalogs they touch are DML-able only by it, so a
+plainer caller could never complete the work); exiting to Main is open to
+everyone. The `pg_branch.owner` column is provenance metadata, not an
+authority grant. apply/discard are idempotent, and a discarded row is kept
+as `state='discarded'` for audit.
 
 ---
 
@@ -296,6 +324,15 @@ re-filtered by `scan.plan.qual`. Correctness rests on `scan.plan.qual` always
 re-checking and on the Pass 2 orphan rule restoring rows moved into range by a
 branch UPDATE.
 
+**Volatile clauses are never pushed down.** A `contain_volatile_functions()`
+guard keeps any volatile clause out of the hidden SPI MAIN query. The clause is
+otherwise evaluated twice — once by the SPI query to select MAIN rows and again
+by `scan.plan.qual` row by row — so the two evaluations can disagree (silently
+dropping the MAIN rows the SPI pass filtered out) and any side effect
+(`nextval()`, ...) fires twice. Stable/immutable clauses are safe: the SPI query
+runs in the same statement and snapshot, so both sites see the same value. The
+guard is exercised by `test/regress/sql/overlay_branch_pushdown.sql`.
+
 ### 2.5 DML-target BranchScan (ACC-1)
 
 The hook injects only for `CMD_SELECT` by default, so the UPDATE/DELETE subplan
@@ -335,6 +372,20 @@ finish; error-path message copies instead go to the caller's context (the error
 path never returns, so a `TopMemoryContext` copy would leak on every failure).
 The iterator's per-row slot and its copies live in a child context reset on every
 `next()`, otherwise memory grows linearly with the scan (§5.2, MF-1).
+
+**`PG_TRY`/`PG_CATCH` locals must be `volatile`.** A local written inside a
+`PG_TRY` block and read inside its `PG_CATCH` is *indeterminate* after the
+`longjmp` (C99 7.13.2.1) unless declared `volatile`; the catch can then read the
+initializer (e.g. `false`) and skip a cleanup (`SPI_finish()`, `PopActiveSnapshot()`)
+it must run. Every such flag — `overlay_delta_count()`'s `did_connect`,
+`ob_delta_size_warn_check()`'s `snap_pushed`, the PK point-lookup block's
+`pushed_snap_`/`pop_done_`, `ob_check_publication()`'s `spi_connected` — is
+declared `volatile` for this reason; the missed cleanup otherwise surfaces as a
+`transaction left non-empty SPI stack` / `still active` WARNING at COMMIT.
+`overlay_branch._debug_delta_count_error` (bool, `PGC_SUSET`, default off) is a
+debug hook that makes the internal delta-count statement raise right after
+`SPI_connect()`, driving this cleanup path deterministically in
+`test/regress/sql/overlay_branch_deltastats.sql` (Section F).
 
 ---
 
@@ -508,6 +559,17 @@ the delta (delta reads use the latest snapshot).
 `overlay_branch.snapshot_max_hold_minutes` (default 10 min) forcibly exits branch
 mode on timeout.
 
+The forced exit is a *local* kickout (no SPI round-trip), so its diagnostic must
+name the TTL reason rather than the generic "invalidated by another session"
+text; the error hint reports `snapshot_max_hold_minutes (R19 TTL)` and the guard
+flag is cleared before the `ereport` so a subsequent error cannot observe it.
+Because `snapshot_max_hold_minutes` is `PGC_POSTMASTER` with a one-minute floor,
+`overlay_branch._debug_snapshot_ttl_seconds` (`int`, `PGC_SUSET`, default -1,
+seconds) overrides the cap at second granularity so the kickout is reachable
+deterministically in a regression test; -1 (default) honours the production cap.
+Both the diagnostic and the debug GUC are exercised by
+`test/regress/sql/overlay_branch_rentry.sql`.
+
 ### 3.6 FR6 BranchScan ReScan freshness
 
 The older path reused the result set materialized at Begin, so a delta committed
@@ -553,7 +615,17 @@ the delta untouched, so the user can retry.
 7. GUC check/assign split: the check hook is side-effect-free read-only
    validation; the assign hook acts and never raises ERROR.
 8. Single idempotent cleanup path; recursion guards balanced under `PG_TRY`/
-   `PG_FINALLY`; C90 top-declaration is a hard build requirement.
+   `PG_FINALLY`; C90 top-declaration is a hard build requirement. The seven
+   bypass-stack flags (`ob_in_*` / the opt-in bool) are saved and restored as a
+   block on the same subxact save/restore as the executor-context stack, so an
+   error that longjmps past a matching `overlay_*_exit()` cannot leave a flag
+   stuck true for the rest of the session (a stuck flag silently disables the
+   overlay and reads fall back to MAIN).
+   Two guard-adjacent changes are **defensive and carry no dedicated regression
+   test**: the planner-hook `PG_TRY`/`PG_FINALLY` wrap (redundant given the
+   subxact save/restore plus the xact reset — its trigger, `is_active()` raising
+   during planning, is not reachable from SQL) and the `SPI_connect`-failure
+   error-prefix correction (an unreachable path).
 9. Two-step plan-cache invalidation on branch switch —
    `CacheInvalidateRelcacheAll()` **then** `CommandEndInvalidationMessages()`.
 
@@ -917,6 +989,13 @@ built with set-based DML so `M` stays controllable. Output goes to
 14. **The delta-write state check reads a fresh snapshot** — never the statement's
     active snapshot, which may predate a concurrent apply commit; it re-runs only
     on a newly acquired `ShareLock` (§3.4).
+15. **`PG_TRY`/`PG_CATCH` cleanup flags are `volatile`** — a local written in the
+    `PG_TRY` and read in the `PG_CATCH` is indeterminate after the `longjmp`
+    (C99 7.13.2.1); the abort path must still `SPI_finish()` / pop snapshots
+    (§2.8).
+16. **Volatile clauses are never pushed into the hidden SPI MAIN query** — only
+    stable/immutable clauses, so double evaluation cannot drop rows or fire a
+    side effect twice (§2.4).
 
 ### 6.2 Corner cases
 

@@ -302,28 +302,29 @@ extern BranchContext *CurrentBranchContext;
  *
  * All SQL-callable lifecycle wrappers MUST call these before dispatching
  * to the internal implementation.  The helpers implement double-layer
- * defense: (1) SQL layer limits EXECUTE to owner / builtin role
+ * defense: (1) SQL layer limits EXECUTE to the builtin role
  * `overlay_branch_administrators`; (2) C layer re-evaluates privileges
- * using the branch row's stored owner Oid, so even if someone bypasses
- * the SQL grant via direct @extschema@ qualification they still get
- * 42501.
+ * using the current user, so even if someone bypasses the SQL grant via
+ * direct @extschema@ qualification they still get 42501.
  *
  * Builtin role name (kept in one place):
  *   #define OB_MGMT_ROLE  "overlay_branch_administrators"
  *
- * Privilege matrix:
+ * Privilege matrix (branch administration is privileged — the delta and
+ * branch catalogs are DML-able only by this role, so a non-admin caller
+ * could never complete the underlying work anyway):
  *   create_branch()                    → superuser OR member of OB_MGMT_ROLE
- *   use_branch(name) / use_with_mode  → owner OR superuser OR mgmt (NULL=EXIT
- *                                       is unrestricted — session-level action)
- *   apply_branch(name)                → owner OR superuser OR mgmt
- *   discard_branch(name)              → owner OR superuser OR mgmt
+ *   use_branch(name) / use_with_mode  → superuser OR mgmt (NULL = EXIT is
+ *                                       unrestricted — session-level action)
+ *   apply_branch(name)                → superuser OR mgmt
+ *   discard_branch(name)              → superuser OR mgmt
  * ----------
  */
 #define OB_MGMT_ROLE_NAME		"overlay_branch_administrators"
 typedef enum ObLifecycleOp
 {
 	OB_OP_CREATE_BRANCH = 0,
-	OB_OP_USE_BRANCH,       /* branch_name may be NULL → skip owner check */
+	OB_OP_USE_BRANCH,       /* branch_name may be NULL → EXIT, always allowed */
 	OB_OP_APPLY_BRANCH,
 	OB_OP_DISCARD_BRANCH
 } ObLifecycleOp;
@@ -442,6 +443,8 @@ extern void     ob_mode_cache_remove(int32 bid);
 /* T8 § B.11 debug GUCs (NOT ABI-stable, _debug_ prefix) */
 extern int		ob_debug_apply_sleep_sec;
 extern int		ob_debug_invalidation_counter_throttle_override;
+extern int		ob_debug_snapshot_ttl_seconds;
+extern bool		ob_debug_delta_count_error;
 
 /* ----------
  * Function declarations for Delta Store operations

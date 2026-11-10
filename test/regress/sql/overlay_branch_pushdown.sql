@@ -30,6 +30,10 @@
 --   2. The structural premise that made the RD-1/RD-2 folds removable — delta
 --      keys are unique per (branch_id, relid).  If a future schema change
 --      drops that PK the removals become unsafe and this assertion fails.
+--   3. A volatile qualifier is never folded into the pushed-down fragment
+--      (PD.6): it stays in scan.plan.qual only, so it is evaluated exactly
+--      once per output row instead of once in the MAIN SPI query and again
+--      in the qual.
 --
 -- Fixture
 --   ob_pd(id PK, grp, payload); 200 MAIN rows, grp = (id-1)/20 (0..9),
@@ -46,7 +50,7 @@
 --   A7 gate rejects DDL (including CREATE TEMP TABLE) while a branch is
 --   active; all DDL here runs before use_branch / after discard_branch.
 --
--- Tags: RD-1, RD-2, MF-5, pushdown, pass2, orphan, branch_scan
+-- Tags: RD-1, RD-2, MF-5, pushdown, pass2, orphan, branch_scan, volatile
 
 CREATE EXTENSION IF NOT EXISTS overlay_branch;
 
@@ -58,6 +62,12 @@ CREATE TABLE ob_pd (
 INSERT INTO ob_pd SELECT g, (g - 1) / 20, 'm' || g FROM generate_series(1, 200) g;
 ANALYZE ob_pd;
 SELECT count(*) AS pd_main_cnt FROM ob_pd;                       -- expect 200
+
+-- Volatile predicate for PD.6: declared VOLATILE so the planner must not fold
+-- it, and backed by a sequence so the number of evaluations is observable.
+CREATE SEQUENCE ob_pd_seq;
+CREATE FUNCTION ob_pd_vol_true(x int) RETURNS boolean LANGUAGE sql VOLATILE
+  AS $$ SELECT nextval('ob_pd_seq') > 0 $$;
 
 SELECT overlay_branch.create_branch('ob_pd_b1');
 SELECT overlay_branch.use_branch('ob_pd_b1');
@@ -144,6 +154,24 @@ SELECT CASE WHEN count(*) = 25 THEN 'PD_GRP8_COUNT_PASS'
   FROM ob_pd WHERE grp = 8;
 
 -- ------------------------------------------------------------
+-- PD.6 A volatile predicate must NOT be pushed into the hidden SPI MAIN
+--      query.  Pushed, it is evaluated once there (to pick MAIN rows) and
+--      again by the scan qual (on the overlay), so a side effect such as
+--      nextval() fires twice per row and the two evaluations can disagree,
+--      silently dropping rows the qual would have kept.  `id >= 1` keeps
+--      has_pk_pred true, which is the only path that consults general_where.
+--      The predicate is backed by a sequence, so the evaluation count is
+--      observable: it must equal the 200 output rows, not twice that.
+-- ------------------------------------------------------------
+SELECT setval('ob_pd_seq', 1, false);
+SELECT CASE WHEN count(*) = 200 THEN 'PD_VOLATILE_COUNT_PASS'
+            ELSE 'PD_VOLATILE_COUNT_FAIL: got=' || count(*) END AS res
+  FROM ob_pd WHERE id >= 1 AND ob_pd_vol_true(id);
+SELECT CASE WHEN last_value = 200 THEN 'PD_VOLATILE_ONCE_PASS'
+            ELSE 'PD_VOLATILE_ONCE_FAIL: evals=' || last_value END AS res
+  FROM ob_pd_seq;
+
+-- ------------------------------------------------------------
 -- PD.5 Plan shape: the pushed predicate is a plain Filter above a single
 --      Custom Scan (no Gather — see overlay_branch_parallel.sql).
 -- ------------------------------------------------------------
@@ -170,3 +198,5 @@ END $$;
 SELECT overlay_branch.use_branch(NULL);
 SELECT overlay_branch.discard_branch('ob_pd_b1');
 DROP TABLE ob_pd;
+DROP FUNCTION ob_pd_vol_true(int);
+DROP SEQUENCE ob_pd_seq;

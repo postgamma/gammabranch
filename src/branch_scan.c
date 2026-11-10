@@ -675,8 +675,12 @@ overlay_scan_open(Relation rel, int32 branch_id,
         char         *q_qualified;
         StringInfoData sql;
         bool          any_where;
-        bool          pushed_snap_;
-        bool          pop_done_;
+        /* volatile: read in the PG_CATCH below, and pop_done_ is written
+         * inside the PG_TRY — a non-volatile local's value is indeterminate
+         * after a longjmp (C99 7.13.2.1), which would make the catch pop an
+         * already-popped snapshot. */
+        volatile bool pushed_snap_;
+        volatile bool pop_done_;
         int           ret;
 
         q_qualified = quote_qualified_identifier(q_nspname, q_relname);
@@ -1605,11 +1609,21 @@ ob_branchscan_planner_hook(PlannerInfo *root, RelOptInfo *rel,
      *     recursion-guard depth.
      */
     {
-        bool active_snapshot;
+        bool active_snapshot = false;
 
+        /* PG_FINALLY restores the flag on ANY error path — otherwise one
+         * failed is_active() leaves ob_in_planner_hook stuck true for the
+         * rest of the session and silently disables overlay injection. */
         ob_in_planner_hook = true;
-        active_snapshot = overlay_branch_is_active();
-        ob_in_planner_hook = false;
+        PG_TRY();
+        {
+            active_snapshot = overlay_branch_is_active();
+        }
+        PG_FINALLY();
+        {
+            ob_in_planner_hook = false;
+        }
+        PG_END_TRY();
         if (!active_snapshot)
             return;
     }
@@ -1766,7 +1780,17 @@ ob_branchscan_planner_hook(PlannerInfo *root, RelOptInfo *rel,
                 if (has_pk_pred && pk_attno != 0 &&
                     ob_is_pk_pushable_clause(clause, rti, pk_attno))
                     is_pk_clause = true;
-                if (!is_pk_clause && !ob_expr_has_outer_ref(clause, NULL))
+                /* A volatile clause must never be pushed into the hidden SPI
+                 * MAIN query: it would be evaluated once there to select MAIN
+                 * rows and again by scan.plan.qual row by row, so the two
+                 * evaluations can disagree (silently dropping the rows the SPI
+                 * query filtered out) and any side effect (nextval(), ...)
+                 * fires twice.  Stable/immutable clauses are safe — the SPI
+                 * query runs in the same statement and snapshot, so they yield
+                 * the same value in both places. */
+                if (!is_pk_clause &&
+                    !contain_volatile_functions(clause) &&
+                    !ob_expr_has_outer_ref(clause, NULL))
                     remain = lappend(remain, clause);
             }
             if (remain != NIL)
@@ -2495,6 +2519,15 @@ next_tuple:
     ExecClearTuple(dst);
     natts = dst->tts_tupleDescriptor->natts;
 
+    /* Reclaim the previous row's expression scratch — including the datum
+     * copies the non-DML path below makes into ecxt_per_tuple_memory — so the
+     * scan's footprint stays O(1 row) instead of growing with the number of
+     * emitted rows.  A slot handed to a caller is valid until the next
+     * ExecCustomScan call, which is exactly the lifetime this reset bounds
+     * (same one-call contract as the streaming iterator and every other
+     * virtual-slot node). */
+    ResetExprContext(econtext);
+
     if (ebs->dml_target)
     {
         /* ACC-1: heap-backed scan slot.  The DML subplan carries the row
@@ -2536,7 +2569,18 @@ next_tuple:
          * (all columns).  We always copy ALL columns from src into dst
          * regardless of the query's requested projection because the
          * scan-level projection (ProjInfo) is applied below via
-         * ExecProject() to produce the plan node's final output slot. */
+         * ExecProject() to produce the plan node's final output slot.
+         *
+         * Materialise into ecxt_per_tuple_memory (reset at the top of every
+         * call).  dst is a virtual slot that does not own its datums: a copy
+         * in CurrentMemoryContext (es_query_cxt for the whole ExecutorRun)
+         * would accumulate one chunk per emitted row and grow the query
+         * context linearly with the result set. */
+        MemoryContext       rowcxt;
+        MemoryContext       oldcxt;
+
+        rowcxt = econtext->ecxt_per_tuple_memory;
+        oldcxt = MemoryContextSwitchTo(rowcxt);
         for (int a = 0; a < natts; a++)
         {
             bool                sisnull;
@@ -2562,13 +2606,11 @@ next_tuple:
             else
                 dst->tts_values[a] = (Datum) 0;
         }
+        MemoryContextSwitchTo(oldcxt);
         ExecStoreVirtualTuple(dst);
         dst->tts_nvalid = natts;
     }
 
-    /* Reset per-tuple expr context so quals / projection have a clean
-     * slate for this tuple. */
-    ResetExprContext(econtext);
     econtext->ecxt_scantuple = dst;
 
     /* Run any scan-level qual (scan.plan.qual=NIL so quals live

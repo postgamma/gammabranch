@@ -10,7 +10,11 @@
  *     • snapshot-mode MAIN write → G2 guard interception (55P02 snapshot expired)
  *   R19 Snapshot TTL sanity: GUC overlay_branch.snapshot_max_hold_minutes default 10min,
  *       PGC_POSTMASTER not session-level modifiable (changing it reports 22023); use_branch snapshot mode
- *       before TTL is reached UPDATE+SELECT works normally (not expired)
+ *       before TTL is reached UPDATE+SELECT works normally (not expired).
+ *   R19 TTL kickout (deterministic): the PGC_SUSET debug GUC
+ *       overlay_branch._debug_snapshot_ttl_seconds forces the cap to 0s, the next write
+ *       is kicked out of the branch (state=expired) and the errhint names the TTL reason
+ *       (snapshot_max_hold_minutes (R19 TTL)) instead of "by another session".
  * GLOBAL CLEANUP: DROP TABLE r_entry_t + DROP 2 branches; RESET client_min_messages
  */
 -- ===== 0. Prerequisite guard (same as the other regression files) =====
@@ -210,10 +214,52 @@ SELECT CASE WHEN note = 'beta-snap' THEN 'PASS:R19_SNAPSHOT_ALIVE'
  PASS:R19_SNAPSHOT_ALIVE
 (1 row)
 
+-- ----- R19 TTL kickout (deterministic).  snapshot_max_hold_minutes is a
+-- -----      PGC_POSTMASTER GUC with a one-minute floor, so a unit test
+-- -----      cannot wait it out; the _debug_snapshot_ttl_seconds GUC
+-- -----      (PGC_SUSET) supplies a seconds-granularity cap for exactly this.
+-- -----      Once the cap elapses the WRITE gate must force the session off
+-- -----      the branch AND the diagnostic must name the TTL reason -- not
+-- -----      the generic "by another session" text the pre-fix code always
+-- -----      appended (which was factually wrong for a local TTL kickout).
+SET overlay_branch._debug_snapshot_ttl_seconds = 0;
+SET client_min_messages = NOTICE;  -- this section runs at ERROR; let the assertion print
+DO $$
+DECLARE
+    _msg  text;
+    _hint text;
+BEGIN
+    BEGIN
+        UPDATE public.r_entry_t SET note = 'ttl_attempt' WHERE pk_id = 1;
+        RAISE EXCEPTION 'FAIL:R19_TTL_NO_ERROR';
+    EXCEPTION WHEN object_not_in_prerequisite_state THEN
+        GET STACKED DIAGNOSTICS _msg = MESSAGE_TEXT, _hint = PG_EXCEPTION_HINT;
+        IF _msg LIKE '%state=expired%'
+           AND _hint LIKE '%snapshot_max_hold_minutes (R19 TTL)%'
+           AND _hint NOT LIKE '%by another session%' THEN
+            RAISE NOTICE 'PASS:R19_TTL_KICKOUT_NAMES_TTL_REASON';
+        ELSE
+            RAISE NOTICE 'FAIL:R19_TTL_KICKOUT msg=[%] hint=[%]', _msg, _hint;
+        END IF;
+    END;
+END $$;
+NOTICE:  PASS:R19_TTL_KICKOUT_NAMES_TTL_REASON
+SET client_min_messages = ERROR;   -- restore the section's level
+RESET overlay_branch._debug_snapshot_ttl_seconds;
 SELECT overlay_branch.use_branch(NULL);
  use_branch 
 ------------
  
+(1 row)
+
+-- Forced exit must leave MAIN untouched: the TTL gate fires before any
+-- redirect, so the attempted write never reached the delta.
+SELECT CASE WHEN count(*) = 0 THEN 'PASS:R19_TTL_MAIN_UNTOUCHED'
+            ELSE 'FAIL:R19_TTL_MAIN_POLLUTED cnt=' || count(*) END AS r19_ttl_main
+  FROM public.r_entry_t WHERE note = 'ttl_attempt';
+        r19_ttl_main         
+-----------------------------
+ PASS:R19_TTL_MAIN_UNTOUCHED
 (1 row)
 
 SELECT overlay_branch.discard_branch('br_r_entry');
@@ -462,7 +508,7 @@ DROP TABLE public.t_r21;
 -- =====
 -- ===== Matrix re-stated here for test traceability:
 -- =====   create_branch                  → superuser | mgmt role only
--- =====   use/apply/discard(name)       → owner OR superuser | mgmt
+-- =====   use/apply/discard(name)       → superuser | mgmt role only
 -- =====   use_branch(NULL/empty)        → PUBLIC (exit branch only)
 -- =====   list_branches()/current_branch() → PUBLIC (metadata only)
 -- =====   public.pg_branch_delta SELECT → REVOKEd from PUBLIC (R22)
@@ -472,8 +518,8 @@ DROP TABLE public.t_r21;
 -- =====   42501 negative cases; clean up the role at the end.
 -- =====================================================================
 SET client_min_messages = WARNING;
--- Setup: two roles — alice = unprivileged user (default); bob = owner
--- of a specific branch.  Mgmt role membership is tested later.
+-- Setup: two roles — alice = unprivileged user; bob = branch owner
+-- (provenance only: ownership alone grants NO administrative authority).
 DO $$BEGIN
     EXECUTE format('CREATE ROLE regress_g02_alice LOGIN');
 EXCEPTION WHEN duplicate_object THEN NULL; END$$;
@@ -482,7 +528,7 @@ DO $$BEGIN
 EXCEPTION WHEN duplicate_object THEN NULL; END$$;
 -- ===== G02 L1 ACL re-baseline (pg_regress temp-inst workaround: EXTENSION
 --       sometimes lands with MGMT-only privileges on lifecycle wrappers,
---       which would break owner-use and mgmt-override positive paths) =====
+--       which would break the mgmt-override positive paths) =====
 DO $$
 DECLARE
   _ns name := (SELECT n.nspname FROM pg_extension e JOIN pg_namespace n ON e.extnamespace=n.oid WHERE e.extname='overlay_branch');
@@ -556,10 +602,9 @@ SELECT CASE WHEN NOT EXISTS (SELECT 1 FROM public.pg_branch WHERE branch_name = 
  PASS:G02_A2_ALICE_CREATE_DIRECT_EXTSCHEMA_DENIED
 (1 row)
 
--- Setup: superuser creates br_g02_bobsbranch and assigns OWNER to bob
--- (simulates bob having created it himself — the ACL check only compares
--- pg_branch.owner vs session user; it doesn't distinguish who ran the
--- literal INSERT).
+-- Setup: superuser creates br_g02_bobsbranch and assigns OWNER to bob.
+-- Ownership is provenance metadata only — it does NOT grant bob any
+-- administrative authority (use/apply/discard stay mgmt-only).
 SELECT overlay_branch.create_branch('br_g02_bobsbranch') AS g02_bob_branch_id;
  g02_bob_branch_id 
 -------------------
@@ -568,25 +613,18 @@ SELECT overlay_branch.create_branch('br_g02_bobsbranch') AS g02_bob_branch_id;
 
 UPDATE overlay_branch.pg_branch SET owner = (SELECT oid FROM pg_roles WHERE rolname = 'regress_g02_bob')
  WHERE branch_name = 'br_g02_bobsbranch';
--- T_G02_B1: owner bob CAN use_branch his own branch (POSITIVE path).
+-- T_G02_B1: bob is the stored OWNER but NOT mgmt → use_branch DENIED 42501.
 SET ROLE regress_g02_bob;
-SELECT public.use_branch('br_g02_bobsbranch');    -- allowed (owner)
-WARNING:  transaction left non-empty SPI stack
-HINT:  Check for missing "SPI_finish" calls.
- use_branch 
-------------
- 
-(1 row)
-
-SELECT CASE WHEN public.current_branch() = 'br_g02_bobsbranch'
-            THEN 'PASS:G02_B1_OWNER_USE_ALLOWED'
-            ELSE 'FAIL:G02_B1 current=' || COALESCE(public.current_branch()::text, 'NULL')
-       END AS g02_b1;
-            g02_b1             
--------------------------------
- PASS:G02_B1_OWNER_USE_ALLOWED
-(1 row)
-
+DO $$
+BEGIN
+    BEGIN
+        PERFORM public.use_branch('br_g02_bobsbranch');
+        RAISE EXCEPTION 'FAIL_G02_B1_NO_ERROR';
+    EXCEPTION WHEN insufficient_privilege THEN
+        NULL;   /* expected 42501 */
+    END;
+END $$;
+-- EXIT path stays open to everyone (never entered a branch here).
 SELECT public.use_branch(NULL);   -- EXIT path: always PUBLIC
  use_branch 
 ------------
@@ -594,6 +632,15 @@ SELECT public.use_branch(NULL);   -- EXIT path: always PUBLIC
 (1 row)
 
 RESET ROLE;
+SELECT CASE WHEN (SELECT owner = (SELECT oid FROM pg_roles WHERE rolname = 'regress_g02_bob')
+                   FROM public.pg_branch WHERE branch_name = 'br_g02_bobsbranch')
+            THEN 'PASS:G02_B1_OWNER_USE_DENIED_42501'
+            ELSE 'FAIL:G02_B1' END AS g02_b1;
+               g02_b1               
+------------------------------------
+ PASS:G02_B1_OWNER_USE_DENIED_42501
+(1 row)
+
 -- T_G02_B2: alice (non-owner, non-mgmt) cannot use_branch bob's branch.
 SET ROLE regress_g02_alice;
 DO $$
@@ -614,6 +661,30 @@ SELECT CASE WHEN (SELECT COALESCE(owner <> (SELECT oid FROM pg_roles WHERE rolna
                  g02_b2                  
 -----------------------------------------
  PASS:G02_B2_ALICE_USE_BOB_BRANCH_DENIED
+(1 row)
+
+-- T_G02_B3: bob is the stored OWNER but NOT mgmt → apply/discard on his
+-- own branch are DENIED 42501 (ownership is provenance, not authority).
+SET ROLE regress_g02_bob;
+DO $$
+BEGIN
+    BEGIN
+        PERFORM public.apply_branch('br_g02_bobsbranch');
+        RAISE EXCEPTION 'FAIL_G02_B3_APPLY_NO_ERROR';
+    EXCEPTION WHEN insufficient_privilege THEN NULL; END;
+    BEGIN
+        PERFORM public.discard_branch('br_g02_bobsbranch');
+        RAISE EXCEPTION 'FAIL_G02_B3_DISCARD_NO_ERROR';
+    EXCEPTION WHEN insufficient_privilege THEN NULL; END;
+END $$;
+RESET ROLE;
+SELECT CASE WHEN EXISTS (SELECT 1 FROM public.pg_branch
+                         WHERE branch_name = 'br_g02_bobsbranch' AND state = 'active')
+            THEN 'PASS:G02_B3_OWNER_APPLY_DISCARD_DENIED_42501'
+            ELSE 'FAIL:G02_B3 branch state changed' END AS g02_b3;
+                    g02_b3                    
+----------------------------------------------
+ PASS:G02_B3_OWNER_APPLY_DISCARD_DENIED_42501
 (1 row)
 
 -- T_G02_C1: alice cannot discard_branch bob's branch → 42501.

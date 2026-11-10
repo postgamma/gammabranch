@@ -13,6 +13,10 @@
  *               DOUBLE / VARCHAR / TIMETZ format_type_with_typmod serialization correct
  *   Section J — P2 complex non-PK expression deparse: WHERE col OP col / LIKE /
  *               LEAST/GREATEST / IN subquery / CASE / CAST etc. deparse coverage
+ *   Section K — dropped-column delta reconstruction (B1 regression): a branch
+ *               taken AFTER a middle column is dropped must still rebuild
+ *               delta rows correctly -- the SPI result set is mapped to the
+ *               heap TupleDesc by skipping dropped attnums.
  *
  * Sections share session; between F→G→H→I→J if the same bs_user table is reused keep it continuous without DISCARD.
  */
@@ -872,3 +876,99 @@ FROM public.bs_p2;
 (1 row)
 
 DROP TABLE public.bs_p2;
+/* =========================================================== Section K */
+-- =====================================================================
+-- ===== Section K: dropped-column delta reconstruction (B1 regression).
+-- =====   A branch is taken AFTER a middle column is dropped, so the heap
+-- =====   TupleDesc has an attisdropped hole.  The delta row is serialized
+-- =====   as JSON over the *live* columns; on read-back the SPI result set
+-- =====   must be mapped to the heap TupleDesc by SKIPPING dropped attnums.
+-- =====   Positional indexing shifts every column after the dropped one.
+-- =====================================================================
+SET client_min_messages = warning;
+DROP TABLE IF EXISTS public.bs_dropcol;
+CREATE TABLE public.bs_dropcol (id INT4 PRIMARY KEY, mid TEXT, tail TEXT, extra TEXT);
+ALTER TABLE public.bs_dropcol DROP COLUMN mid;   -- live attrs: id, tail, extra
+INSERT INTO public.bs_dropcol VALUES (1, 'MAIN_tail', 'MAIN_extra');
+SELECT overlay_branch.create_branch('bs_dropcol_b');
+ create_branch 
+---------------
+            13
+(1 row)
+
+SELECT overlay_branch.use_branch('bs_dropcol_b');
+ use_branch 
+------------
+ 
+(1 row)
+
+INSERT INTO public.bs_dropcol VALUES (2, 'DELTA_tail', 'DELTA_extra');  -- pure delta INSERT
+UPDATE public.bs_dropcol SET tail = 'MAIN_tail_x' WHERE id = 1;        -- MAIN-row UPDATE → delta
+-- K.1 delta INSERT must reconstruct the tail columns correctly
+SELECT CASE WHEN tail = 'DELTA_tail' AND extra = 'DELTA_extra'
+            THEN 'PASS:K1_DELTA_INSERT_RECON'
+            ELSE 'FAIL:'||COALESCE(tail,'NULL')||'/'||COALESCE(extra,'NULL') END AS k1
+  FROM public.bs_dropcol WHERE id = 2;
+             k1             
+----------------------------
+ PASS:K1_DELTA_INSERT_RECON
+(1 row)
+
+-- K.2 MAIN-row UPDATE delta must also reconstruct the tail columns
+SELECT CASE WHEN tail = 'MAIN_tail_x' AND extra = 'MAIN_extra'
+            THEN 'PASS:K2_MAIN_UPDATE_RECON'
+            ELSE 'FAIL:'||COALESCE(tail,'NULL')||'/'||COALESCE(extra,'NULL') END AS k2
+  FROM public.bs_dropcol WHERE id = 1;
+            k2             
+---------------------------
+ PASS:K2_MAIN_UPDATE_RECON
+(1 row)
+
+-- K.3 exit + re-enter: reconstruction must be identical from a cold context
+SELECT overlay_branch.use_branch(NULL);
+ use_branch 
+------------
+ 
+(1 row)
+
+SELECT overlay_branch.use_branch('bs_dropcol_b');
+ use_branch 
+------------
+ 
+(1 row)
+
+SELECT CASE WHEN string_agg(id::text||':'||tail||':'||extra, ',' ORDER BY id)
+              = '1:MAIN_tail_x:MAIN_extra,2:DELTA_tail:DELTA_extra'
+            THEN 'PASS:K3_REENTER_RECON'
+            ELSE 'FAIL:'||COALESCE(string_agg(id::text||':'||tail||':'||extra, ',' ORDER BY id),'NULL') END AS k3
+  FROM public.bs_dropcol;
+          k3           
+-----------------------
+ PASS:K3_REENTER_RECON
+(1 row)
+
+SELECT overlay_branch.use_branch(NULL);
+ use_branch 
+------------
+ 
+(1 row)
+
+RESET overlay_branch.current;
+-- K.4 MAIN pristine: single row, original tail/extra
+SELECT CASE WHEN count(*) = 1 AND max(tail) = 'MAIN_tail' AND max(extra) = 'MAIN_extra'
+            THEN 'PASS:K4_MAIN_PRISTINE'
+            ELSE 'FAIL' END AS k4
+  FROM public.bs_dropcol;
+          k4           
+-----------------------
+ PASS:K4_MAIN_PRISTINE
+(1 row)
+
+SELECT overlay_branch.discard_branch('bs_dropcol_b');
+ discard_branch 
+----------------
+ 
+(1 row)
+
+RESET client_min_messages;
+DROP TABLE public.bs_dropcol;

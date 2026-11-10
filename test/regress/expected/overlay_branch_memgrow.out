@@ -73,14 +73,32 @@
 --         leak above it, so the TopMemoryContext before/after probes cannot see
 --         it and no SQL-level assertion can; it is covered by the peak-RSS
 --         probe test/bench/srf_peak_rss.sh, and Section 1b exercises the path.
+--    12. branch_scan.c non-DML output path (overlay_scan_next) copied every
+--        result row's datums into the ambient CurrentMemoryContext -- for a
+--        running query that is the enclosing ExecutorState, released only when
+--        the portal/statement ends -- so a single statement streaming N rows
+--        grew the backend linearly with N.  Like leak 9 the growth is bounded
+--        by the query's lifetime, but it is worse in one respect: ExecutorState
+--        is NOT under TopMemoryContext, so the before/after probes below are
+--        blind to it.  Section 1c sums every backend context instead and
+--        compares against a plain-table baseline of the same shape.
 --
--- Tags: MF-1, memory, TopMemoryContext, BranchScan, delta_store, write_redirect,
---       branch_lifecycle, apply_batch, overlay_main_plus_delta, SRF
+-- Tags: MF-1, memory, TopMemoryContext, ExecutorState, BranchScan, delta_store,
+--       write_redirect, branch_lifecycle, apply_batch, overlay_main_plus_delta,
+--       SRF
 CREATE EXTENSION IF NOT EXISTS overlay_branch;
 NOTICE:  extension "overlay_branch" already exists, skipping
 CREATE TABLE ob_mem (id int PRIMARY KEY, v text);
 INSERT INTO ob_mem SELECT g, repeat('x', 40) || g FROM generate_series(1, 2000) g;
 ANALYZE ob_mem;
+-- A larger, wider table for the Section 1c single-query peak probe.  It must
+-- be created BEFORE the branch is entered (the A7 gate rejects DDL inside an
+-- active branch).  The per-row datum copy a wrong output path makes is
+-- ~1.1 KB here, so a buggy scan of 20000 rows adds well over 20 MB to the
+-- enclosing ExecutorState.
+CREATE TABLE ob_mem_big (id int PRIMARY KEY, v text);
+INSERT INTO ob_mem_big SELECT g, repeat('x', 600) || g FROM generate_series(1, 20000) g;
+ANALYZE ob_mem_big;
 SELECT overlay_branch.create_branch('ob_mem_b1');
  create_branch 
 ---------------
@@ -95,6 +113,8 @@ SELECT overlay_branch.use_branch('ob_mem_b1');
 
 UPDATE ob_mem SET v = 'u' || v WHERE id % 10 = 0;                          -- 200 overlaid rows
 INSERT INTO ob_mem SELECT g, 'n' || g FROM generate_series(2001, 2200) g;  -- 200 pure delta
+UPDATE ob_mem_big SET v = 'u' || v WHERE id % 100 = 0;                     -- 200 overlaid rows
+INSERT INTO ob_mem_big SELECT g, repeat('y', 600) || g FROM generate_series(20001, 20010) g; -- 10 pure delta
 -- Warm-up: first executions also fill relcache/syscache/plan cache.
 SELECT count(*) FROM ob_mem;
  count 
@@ -183,6 +203,51 @@ SELECT CASE WHEN count(*) = 0 THEN 'MF1_SRF_CONTENT_CORRECT_PASS'
  MF1_SRF_CONTENT_CORRECT_PASS
 (1 row)
 
+-- ==========================================================================
+-- Section 1c: single-query peak memory (leak 12, branch_scan.c output path)
+-- --------------------------------------------------------------------------
+-- The BranchScan non-DML output path must materialise each result row into
+-- the executor's per-tuple context.  Copying into the ambient
+-- CurrentMemoryContext instead means the enclosing query's ExecutorState,
+-- which a portal releases only at close -- so one statement streaming N rows
+-- grows the backend by ~N x row-width.  That context is NOT under
+-- TopMemoryContext, so the before/after probes above are blind to it; this
+-- probe sums every backend context across a cursor that fetches ob_mem_big
+-- (20000 MAIN rows + 200 overlaid + 10 pure delta = 20010).  With the fix the
+-- growth stays in the tens-of-KB range (a plain unmanaged table of the same
+-- shape grows ~17 KB); the buggy path added >20 MB.
+-- ==========================================================================
+DO $$
+DECLARE
+  before_bytes bigint;
+  after_bytes  bigint;
+  c            CURSOR FOR SELECT * FROM ob_mem_big;
+  r            record;
+  n            int := 0;
+BEGIN
+  OPEN c;
+  SELECT sum(total_bytes)::bigint INTO before_bytes FROM pg_backend_memory_contexts;
+  LOOP
+    FETCH c INTO r;
+    EXIT WHEN NOT FOUND;
+    n := n + 1;
+  END LOOP;
+  SELECT sum(total_bytes)::bigint INTO after_bytes FROM pg_backend_memory_contexts;
+  CLOSE c;
+
+  -- The PASS line deliberately omits the byte count: unlike the TopMemoryContext
+  -- probes above, this one sums every backend context, so the absolute growth
+  -- tracks the platform's memory-context chunk layout (hundreds of KB here, a
+  -- different number on another build) and would make the regression output
+  -- non-portable.  The threshold alone is the assertion; the failing case,
+  -- where the exact number is useful, still prints it.
+  IF n = 20010 AND after_bytes - before_bytes < 2097152 THEN
+    RAISE NOTICE 'MF1_SCAN_PEAK_MEM_STABLE_PASS: rows=%', n;
+  ELSE
+    RAISE NOTICE 'MF1_SCAN_PEAK_MEM_STABLE_FAIL: rows=% grew=% bytes', n, after_bytes - before_bytes;
+  END IF;
+END $$;
+NOTICE:  MF1_SCAN_PEAK_MEM_STABLE_PASS: rows=20010
 -- MF-1 write path (leaks 3-5): redirected UPDATE/DELETE + pure-delta UPDATE.
 DO $$
 DECLARE
@@ -448,4 +513,5 @@ SELECT CASE WHEN count(*) = 200 THEN 'MF1_APPLYPR_RESULT_CORRECT_PASS'
 
 -- Cleanup
 DROP TABLE ob_mem;
+DROP TABLE ob_mem_big;
 RESET ALL;

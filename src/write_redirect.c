@@ -2204,14 +2204,15 @@ overlay_executor_run_intercept(QueryDesc *queryDesc,
 				tdata = overlay_serialize_tuple(rel, slot);
 
 				/* ================================================================
-				 * === B2 UPSERT: 2-Phase Conflict Detection (MAIN-first) ===
+				 * === B2 UPSERT: 2-Phase Conflict Detection (delta shadows
+				 * === MAIN) ===
 				 * ================================================================
 				 * Per B1/B2 mandate, conflict detection is strictly 2-phase:
 				 *   Phase I  → pure delta SPI lookup (op=I OR op=U per
 				 *              BranchScan Pass2 invariant, so INSERT→UPDATE
 				 *              collapsed rows do not vanish)
-				 *   Phase II → MAIN heap ctid SPI lookup (MAIN-first per
-				 *              hard functional constraint)
+				 *   Phase II → MAIN heap ctid SPI lookup (only consulted when
+				 *              the delta has no row for the key)
 				 *
 				 * promo dispatch matrix after both phases:
 				 *   main_hit  pure_hit  oc_action  WHERE  promotion
@@ -2223,7 +2224,7 @@ overlay_executor_run_intercept(QueryDesc *queryDesc,
 				 *   false     true      DO_UPD     true   3 (UPDATE pure)
 				 *   false     true      DO_UPD     false  0 (skip WHERE)
 				 *   false     true      DO_NOTHING -      0 (skip NOTHING)
-				 *   true      true      DO_UPD     true   2 (MAIN wins tie)
+				 *   true      true      DO_UPD     true   3 (delta shadows MAIN)
 				 * ================================================================ */
 
 				/* ---------- Phase I: Pure delta conflict lookup ---------- */
@@ -2433,7 +2434,8 @@ overlay_executor_run_intercept(QueryDesc *queryDesc,
 					SPI_finish();
 				}
 
-				/* ---------- Phase II: MAIN heap ctid lookup (MAIN-FIRST) --- */
+				/* ---------- Phase II: MAIN heap ctid lookup (delta-first
+				 * ---------- shadow: only consulted on a delta miss) --- */
 				if (oc_action != ONCONFLICT_NONE && (pk_attno > 0 || arb_natts > 0))
 				{
 					TupleDesc	reldesc = RelationGetDescr(rel);
@@ -2637,22 +2639,43 @@ overlay_executor_run_intercept(QueryDesc *queryDesc,
 							ExprContext *ecx;
 							EState *estate = mt->ps.state;
 							TupleTableSlot *t_where_scan = NULL;
+							TupleTableSlot *save_scantuple;
+							TupleTableSlot *save_innertuple;
 							bool		main_where_fetched = false;
 							ecx = GetPerTupleExprContext(estate);
-							if (ecx->ecxt_scantuple)
-								ExecClearTuple(ecx->ecxt_scantuple);
-							if (ecx->ecxt_innertuple)
-								ExecClearTuple(ecx->ecxt_innertuple);
-							if (main_hit)
+							/* FIX-UPSERT-WHERE (shared-slot preservation):
+							 * ecxt_innertuple below is bound to the caller's
+							 * EXCLUDED slot (`slot`) and, on the pure-delta
+							 * path, ecxt_scantuple is bound to the caller's
+							 * live pre-image slot (`pre_image_slot`).  Both
+							 * are consumed again by the promo dispatch and the
+							 * ExecProject SET merge that follow.  Calling
+							 * ExecClearTuple on them would mark those live
+							 * slots empty, after which TupIsNull() misreports
+							 * a populated row as NULL and the promo=2/3 guard
+							 * silently takes the fallback path against a
+							 * cleared slot (getsomeattrs / bogus palloc
+							 * errors).  Save and restore the incoming pointers
+							 * instead of clearing them. */
+							save_scantuple = ecx->ecxt_scantuple;
+							save_innertuple = ecx->ecxt_innertuple;
+							/* The branch's own delta row shadows MAIN
+							 * (self-written deltas are always visible), so
+							 * the WHERE predicate must be evaluated against
+							 * the delta value whenever one exists.  Testing
+							 * the stale MAIN row here would let a second
+							 * UPSERT / UPDATE on a row the branch already
+							 * touched mis-evaluate its predicate. */
+							if (pure_hit)
+							{
+								t_where_scan = pre_image_slot;
+								main_where_fetched = false;
+							}
+							else
 							{
 								t_where_scan = fetch_tuple_by_ctid(rel, main_ctid,
 																   queryDesc->estate->es_query_cxt);
 								main_where_fetched = true;
-							}
-							else
-							{
-								t_where_scan = pre_image_slot;
-								main_where_fetched = false;
 							}
 							ecx->ecxt_scantuple = t_where_scan;
 							ecx->ecxt_innertuple = slot; /* EXCLUDED */
@@ -2670,8 +2693,8 @@ overlay_executor_run_intercept(QueryDesc *queryDesc,
 							}
 							ResetExprContext(ecx);
 							where_ok = ExecQual(oc_where, ecx);
-							ExecClearTuple(ecx->ecxt_scantuple);
-							ExecClearTuple(ecx->ecxt_innertuple);
+							ecx->ecxt_scantuple = save_scantuple;
+							ecx->ecxt_innertuple = save_innertuple;
 							if (main_where_fetched && t_where_scan)
 								ExecDropSingleTupleTableSlot(t_where_scan);
 						}
@@ -2681,14 +2704,19 @@ overlay_executor_run_intercept(QueryDesc *queryDesc,
 						}
 						else
 						{
-							/* MAIN-first tie-break: both hit → MAIN wins promo=2 */
-							if (main_hit)
+							/* Both-hit tie-break: the delta row is the latest
+							 * visible version -- it shadows MAIN -- so the
+							 * pure pre-image wins.  Choosing MAIN here would
+							 * make a second UPSERT / UPDATE on a row the
+							 * branch already wrote silently revert every
+							 * untouched column to its MAIN value. */
+							if (pure_hit)
 							{
-								promotion = 2;
+								promotion = 3;
 							}
 							else
 							{
-								promotion = 3;
+								promotion = 2;
 							}
 						}
 					}
@@ -2704,6 +2732,8 @@ overlay_executor_run_intercept(QueryDesc *queryDesc,
 					ExprContext *ecx;
 					MemoryContext oldprojctx;
 					bool		proj_switched = false;
+					TupleTableSlot *save_scantuple = NULL;
+					TupleTableSlot *save_innertuple = NULL;
 
 					/* ========== Build pre_image (scantuple) ========== */
 					if (promotion == 2)
@@ -2732,10 +2762,29 @@ overlay_executor_run_intercept(QueryDesc *queryDesc,
 
 					if (promotion == 2 || promotion == 3)
 					{
+						TypedKey   *pre_pk = NULL;
+						int			pre_n = 0;
+						bool		pk_check_active = false;
+
 						if (tdata != NULL)
 						{
 							pfree(tdata);
 							tdata = NULL;
+						}
+
+						/* R03 (UPSERT): capture the pre-image PK BEFORE the
+						 * ExecProject below calls ExecClearTuple() on
+						 * ecxt_scantuple (= pre_image_slot).  That clear marks
+						 * the slot empty, after which TupIsNull() reports a
+						 * fully populated pre-image as empty and the mutation
+						 * check would be silently skipped.  Build the TypedKey
+						 * here while the slot is still live. */
+						if (overlay_relation_has_pk(rel) &&
+							pre_image_slot != NULL && !TupIsNull(pre_image_slot))
+						{
+							pre_pk = overlay_build_typed_pk_from_slot(
+								rel, pre_image_slot, &pre_n);
+							pk_check_active = true;
 						}
 
 						if (oc_proj == NULL || estate == NULL ||
@@ -2761,10 +2810,24 @@ overlay_executor_run_intercept(QueryDesc *queryDesc,
 							}
 							oldprojctx = MemoryContextSwitchTo(ecx->ecxt_per_tuple_memory);
 							proj_switched = true;
-							if (ecx->ecxt_scantuple)
-								ExecClearTuple(ecx->ecxt_scantuple);
-							if (ecx->ecxt_innertuple)
-								ExecClearTuple(ecx->ecxt_innertuple);
+
+							/* FIX-UPSERT-MULTIROW (shared-slot preservation):
+							 * Save the ExprContext bindings and restore them
+							 * after the projection; never ExecClearTuple() a
+							 * slot we do not own.  ecxt_innertuple may still
+							 * alias `slot` -- the caller's live subplan slot,
+							 * bound on the previous loop iteration for a
+							 * preceding promo=2/3 row -- and ecxt_scantuple
+							 * may alias a pre_image_slot that was already
+							 * dropped.  Clearing the caller's slot would free
+							 * the tuple behind its EXCLUDED values, so the
+							 * next ExcludedColumn read faults or reads freed
+							 * varlena memory (observed as "compression method
+							 * lz4 not supported").  See doc/internals.md
+							 * "slot aliasing". */
+							save_scantuple = ecx->ecxt_scantuple;
+							save_innertuple = ecx->ecxt_innertuple;
+
 							ecx->ecxt_scantuple = pre_image_slot;
 							ecx->ecxt_innertuple  = slot; /* EXCLUDED */
 							if (ecx->ecxt_scantuple && TTS_IS_VIRTUAL(ecx->ecxt_scantuple))
@@ -2793,8 +2856,51 @@ overlay_executor_run_intercept(QueryDesc *queryDesc,
 								}
 							}
 
-							ExecClearTuple(ecx->ecxt_scantuple);
-							ExecClearTuple(ecx->ecxt_innertuple);
+							/* Restore the caller's ExprContext bindings
+							 * (FIX-UPSERT-MULTIROW): undo our temporary
+							 * scantuple/innertuple aliases instead of
+							 * clearing them, so the live subplan slot is left
+							 * intact for the next row. */
+							ecx->ecxt_scantuple = save_scantuple;
+							ecx->ecxt_innertuple = save_innertuple;
+						}
+
+						/* ===== REVIEW-260926 / R03 (UPSERT) =====
+						 * The delta row is keyed by the conflict identity
+						 * (the pre-image's PK); the post-image carries the
+						 * DO UPDATE SET result.  If SET touched a PK column
+						 * the two desync exactly as on the plain UPDATE
+						 * path.  Compare with the type-safe TypedKey equality
+						 * (never as text) so BPCHAR rtrim / NUMERIC precision
+						 * / TIMESTAMPTZ zone differences cannot alias.
+						 * pre_pk was captured above (before the projection
+						 * cleared the pre-image slot); when the pre-image was
+						 * absent/unusable pk_check_active is false and we skip
+						 * -- that branch only uses the EXCLUDED row, whose PK
+						 * is the arbiter key by construction. */
+						if (pk_check_active)
+						{
+							int			post_n = 0;
+							TypedKey   *post_pk;
+							bool		pk_mutated;
+
+							post_pk = overlay_build_typed_pk_from_slot(
+								rel, post_image, &post_n);
+							pk_mutated =
+								(overlay_typed_pk_cmp(pre_pk, pre_n,
+													  post_pk, post_n) != 0);
+							overlay_typed_pk_free(post_pk, post_n);
+
+							if (pk_mutated)
+							{
+								overlay_typed_pk_free(pre_pk, pre_n);
+								ereport(ERROR,
+										(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+										 errmsg("overlay_branch does not support UPSERT ON CONFLICT DO UPDATE that modifies primary key columns (R03 pk-mutation blocked)"),
+										 errdetail("The DO UPDATE SET targetlist changes a primary key column, which would desync the delta key from the post-image."),
+										 errhint("To change a PK value inside a branch, DELETE the old row then INSERT a new row with the desired key.")));
+							}
+							overlay_typed_pk_free(pre_pk, pre_n);
 						}
 
 						tdata = overlay_serialize_tuple(rel, post_image);

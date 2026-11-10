@@ -128,6 +128,35 @@ SELECT 'PASS:DS_D1_PLAIN_ROLE_DENIED' AS ds_d1;
 DROP ROLE IF EXISTS regress_ds_probe;
 
 -- ============================================================
+-- F. SPI cleanup when the internal delta-count statement raises
+-- ============================================================
+-- overlay_branch._debug_delta_count_error (PGC_SUSET) makes the internal
+-- delta-count statement raise right after SPI_connect().  That error is
+-- swallowed by the delta-size path's fail-open handler (a plain
+-- PG_TRY/FlushErrorState, NOT a subtransaction), so the surrounding DML must
+-- still succeed.  The contract under test: overlay_delta_count() matches its
+-- SPI_connect() with an SPI_finish() on that error path too.  Were it
+-- missing, the frame would survive to end-of-transaction and the implicit
+-- COMMIT of each statement below would emit
+--     WARNING: transaction left non-empty SPI stack
+-- which does not appear in the expected output.
+SET overlay_branch.delta_size_warn_rows = 1;
+SET overlay_branch.delta_size_check_interval = 1;
+SET overlay_branch._debug_delta_count_error = on;
+
+INSERT INTO public.ob_ds VALUES (110, 'fc1');   -- trips count; error swallowed
+INSERT INTO public.ob_ds VALUES (111, 'fc2');   -- and again
+
+SET overlay_branch._debug_delta_count_error = off;
+RESET overlay_branch.delta_size_check_interval;
+RESET overlay_branch.delta_size_warn_rows;
+
+-- The DML must have landed in the delta despite every count failing.
+SELECT CASE WHEN count(*) = 2 THEN 'PASS:FIXC_DML_SURVIVES_COUNT_ERROR'
+            ELSE 'FAIL:FIXC_DML_LOST cnt=' || count(*) END AS fixc_dml
+  FROM public.ob_ds WHERE k IN (110, 111);
+
+-- ============================================================
 -- E. throttled WARNING from the delta-write choke point
 -- ============================================================
 SELECT overlay_branch.use_branch(NULL);           -- leave ds_b1

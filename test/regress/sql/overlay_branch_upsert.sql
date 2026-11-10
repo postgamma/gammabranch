@@ -16,6 +16,25 @@
  *               the PK (branch_id, relid, key), and must not have a (branch_id, relid) redundant index;
  *               and verifies, with M=2000 delta rows, that the write-path existence probe (conflict detection)
  *               resolves both the hit/miss paths correctly.
+ *   Section W — R03 (UPSERT) pk-mutation guard: ON CONFLICT DO UPDATE whose
+ *               SET targetlist touches a PK column must ERROR 0A000 on both
+ *               promo=2 (MAIN conflict) and promo=3 (pure-delta conflict)
+ *               before any delta row is written; a legal (non-PK) UPSERT still
+ *               succeeds and MAIN stays pristine.  Also pins guard-flag
+ *               restoration: an overlay read in the same transaction, after
+ *               the caught 0A000, must still expose the delta.
+ *   Section X — UPSERT DO UPDATE ... WHERE with a PASSING predicate on both
+ *               promo=2 (MAIN conflict) and promo=3 (pure-delta conflict):
+ *               the WHERE evaluation must not clear the caller's live
+ *               pre-image / EXCLUDED slots.
+ *   Section Y — (a) multi-row UPSERT with >= 2 consecutive promo=2/3 rows and
+ *               a varlena SET column: the promo SET-merge projection must not
+ *               clear the caller's live subplan slot (EXCLUDED); otherwise
+ *               the following row reads a released tuple (lz4 corruption).
+ *               (b) both-hit tie-break: when a key is present in MAIN *and*
+ *               in the branch delta, the delta shadows MAIN, so a second
+ *               UPSERT (or a UPSERT after an UPDATE) must build its post-image
+ *               from the delta value, not the stale MAIN row.
  *
  * ⚠️ Absolutely no DISCARD ALL / RESET between S→T→U: all three sections share the
  * catalog state of branches bs_S_br and bs_U_disc; if interrupted, Section T cannot find "bs_S_br" (already discarded in a different session).
@@ -263,4 +282,265 @@ SELECT CASE WHEN count(*) = 100 THEN 'PASS:V2_MAIN_PRISTINE_100'
 SELECT overlay_branch.discard_branch('bs_V_br');
 RESET client_min_messages;
 DROP TABLE public.bs_V_t;
+
+
+/* =========================================================== Section W */
+-- =====================================================================
+-- ===== Section W: R03 (UPSERT) pk-mutation guard.
+-- =====   The delta row is keyed by the CONFLICT identity (pre-image PK)
+-- =====   while the payload is the DO UPDATE SET post-image.  If SET
+-- =====   touches a PK column the two desync exactly as on the plain
+-- =====   UPDATE path, so the write must be refused with 0A000 -- on BOTH
+-- =====   promo=2 (MAIN conflict) and promo=3 (pure-delta conflict) --
+-- =====   BEFORE any delta row is written.
+-- =====   Also asserts a legal (non-PK) UPSERT still succeeds, MAIN stays
+-- =====   pristine, and an overlay READ in the same (outer) transaction,
+-- =====   after the caught 0A000, still exposes the delta (re-entrancy
+-- =====   guard flags restored by the subxact-abort callback).
+-- =====================================================================
+SET client_min_messages = warning;
+DROP TABLE IF EXISTS public.bs_W_up;
+CREATE TABLE public.bs_W_up (id INT4 PRIMARY KEY, v INT4 NOT NULL, t TEXT DEFAULT 'main');
+INSERT INTO public.bs_W_up SELECT g, g*10, 'main' FROM generate_series(1,3) g;
+SELECT overlay_branch.create_branch('bs_W_br');
+SELECT overlay_branch.use_branch('bs_W_br');
+
+-- pure row id=7 (delta-only) so W.2 drives the promo=3 (pure conflict) path
+INSERT INTO public.bs_W_up VALUES (7, 70, 'pure');
+
+DO $$
+DECLARE
+    cnt integer;
+BEGIN
+    -- W.1 promo=2 (MAIN conflict id=2): SET id → must ERROR 0A000
+    BEGIN
+        INSERT INTO public.bs_W_up VALUES (2, 999, 'x')
+          ON CONFLICT (id) DO UPDATE SET id = public.bs_W_up.id + 100;
+        RAISE EXCEPTION 'FAIL_W1_NO_ERROR';
+    EXCEPTION WHEN OTHERS THEN
+        IF SQLSTATE <> '0A000' THEN
+            RAISE EXCEPTION 'FAIL_W1: expected 0A000 got % %', SQLSTATE, SQLERRM;
+        END IF;
+    END;
+    PERFORM overlay_branch.use_branch('bs_W_br');
+
+    -- W.2 promo=3 (pure-delta conflict id=7): SET id → must ERROR 0A000
+    BEGIN
+        INSERT INTO public.bs_W_up VALUES (7, 777, 'x')
+          ON CONFLICT (id) DO UPDATE SET id = public.bs_W_up.id + 100;
+        RAISE EXCEPTION 'FAIL_W2_NO_ERROR';
+    EXCEPTION WHEN OTHERS THEN
+        IF SQLSTATE <> '0A000' THEN
+            RAISE EXCEPTION 'FAIL_W2: expected 0A000 got % %', SQLSTATE, SQLERRM;
+        END IF;
+    END;
+    PERFORM overlay_branch.use_branch('bs_W_br');
+
+    -- W.2b guard restore: the caught 0A000 above was raised while the
+    -- write-redirect / overlay-helper re-entrancy guards were set.  If the
+    -- subxact-abort callback did not fold them back, the overlay would stay
+    -- disabled for the rest of THIS transaction and this read would see
+    -- MAIN only (3 rows, pure id=7 invisible).
+    SELECT count(*) INTO cnt FROM public.bs_W_up;
+    IF cnt <> 4 THEN RAISE EXCEPTION 'FAIL_W_GUARD_LEAK cnt=%', cnt; END IF;
+
+    -- W.3 legal UPSERT (non-PK SET) must still succeed: id=2 v 20→205
+    INSERT INTO public.bs_W_up VALUES (2, 205, 'x')
+      ON CONFLICT (id) DO UPDATE SET v = EXCLUDED.v;
+END $$;
+
+-- overlay view: 3 MAIN + 1 pure = 4 rows; id=2 carries the legal update
+SELECT CASE WHEN count(*) = 4 THEN 'PASS:W_COUNT_EQ_4'
+            ELSE 'FAIL_COUNT:'||count(*) END AS w_cnt
+FROM public.bs_W_up;
+SELECT CASE WHEN v = 205 THEN 'PASS:W3_ID2_V_205'
+            ELSE 'FAIL_V:'||COALESCE(v::text,'NULL') END AS w3
+FROM public.bs_W_up WHERE id = 2;
+-- the refused PK-mutation UPSERTs must not have written any delta row
+SELECT CASE WHEN count(*) = 0 THEN 'PASS:W_NO_PHANTOM_KEYS'
+            ELSE 'FAIL_PHANTOM:'||count(*) END AS w_phantom
+FROM public.bs_W_up WHERE id IN (102, 107);
+
+-- W.4 MAIN pristine (3 rows, sum 60) after exiting the branch
+SELECT overlay_branch.use_branch(NULL);
+RESET overlay_branch.current;
+SET overlay_branch.current = '';
+SELECT CASE WHEN count(*) = 3 THEN 'PASS:W4_MAIN_COUNT_3'
+            ELSE 'FAIL_COUNT:'||count(*) END AS w4c
+FROM public.bs_W_up;
+SELECT CASE WHEN sum(v) = 60 THEN 'PASS:W4_MAIN_SUM_60'
+            ELSE 'FAIL_SUM:'||COALESCE(sum(v)::text,'NULL') END AS w4s
+FROM public.bs_W_up;
+
+SELECT overlay_branch.discard_branch('bs_W_br');
+RESET client_min_messages;
+DROP TABLE public.bs_W_up;
+
+
+/* =========================================================== Section X */
+-- =====================================================================
+-- ===== Section X: UPSERT DO UPDATE ... WHERE with a PASSING predicate.
+-- =====   Regression for the shared-slot preservation fix.  The WHERE
+-- =====   evaluation binds the ModifyTable per-tuple ExprContext's
+-- =====   scantuple/innertuple to the caller's live pre-image / EXCLUDED
+-- =====   slots; a stray ExecClearTuple marked them empty, so the promo
+-- =====   dispatch guard saw TupIsNull()==true and ran against a cleared
+-- =====   slot (getsomeattrs / bogus-palloc errors).  A TRUE predicate was
+-- =====   the only way to reach it -- S.6/S.7 all use a FALSE predicate
+-- =====   (promo=0 skip) and never tripped it.
+-- =====================================================================
+SET client_min_messages = warning;
+DROP TABLE IF EXISTS public.bs_X_up;
+CREATE TABLE public.bs_X_up (id INT4 PRIMARY KEY, v INT4 NOT NULL, t TEXT DEFAULT 'main');
+INSERT INTO public.bs_X_up SELECT g, g*10, 'main' FROM generate_series(1,3) g;
+SELECT overlay_branch.create_branch('bs_X_br');
+SELECT overlay_branch.use_branch('bs_X_br');
+
+-- pure-delta row id=7 so X.2 drives the promo=3 path
+INSERT INTO public.bs_X_up VALUES (7, 70, 'pure');
+
+-- X.1 promo=2 (MAIN conflict id=2) DO UPDATE, WHERE true
+INSERT INTO public.bs_X_up VALUES (2, 205, 'excluded')
+  ON CONFLICT (id) DO UPDATE SET v = EXCLUDED.v WHERE true
+  RETURNING id, v, t;
+
+-- X.2 promo=3 (pure-delta conflict id=7) DO UPDATE, WHERE true
+INSERT INTO public.bs_X_up VALUES (7, 707, 'excluded')
+  ON CONFLICT (id) DO UPDATE SET v = EXCLUDED.v WHERE true
+  RETURNING id, v, t;
+
+-- X.3 promo=2 WHERE references EXCLUDED (true) -> update applies
+INSERT INTO public.bs_X_up VALUES (1, 111, 'excluded')
+  ON CONFLICT (id) DO UPDATE SET v = EXCLUDED.v
+  WHERE public.bs_X_up.v <> EXCLUDED.v
+  RETURNING id, v, t;
+
+-- X.4 promo=0 WHERE false -> skip (no change)
+INSERT INTO public.bs_X_up VALUES (2, 999, 'excluded')
+  ON CONFLICT (id) DO UPDATE SET v = EXCLUDED.v WHERE false
+  RETURNING id, v, t;
+
+-- overlay view: 3 MAIN + 1 pure = 4 rows
+SELECT CASE WHEN count(*) = 4 THEN 'PASS:X_COUNT_EQ_4'
+            ELSE 'FAIL_COUNT:'||count(*) END AS x_cnt
+FROM public.bs_X_up;
+SELECT CASE WHEN v = 205 THEN 'PASS:X1_ID2_V_205'
+            ELSE 'FAIL_V:'||COALESCE(v::text,'NULL') END AS x1
+FROM public.bs_X_up WHERE id = 2;
+SELECT CASE WHEN v = 707 THEN 'PASS:X2_ID7_V_707'
+            ELSE 'FAIL_V:'||COALESCE(v::text,'NULL') END AS x2
+FROM public.bs_X_up WHERE id = 7;
+SELECT CASE WHEN v = 111 THEN 'PASS:X3_ID1_V_111'
+            ELSE 'FAIL_V:'||COALESCE(v::text,'NULL') END AS x3
+FROM public.bs_X_up WHERE id = 1;
+
+-- X.5 MAIN pristine after leaving the branch (3 rows, sum 60)
+SELECT overlay_branch.use_branch(NULL);
+RESET overlay_branch.current;
+SET overlay_branch.current = '';
+SELECT CASE WHEN count(*) = 3 THEN 'PASS:X5_MAIN_COUNT_3'
+            ELSE 'FAIL_COUNT:'||count(*) END AS x5c
+FROM public.bs_X_up;
+SELECT CASE WHEN sum(v) = 60 THEN 'PASS:X5_MAIN_SUM_60'
+            ELSE 'FAIL_SUM:'||COALESCE(sum(v)::text,'NULL') END AS x5s
+FROM public.bs_X_up;
+
+SELECT overlay_branch.discard_branch('bs_X_br');
+RESET client_min_messages;
+DROP TABLE public.bs_X_up;
+
+-- =====================================================================
+-- ===== Section Y: multi-row UPSERT + both-hit delta-shadow tie-break.
+-- ===== (a) shared-slot: each promo=2/3 row binds the caller's LIVE subplan
+-- =====     slot as ecxt_innertuple (EXCLUDED).  The previous code
+-- =====     ExecClearTuple()d it, so on a FOLLOWING promo=2/3 row the
+-- =====     just-fetched subplan slot was cleared and a varlena EXCLUDED.*
+-- =====     value was read from a released tuple (observed as
+-- =====     "compression method lz4 not supported").  A lone conflicting row
+-- =====     never tripped it (S.1/S.2 use one row); it takes >= 2
+-- =====     consecutive conflicting rows with a varlena SET column.
+-- ===== (b) both-hit: a key present in MAIN *and* in the branch delta must
+-- =====     resolve to the delta value (the delta shadows MAIN).  id=2 below
+-- =====     is written by Y.1 and re-touched by Y.3/Y.3b/Y.3c; the old
+-- =====     MAIN-first tie-break reverted its untouched column v back to the
+-- =====     MAIN value (20) instead of keeping the delta value (222).
+-- =====================================================================
+SET client_min_messages = warning;
+DROP TABLE IF EXISTS public.bs_Y_up;
+CREATE TABLE public.bs_Y_up (id INT4 PRIMARY KEY, v INT4, t TEXT);
+INSERT INTO public.bs_Y_up SELECT g, g*10, 'main' FROM generate_series(1,4) g;
+SELECT overlay_branch.create_branch('bs_Y_br');
+SELECT overlay_branch.use_branch('bs_Y_br');
+-- pure-delta rows so Y.2 drives the promo=3 path twice in a row
+INSERT INTO public.bs_Y_up VALUES (50, 500, 'p50'), (51, 510, 'p51');
+
+-- Y.1 two consecutive MAIN-conflict rows (promo=2, promo=2), SET int + varlena
+INSERT INTO public.bs_Y_up VALUES (1, 111, 'a'), (2, 222, 'b')
+  ON CONFLICT (id) DO UPDATE SET v = EXCLUDED.v, t = EXCLUDED.t;
+-- Y.2 two consecutive pure-delta-conflict rows (promo=3, promo=3), SET int + varlena
+INSERT INTO public.bs_Y_up VALUES (50, 505, 'p50x'), (51, 515, 'p51x')
+  ON CONFLICT (id) DO UPDATE SET v = EXCLUDED.v, t = EXCLUDED.t;
+-- Y.3 three consecutive rows: id=2 is a BOTH-HIT (delta from Y.1 shadows
+--     MAIN), id=3/id=4 are MAIN-only first touches.  SET varlena only, so the
+--     untouched v of id=2 must keep the delta value (222), not MAIN (20).
+INSERT INTO public.bs_Y_up VALUES (2, 221, 'c'), (3, 331, 'd'), (4, 441, 'e')
+  ON CONFLICT (id) DO UPDATE SET t = EXCLUDED.t;
+-- Y.3b both-hit WHERE is evaluated against the delta value (v=222) -> true, apply
+INSERT INTO public.bs_Y_up VALUES (2, -1, 'g')
+  ON CONFLICT (id) DO UPDATE SET t = EXCLUDED.t WHERE public.bs_Y_up.v = 222;
+-- Y.3c the MAIN value (20) would make this true, but the delta value (222)
+--      makes it false -> skip, so t stays 'g' (a MAIN-first tie-break would
+--      instead skip here and set t='h')
+INSERT INTO public.bs_Y_up VALUES (2, -1, 'h')
+  ON CONFLICT (id) DO UPDATE SET t = EXCLUDED.t WHERE public.bs_Y_up.v = 20;
+
+SELECT CASE WHEN count(*) = 6 THEN 'PASS:Y_COUNT_EQ_6'
+            ELSE 'FAIL_COUNT:'||count(*) END AS y_cnt
+FROM public.bs_Y_up;
+SELECT CASE WHEN v = 111 AND t = 'a' THEN 'PASS:Y1_ID1_111_A'
+            ELSE 'FAIL:'||COALESCE(v::text,'N')||'/'||COALESCE(t,'N') END AS y1
+FROM public.bs_Y_up WHERE id = 1;
+-- Y.3 both-hit: v keeps the delta value 222 (not the MAIN 20), t from Y.3c is 'g'
+SELECT CASE WHEN v = 222 AND t = 'g' THEN 'PASS:Y3_ID2_BOTH_HIT_222_G'
+            ELSE 'FAIL:'||COALESCE(v::text,'N')||'/'||COALESCE(t,'N') END AS y1b
+FROM public.bs_Y_up WHERE id = 2;
+SELECT CASE WHEN v = 505 AND t = 'p50x' THEN 'PASS:Y2_ID50_505_P50X'
+            ELSE 'FAIL:'||COALESCE(v::text,'N')||'/'||COALESCE(t,'N') END AS y2
+FROM public.bs_Y_up WHERE id = 50;
+SELECT CASE WHEN v = 515 AND t = 'p51x' THEN 'PASS:Y2_ID51_515_P51X'
+            ELSE 'FAIL:'||COALESCE(v::text,'N')||'/'||COALESCE(t,'N') END AS y2b
+FROM public.bs_Y_up WHERE id = 51;
+SELECT CASE WHEN t = 'd' THEN 'PASS:Y3_ID3_D'
+            ELSE 'FAIL:'||COALESCE(t,'N') END AS y3
+FROM public.bs_Y_up WHERE id = 3;
+SELECT CASE WHEN t = 'e' THEN 'PASS:Y3_ID4_E'
+            ELSE 'FAIL:'||COALESCE(t,'N') END AS y3b
+FROM public.bs_Y_up WHERE id = 4;
+
+-- Y.4 MAIN pristine before apply (4 baseline rows, sum(v) = 100)
+SELECT overlay_branch.use_branch(NULL);
+RESET overlay_branch.current;
+SET overlay_branch.current = '';
+SELECT CASE WHEN count(*) = 4 AND sum(v) = 100 THEN 'PASS:Y4_MAIN_PRISTINE'
+            ELSE 'FAIL_MAIN:'||count(*)||'/'||COALESCE(sum(v)::text,'N') END AS y4
+FROM public.bs_Y_up;
+
+-- Y.5 apply materializes every UPSERT: 6 rows, pure-delta rows included
+SELECT overlay_branch.apply_branch('bs_Y_br');
+SELECT CASE WHEN count(*) = 6 THEN 'PASS:Y5_APPLIED_COUNT_6'
+            ELSE 'FAIL_COUNT:'||count(*) END AS y5c
+FROM public.bs_Y_up;
+SELECT CASE WHEN v = 515 AND t = 'p51x' THEN 'PASS:Y5_APPLIED_ID51'
+            ELSE 'FAIL:'||COALESCE(v::text,'N')||'/'||COALESCE(t,'N') END AS y5
+FROM public.bs_Y_up WHERE id = 51;
+SELECT CASE WHEN v = 111 AND t = 'a' THEN 'PASS:Y5_APPLIED_ID1'
+            ELSE 'FAIL:'||COALESCE(v::text,'N')||'/'||COALESCE(t,'N') END AS y5b
+FROM public.bs_Y_up WHERE id = 1;
+-- Y.5 applied both-hit row carries the delta value (222), never MAIN's 20
+SELECT CASE WHEN v = 222 AND t = 'g' THEN 'PASS:Y5_APPLIED_ID2_222_G'
+            ELSE 'FAIL:'||COALESCE(v::text,'N')||'/'||COALESCE(t,'N') END AS y5c2
+FROM public.bs_Y_up WHERE id = 2;
+
+RESET client_min_messages;
+DROP TABLE public.bs_Y_up;
 

@@ -52,14 +52,18 @@ extern bool ob_in_guc_setconfig;
  * §G02 ACL helpers (S13) — double-layer defense
  *
  *   Layer 1 (SQL):  overlay_branch--0.1.sql revokes EXECUTE TO PUBLIC
- *                   on lifecycle functions; grants only to owner +
- *                   the builtin role OB_MGMT_ROLE_NAME.
+ *                   on lifecycle functions; grants only to the builtin
+ *                   role OB_MGMT_ROLE_NAME.
  *   Layer 2 (C  ):  this `ob_acl_check_lifecycle` helper, re-checked
  *                   inside every SQL-callable wrapper so direct
  *                   @extschema@.qualification bypasses of layer-1 still
- *                   get 42501.  For use/apply/discard we also read the
- *                   pg_branch.owner column and compare to the current
- *                   user.
+ *                   get 42501.
+ *
+ *   Branch administration is privileged (superuser or OB_MGMT_ROLE):
+ *   the delta/branch catalogs are DML-able only by that role, so a
+ *   non-admin caller could never complete the underlying work anyway.
+ *   Denying at the C layer keeps the SQLSTATE uniform (42501) instead
+ *   of leaking a raw table-level "permission denied for table".
  * ================================================================ */
 
 static Oid
@@ -85,57 +89,11 @@ ob_user_is_superuser_or_mgmt(void)
 	return false;
 }
 
-static bool
-ob_user_is_branch_owner(const char *branch_name, Oid *out_owner)
-{
-	bool		result = false;
-	int			ret;
-	StringInfoData sql;
-	char	   *esc_name;
-	Oid			owner;
-	bool		isnull;
-	Datum		v;
-
-	if (out_owner) *out_owner = InvalidOid;
-	if (branch_name == NULL || *branch_name == '\0')
-		return false;
-
-	esc_name = quote_literal_cstr(branch_name);
-	initStringInfo(&sql);
-	appendStringInfo(&sql,
-					 "SELECT owner FROM " OBTABLE_BRANCH " "
-					 "WHERE branch_name = %s LIMIT 1",
-					 esc_name);
-
-	ret = ob_spi_one_shot(sql.data, true, 1);
-	pfree(sql.data);
-	pfree(esc_name);
-	if (ret != SPI_OK_SELECT || SPI_processed != 1)
-	{
-		/* Bid does not exist → let the internal function raise its usual
-		 * UNDEFINED_OBJECT error with a branch-specific message, we
-		 * return "not owner" (caller rejects with 42501 only AFTER the
-		 * bid-existence check). */
-		return false;
-	}
-
-	v = SPI_getbinval(SPI_tuptable->vals[0], SPI_tuptable->tupdesc, 1, &isnull);
-	if (isnull)
-		owner = InvalidOid;
-	else
-		owner = DatumGetObjectId(v);
-
-	if (out_owner) *out_owner = owner;
-	result = (OidIsValid(owner) && owner == GetUserId());
-	return result;
-}
-
 void
 ob_acl_check_lifecycle(ObLifecycleOp op, const char *branch_name)
 {
 	const char *opname;
-	bool		allowed = false;
-	Oid			owner_oid = InvalidOid;
+	bool		allowed;
 
 	switch (op)
 	{
@@ -150,26 +108,17 @@ ob_acl_check_lifecycle(ObLifecycleOp op, const char *branch_name)
 			if (branch_name == NULL || *branch_name == '\0')
 				return;
 			opname = "use_branch";
-			if (ob_user_is_superuser_or_mgmt())
-				allowed = true;
-			else
-				allowed = ob_user_is_branch_owner(branch_name, &owner_oid);
+			allowed = ob_user_is_superuser_or_mgmt();
 			break;
 
 		case OB_OP_APPLY_BRANCH:
 			opname = "apply_branch";
-			if (ob_user_is_superuser_or_mgmt())
-				allowed = true;
-			else
-				allowed = ob_user_is_branch_owner(branch_name, &owner_oid);
+			allowed = ob_user_is_superuser_or_mgmt();
 			break;
 
 		case OB_OP_DISCARD_BRANCH:
 			opname = "discard_branch";
-			if (ob_user_is_superuser_or_mgmt())
-				allowed = true;
-			else
-				allowed = ob_user_is_branch_owner(branch_name, &owner_oid);
+			allowed = ob_user_is_superuser_or_mgmt();
 			break;
 
 		default:
@@ -179,32 +128,11 @@ ob_acl_check_lifecycle(ObLifecycleOp op, const char *branch_name)
 	}
 
 	if (!allowed)
-	{
-		if (op == OB_OP_CREATE_BRANCH)
-		{
-			ereport(ERROR,
-					(errcode(ERRCODE_INSUFFICIENT_PRIVILEGE),
-					 errmsg("permission denied to create a branch"),
-					 errhint("Must be superuser or member of role \"%s\".",
-							 OB_MGMT_ROLE_NAME)));
-		}
-		else if (!OidIsValid(owner_oid))
-		{
-			/* Bid not found → let the underlying internal function raise
-			 * UNDEFINED_OBJECT.  (We can't jump to ERROR here with the
-			 * wrong errcode.) */
-			return;
-		}
-		else
-		{
-			ereport(ERROR,
-					(errcode(ERRCODE_INSUFFICIENT_PRIVILEGE),
-					 errmsg("permission denied for %s on branch \"%s\"",
-							opname, branch_name),
-					 errhint("Must be branch owner, superuser, or member of role \"%s\".",
-							 OB_MGMT_ROLE_NAME)));
-		}
-	}
+		ereport(ERROR,
+				(errcode(ERRCODE_INSUFFICIENT_PRIVILEGE),
+				 errmsg("permission denied for %s", opname),
+				 errhint("Must be superuser or member of role \"%s\".",
+						 OB_MGMT_ROLE_NAME)));
 }
 
 /* ================================================================
@@ -674,7 +602,10 @@ ob_g06_check_publication_leak_throttled(void)
 	int			ret;
 	bool		found = false;
 	bool		isnull;
-	bool		spi_connected = false;
+	/* volatile: set inside the PG_TRY and read in the PG_CATCH to decide
+	 * whether to SPI_finish; a non-volatile local's value is indeterminate
+	 * after a longjmp (C99 7.13.2.1) and the frame would leak. */
+	volatile bool spi_connected = false;
 
 	if (s_warned || s_checked)
 		return;
@@ -1923,10 +1854,14 @@ ob_invalidate_check_throttled(bool for_dml)
 	 * both the original kickout entry point and the goto landing point. */
 	bool		still_active = false;
 	bool		got_row = false;
+	/* R19: true when the kickout was triggered by the local snapshot TTL,
+	 * not by another session flipping the branch state.  Keeps the TTL
+	 * diagnostic from being overwritten by the generic invalidated text. */
+	bool		ttl_expired = false;
 
 	local_state_buf[0] = '\0';
 	local_branch_name[0] = '\0';
-	local_what_happened = "invalidated";
+	local_what_happened = "invalidated by another session";
 
 	/* ---- Depth-1 recursion guard.  ANY caller path may re-enter here via
 	 *   throttled → SPI_execute(pg_branch) → planner → is_active → throttled.
@@ -2019,26 +1954,47 @@ ob_invalidate_check_throttled(bool for_dml)
 		 *   on mode==snapshot activation; live mode clears it to 0 so
 		 *   the gate is never taken on the default live path. */
 		if (ctx->entered_at != 0 &&
-			ob_snapshot_max_hold_minutes > 0)
+			(ob_snapshot_max_hold_minutes > 0 ||
+			 ob_debug_snapshot_ttl_seconds >= 0))
 		{
 			long		elapsed_secs;
 			int			elapsed_usecs;
-			int64		elapsed_minutes;
+			int64		elapsed_units;
+			int64		limit_units;
 
 			TimestampDifference(ctx->entered_at, now,
 								&elapsed_secs, &elapsed_usecs);
-			elapsed_minutes = (int64) elapsed_secs / 60;
-			if (elapsed_minutes >= (int64) ob_snapshot_max_hold_minutes)
+			/* The debug override (_debug_snapshot_ttl_seconds >= 0) uses a
+			 * per-second cap so an L3/L1 test can reach the kickout without
+			 * waiting a full minute; the production path counts whole
+			 * minutes. */
+			if (ob_debug_snapshot_ttl_seconds >= 0)
 			{
-				/* TTL expired — treat exactly the same as if the
-				 * branch had been externally invalidated.  We do NOT
-				 * touch SPI (this is a local-side guard).  Instead
-				 * we synthesize "state=expired" for the kickout
-				 * machinery below. */
+				elapsed_units = (int64) elapsed_secs;
+				limit_units = (int64) ob_debug_snapshot_ttl_seconds;
+			}
+			else
+			{
+				elapsed_units = (int64) elapsed_secs / 60;
+				limit_units = (int64) ob_snapshot_max_hold_minutes;
+			}
+			if (elapsed_units >= limit_units)
+			{
+				/* TTL expired — a purely local kickout: the branch is
+				 * still 'active' in the catalog (no other session
+				 * touched it); we force the user off because the
+				 * snapshot pinned the cluster horizon too long.  We do
+				 * NOT touch SPI (this is a local-side guard).  Record
+				 * the real reason so the kickout diagnostic below is
+				 * not overwritten by the generic "invalidated by
+				 * another session" text. */
 				local_is_applied = false;
 				local_is_discarded = false;
-				strcpy(local_state_buf, BRANCH_STATE_ACTIVE);
-				local_what_happened = "snapshot expired (R19 TTL)";
+				strcpy(local_state_buf, "expired");
+				local_what_happened =
+					"exited because the snapshot hold time exceeded "
+					"overlay_branch.snapshot_max_hold_minutes (R19 TTL)";
+				ttl_expired = true;
 				still_active = false;
 				got_row = true;
 				goto snapshot_ttl_kickout;
@@ -2123,10 +2079,13 @@ snapshot_ttl_kickout:
 			/* ===== Kickout path: ground truth says state != active ===== */
 			/* (R19 snapshot TTL jump lands here with local_state_buf
 			 * and what_happened already populated; other paths fall
-			 * through and fill both below.) */
-			strcpy(local_state_buf, got_row ? "<known>" : "missing");
+			 * through and fill both below.)  The TTL case must not be
+			 * re-read: the catalog still says 'active', so a re-read
+			 * would clobber the 'expired' reason we recorded. */
+			if (!ttl_expired)
+				strcpy(local_state_buf, got_row ? "<known>" : "missing");
 
-			if (got_row)
+			if (got_row && !ttl_expired)
 			{
 				StringInfoData sq2;
 				int			r2;
@@ -2242,9 +2201,10 @@ snapshot_ttl_kickout:
 			/* Save kickout inputs from ctx BEFORE cleanup zeroes it. */
 			strncpy(local_branch_name, ctx->branch_name, NAMEDATALEN - 1);
 			local_branch_name[NAMEDATALEN - 1] = '\0';
-			local_what_happened = local_is_applied ? "applied" :
-								  local_is_discarded ? "discarded"
-												 : "invalidated";
+			if (!ttl_expired)
+				local_what_happened = local_is_applied ? "applied by another session" :
+									  local_is_discarded ? "discarded by another session"
+														 : "invalidated by another session";
 
 			/* Planner-hook suppression (kept as dead-code but safe:
 			 * ob_in_planner_hook implies allow_kickout is NOT set,
@@ -2297,7 +2257,7 @@ throttle_clean_exit:	;
 					 errmsg("overlay_branch: branch \"%s\" is no longer "
 							"active (state=%s); cannot write through it",
 							local_branch_name, local_state_buf),
-					 errhint("The branch was %s by another session.  "
+					 errhint("The branch was %s.  "
 							 "Re-connect to MAIN and retry the write.",
 							 local_what_happened)));
 		}

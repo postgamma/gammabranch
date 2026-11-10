@@ -157,6 +157,65 @@ static int	ob_exec_ctx_overflow = 0;		/* pushes past OB_EXEC_CTX_MAX_DEPTH */
 static int	ob_subxact_saved_depth[OB_SUBXACT_MAX_LEVEL];
 static int	ob_subxact_level = 0;
 
+/* ---------- Recursion guard flags (5-layer Bypass stack) ---------- */
+bool		ob_in_apply_operation = false;		/* extern: branch_lifecycle.c writes */
+bool		ob_in_guc_setconfig = false;		/* extern: branch_lifecycle.c writes */
+bool		ob_in_invalidation_check = false;	/* extern: branch_lifecycle.c throttled() */
+bool		ob_in_planner_hook = false;		/* extern: branch_scan planner_hook wrap */
+bool		ob_throttled_allow_kickout = false;	/* extern: only WR ExecutorRun allows cleanup */
+static bool ob_in_overlay_helper = false;
+static bool ob_in_write_redirect = false;
+
+/*
+ * The ob_in_* recursion guards must never outlive the statement / subxact
+ * that set them.  An error thrown inside a guard region longjmps out of the
+ * C helper, skipping its matching overlay_*_exit(), so the flag stays stuck
+ * true and silently disables the overlay for the rest of the session (reads
+ * fall back to MAIN).  The executor-context stack above is unwound exactly
+ * this way by the xact/subxact callbacks; the guard flags ride along on the
+ * same save/restore so a caught error cannot leak them.
+ *
+ * Order is fixed and shared by ob_guards_save() / ob_guards_restore().
+ */
+#define OB_GUARD_COUNT	7
+static bool	ob_subxact_saved_guards[OB_SUBXACT_MAX_LEVEL][OB_GUARD_COUNT];
+
+static void
+ob_guards_save(bool *dst)
+{
+	dst[0] = ob_in_apply_operation;
+	dst[1] = ob_in_guc_setconfig;
+	dst[2] = ob_in_invalidation_check;
+	dst[3] = ob_in_planner_hook;
+	dst[4] = ob_throttled_allow_kickout;
+	dst[5] = ob_in_overlay_helper;
+	dst[6] = ob_in_write_redirect;
+}
+
+static void
+ob_guards_restore(const bool *src)
+{
+	ob_in_apply_operation = src[0];
+	ob_in_guc_setconfig = src[1];
+	ob_in_invalidation_check = src[2];
+	ob_in_planner_hook = src[3];
+	ob_throttled_allow_kickout = src[4];
+	ob_in_overlay_helper = src[5];
+	ob_in_write_redirect = src[6];
+}
+
+static void
+ob_guards_clear(void)
+{
+	ob_in_apply_operation = false;
+	ob_in_guc_setconfig = false;
+	ob_in_invalidation_check = false;
+	ob_in_planner_hook = false;
+	ob_throttled_allow_kickout = false;
+	ob_in_overlay_helper = false;
+	ob_in_write_redirect = false;
+}
+
 static void
 ob_exec_ctx_push(void *owner)
 {
@@ -226,6 +285,7 @@ ob_exec_ctx_reset(void)
 	ob_exec_ctx_overflow = 0;
 	ob_subxact_level = 0;
 	CurrentBranchExecContext = NULL;
+	ob_guards_clear();
 }
 
 /* PostgreSQL skips ExecutorEnd on error abort (portalcmds.c PortalCleanup),
@@ -263,7 +323,10 @@ ob_exec_ctx_subxact_cb(SubXactEvent event, SubTransactionId mySubid,
 	{
 		case SUBXACT_EVENT_START_SUB:
 			if (ob_subxact_level < OB_SUBXACT_MAX_LEVEL)
+			{
 				ob_subxact_saved_depth[ob_subxact_level] = ob_exec_ctx_depth;
+				ob_guards_save(ob_subxact_saved_guards[ob_subxact_level]);
+			}
 			ob_subxact_level++;
 			break;
 		case SUBXACT_EVENT_COMMIT_SUB:
@@ -282,6 +345,9 @@ ob_exec_ctx_subxact_cb(SubXactEvent event, SubTransactionId mySubid,
 					ob_exec_ctx_overflow = 0;
 					CurrentBranchExecContext = (ob_exec_ctx_depth > 0)
 						? &ob_exec_ctx_stack[ob_exec_ctx_depth - 1] : NULL;
+					/* The error longjmp'd past the matching overlay_*_exit(),
+					 * so fold the guard flags back to their pre-subxact state. */
+					ob_guards_restore(ob_subxact_saved_guards[ob_subxact_level]);
 				}
 			}
 			break;
@@ -296,15 +362,6 @@ ob_get_exec_context(void)
 	return CurrentBranchExecContext;
 }
 
-/* ---------- Recursion guard flags (5-layer Bypass stack) ---------- */
-bool		ob_in_apply_operation = false;		/* extern: branch_lifecycle.c writes */
-bool		ob_in_guc_setconfig = false;		/* extern: branch_lifecycle.c writes */
-bool		ob_in_invalidation_check = false;	/* extern: branch_lifecycle.c throttled() */
-bool		ob_in_planner_hook = false;		/* extern: branch_scan planner_hook wrap */
-bool		ob_throttled_allow_kickout = false;	/* extern: only WR ExecutorRun allows cleanup */
-static bool ob_in_overlay_helper = false;
-static bool ob_in_write_redirect = false;
-
 /* T8 § B.9.1 Debug GUCs — § B.11 documented.  Default values match L3
  * expected baseline.  Underlying storage: these two are extern-accessible
  * from branch_lifecycle.c for actual enforcement. */
@@ -313,10 +370,23 @@ int			ob_debug_apply_sleep_sec = 0;			/* PGC_SUSET: pg_sleep(N)
 													 * state='applying' and
 													 * MAIN merge; 0 = OFF */
 int			ob_debug_invalidation_counter_throttle_override = -1;
-											/* PGC_USERSET: >= 0 overrides
-											 * DEFAULT_SPI_INVALIDATION_THROTTLE
-											 * constant for L1 state_inval
-											 * permutation; -1 = use default */
+										/* PGC_USERSET: >= 0 overrides
+										 * DEFAULT_SPI_INVALIDATION_THROTTLE
+										 * constant for L1 state_inval
+										 * permutation; -1 = use default */
+int			ob_debug_snapshot_ttl_seconds = -1;
+										/* PGC_SUSET: >= 0 overrides the R19
+										 * snapshot hold cap (in seconds) so a
+										 * regression test can reach the TTL
+										 * kickout without waiting a whole
+										 * minute; -1 = use
+										 * snapshot_max_hold_minutes */
+bool		ob_debug_delta_count_error = false;
+										/* PGC_SUSET: when on, the internal
+										 * delta-count SPI statement raises
+										 * right after SPI_connect() so a
+										 * regression test can pin the
+										 * SPI_finish-on-error cleanup */
 
 /* --- Layer 1: apply_operation bypass --- */
 bool
@@ -621,6 +691,30 @@ _PG_init(void)
 							NULL,
 							NULL,
 							NULL);
+
+	DefineCustomIntVariable("overlay_branch._debug_snapshot_ttl_seconds",
+							"(DEBUG) Override the R19 snapshot hold cap with a seconds granularity so tests reach the TTL kickout without a whole minute of waiting.",
+							"Set >= 0 to enforce a per-session snapshot hold cap of N seconds; -1 (default) honours overlay_branch.snapshot_max_hold_minutes.  NOT ABI stable.",
+							&ob_debug_snapshot_ttl_seconds,
+							-1,
+							-1,
+							365 * 24 * 60 * 60,
+							PGC_SUSET,
+							GUC_UNIT_S,
+							NULL,
+							NULL,
+							NULL);
+
+	DefineCustomBoolVariable("overlay_branch._debug_delta_count_error",
+							 "(DEBUG) Force the internal branch-delta row count to raise right after SPI_connect().",
+							 "Set on to drive overlay_delta_count()'s SPI_finish-on-error cleanup through a deterministic failure.  The error is swallowed by the delta-size fail-open path.  NOT ABI stable.",
+							 &ob_debug_delta_count_error,
+							 false,
+							 PGC_SUSET,
+							 0,
+							 NULL,
+							 NULL,
+							 NULL);
 
 	MarkGUCPrefixReserved("overlay_branch");
 
