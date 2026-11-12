@@ -380,7 +380,7 @@ BEGIN
 END $$;
 SELECT CASE WHEN count(*) = 2 THEN 'PASS:R21_B2_UNIQUE_DELTA_I_23505'
             ELSE 'FAIL:R21_B2 count=' || count(*) END AS t_r21_b2
-  FROM overlay_branch.overlay_main_plus_delta('public.t_r21');
+  FROM public.t_r21;
 
 -- T_R21_B3: INSERT → UPDATE → re-INSERT same PK → 23505 (delta op=U triggers too)
 INSERT INTO public.t_r21 VALUES (3, 'row3_v1', 30);
@@ -400,7 +400,7 @@ BEGIN
 END $$;
 SELECT CASE WHEN count(*) = 3 THEN 'PASS:R21_B3_UNIQUE_DELTA_U_23505'
             ELSE 'FAIL:R21_B3 count=' || count(*) END AS t_r21_b3
-  FROM overlay_branch.overlay_main_plus_delta('public.t_r21');
+  FROM public.t_r21;
 
 -- T_R21_C: UPSERT ON CONFLICT DO NOTHING / DO UPDATE regression check.
 --          (These paths already had Phase I/II conflict detection; the
@@ -413,11 +413,213 @@ INSERT INTO public.t_r21 VALUES (4, 'upsert_do_update_hit', 42)
     ON CONFLICT (id) DO UPDATE SET v = EXCLUDED.v, n = EXCLUDED.n;  -- promo=3
 SELECT CASE WHEN count(*) = 4 THEN 'PASS:R21_C_UPSERT_OK'
             ELSE 'FAIL:R21_C count=' || count(*) END AS t_r21_c
-  FROM overlay_branch.overlay_main_plus_delta('public.t_r21');
+  FROM public.t_r21;
 
 -- R21 cleanup: discard branch, drop test table.
 SELECT overlay_branch.discard_branch('br_r21');
 DROP TABLE public.t_r21;
+
+-- =====================================================================
+-- Section R23 : Eager NOT NULL (23502) + CHECK (23514) validation on
+--               branch-local writes.
+--
+--   The write-redirect short-circuits standard_ExecutorRun(), so the
+--   executor's own ExecConstraints() never runs for a redirected row.
+--   Without an explicit check an invalid post-image would be silently
+--   stored in the delta and only rejected later, at apply time.  The
+--   redirection now delegates to ExecConstraints() on the post-image
+--   BEFORE writing, so a branch-local UPDATE / INSERT / UPSERT fails
+--   eagerly with the exact native SQLSTATE and leaves the delta
+--   untouched.
+--
+-- COVERAGE:
+--   T_R23_A  : main-hit UPDATE v=NULL           → 23502, delta unchanged
+--   T_R23_B  : main-hit UPDATE ck=-1            → 23514
+--   T_R23_C  : pure-delta UPDATE v=NULL         → 23502
+--   T_R23_D  : pure-delta UPDATE ck=-1          → 23514
+--   T_R23_E  : plain INSERT ck=-1               → 23514
+--              (plain INSERT NOT NULL is already R21_A)
+--   T_R23_F  : UPSERT DO UPDATE merged v=NULL   → 23502
+--   T_R23_G  : UPSERT DO UPDATE merged ck=-1    → 23514
+--   T_R23_H  : UPSERT DO UPDATE candidate v=NULL (merged valid) → 23502
+--   T_R23_I  : UPSERT DO NOTHING candidate v=NULL               → 23502
+--   T_R23_J  : legal UPDATE/INSERT/UPSERT all succeed (no false positive)
+-- =====================================================================
+SET client_min_messages = WARNING;
+CREATE TABLE public.t_r23 (
+    id  integer PRIMARY KEY,
+    v   text NOT NULL,
+    ck  integer CHECK (ck > 0)
+);
+INSERT INTO public.t_r23 VALUES (1, 'seed', 100);
+SELECT overlay_branch.create_branch('br_r23');
+SELECT overlay_branch.use_branch('br_r23');
+
+-- T_R23_A: branch-local UPDATE of a MAIN row sets NOT NULL col to NULL.
+DO $$
+DECLARE _sqlstate text;
+BEGIN
+    BEGIN
+        UPDATE public.t_r23 SET v = NULL WHERE id = 1;
+    EXCEPTION WHEN OTHERS THEN _sqlstate := SQLSTATE;
+    END;
+    IF _sqlstate IS DISTINCT FROM '23502' THEN
+        RAISE EXCEPTION 'FAIL_R23_A: expected 23502 got %', COALESCE(_sqlstate, '<no error>');
+    END IF;
+END $$;
+SELECT CASE WHEN count(*) = 1 THEN 'PASS:R23_A_UPDATE_NOTNULL_23502'
+            ELSE 'FAIL:R23_A row leaked into delta, count=' || count(*) END AS t_r23_a
+  FROM public.t_r23;
+
+-- T_R23_B: branch-local UPDATE of a MAIN row violates CHECK.
+DO $$
+DECLARE _sqlstate text;
+BEGIN
+    BEGIN
+        UPDATE public.t_r23 SET ck = -1 WHERE id = 1;
+    EXCEPTION WHEN OTHERS THEN _sqlstate := SQLSTATE;
+    END;
+    IF _sqlstate IS DISTINCT FROM '23514' THEN
+        RAISE EXCEPTION 'FAIL_R23_B: expected 23514 got %', COALESCE(_sqlstate, '<no error>');
+    END IF;
+END $$;
+SELECT CASE WHEN count(*) = 1 THEN 'PASS:R23_B_UPDATE_CHECK_23514'
+            ELSE 'FAIL:R23_B count=' || count(*) END AS t_r23_b
+  FROM public.t_r23;
+
+-- T_R23_C: branch-local UPDATE of a PURE-DELTA row sets NOT NULL col to NULL.
+INSERT INTO public.t_r23 VALUES (2, 'delta_row', 2);
+DO $$
+DECLARE _sqlstate text;
+BEGIN
+    BEGIN
+        UPDATE public.t_r23 SET v = NULL WHERE id = 2;
+    EXCEPTION WHEN OTHERS THEN _sqlstate := SQLSTATE;
+    END;
+    IF _sqlstate IS DISTINCT FROM '23502' THEN
+        RAISE EXCEPTION 'FAIL_R23_C: expected 23502 got %', COALESCE(_sqlstate, '<no error>');
+    END IF;
+END $$;
+SELECT CASE WHEN count(*) = 2 THEN 'PASS:R23_C_PUREDELTA_UPDATE_NOTNULL_23502'
+            ELSE 'FAIL:R23_C count=' || count(*) END AS t_r23_c
+  FROM public.t_r23;
+
+-- T_R23_D: branch-local UPDATE of a PURE-DELTA row violates CHECK.
+DO $$
+DECLARE _sqlstate text;
+BEGIN
+    BEGIN
+        UPDATE public.t_r23 SET ck = -1 WHERE id = 2;
+    EXCEPTION WHEN OTHERS THEN _sqlstate := SQLSTATE;
+    END;
+    IF _sqlstate IS DISTINCT FROM '23514' THEN
+        RAISE EXCEPTION 'FAIL_R23_D: expected 23514 got %', COALESCE(_sqlstate, '<no error>');
+    END IF;
+END $$;
+SELECT CASE WHEN count(*) = 2 THEN 'PASS:R23_D_PUREDELTA_UPDATE_CHECK_23514'
+            ELSE 'FAIL:R23_D count=' || count(*) END AS t_r23_d
+  FROM public.t_r23;
+
+-- T_R23_E: branch-local plain INSERT violates CHECK.
+DO $$
+DECLARE _sqlstate text;
+BEGIN
+    BEGIN
+        INSERT INTO public.t_r23 VALUES (3, 'ck_bad', -1);
+    EXCEPTION WHEN OTHERS THEN _sqlstate := SQLSTATE;
+    END;
+    IF _sqlstate IS DISTINCT FROM '23514' THEN
+        RAISE EXCEPTION 'FAIL_R23_E: expected 23514 got %', COALESCE(_sqlstate, '<no error>');
+    END IF;
+END $$;
+SELECT CASE WHEN count(*) = 2 THEN 'PASS:R23_E_INSERT_CHECK_23514'
+            ELSE 'FAIL:R23_E count=' || count(*) END AS t_r23_e
+  FROM public.t_r23;
+
+-- T_R23_F: UPSERT DO UPDATE merges to a NOT NULL violation.
+DO $$
+DECLARE _sqlstate text;
+BEGIN
+    BEGIN
+        INSERT INTO public.t_r23 VALUES (1, 'ignored', 1)
+            ON CONFLICT (id) DO UPDATE SET v = NULL;
+    EXCEPTION WHEN OTHERS THEN _sqlstate := SQLSTATE;
+    END;
+    IF _sqlstate IS DISTINCT FROM '23502' THEN
+        RAISE EXCEPTION 'FAIL_R23_F: expected 23502 got %', COALESCE(_sqlstate, '<no error>');
+    END IF;
+END $$;
+SELECT CASE WHEN count(*) = 2 THEN 'PASS:R23_F_UPSERT_DOUPDATE_NOTNULL_23502'
+            ELSE 'FAIL:R23_F count=' || count(*) END AS t_r23_f
+  FROM public.t_r23;
+
+-- T_R23_G: UPSERT DO UPDATE merges to a CHECK violation.
+DO $$
+DECLARE _sqlstate text;
+BEGIN
+    BEGIN
+        INSERT INTO public.t_r23 VALUES (1, 'ignored', 1)
+            ON CONFLICT (id) DO UPDATE SET ck = -1;
+    EXCEPTION WHEN OTHERS THEN _sqlstate := SQLSTATE;
+    END;
+    IF _sqlstate IS DISTINCT FROM '23514' THEN
+        RAISE EXCEPTION 'FAIL_R23_G: expected 23514 got %', COALESCE(_sqlstate, '<no error>');
+    END IF;
+END $$;
+SELECT CASE WHEN count(*) = 2 THEN 'PASS:R23_G_UPSERT_DOUPDATE_CHECK_23514'
+            ELSE 'FAIL:R23_G count=' || count(*) END AS t_r23_g
+  FROM public.t_r23;
+
+-- T_R23_H: the ON CONFLICT candidate row itself is invalid, but DO UPDATE
+--          would overwrite the bad column with a valid value.  Native
+--          ExecInsert() validates the candidate BEFORE resolving the
+--          conflict, so this must still raise 23502.
+DO $$
+DECLARE _sqlstate text;
+BEGIN
+    BEGIN
+        INSERT INTO public.t_r23 VALUES (1, NULL, 1)
+            ON CONFLICT (id) DO UPDATE SET v = 'overwritten';
+    EXCEPTION WHEN OTHERS THEN _sqlstate := SQLSTATE;
+    END;
+    IF _sqlstate IS DISTINCT FROM '23502' THEN
+        RAISE EXCEPTION 'FAIL_R23_H: expected 23502 got %', COALESCE(_sqlstate, '<no error>');
+    END IF;
+END $$;
+SELECT CASE WHEN count(*) = 2 THEN 'PASS:R23_H_UPSERT_CANDIDATE_PRE_CONFLICT_23502'
+            ELSE 'FAIL:R23_H count=' || count(*) END AS t_r23_h
+  FROM public.t_r23;
+
+-- T_R23_I: same candidate check, but DO NOTHING skips the conflicting row.
+DO $$
+DECLARE _sqlstate text;
+BEGIN
+    BEGIN
+        INSERT INTO public.t_r23 VALUES (1, NULL, 1)
+            ON CONFLICT (id) DO NOTHING;
+    EXCEPTION WHEN OTHERS THEN _sqlstate := SQLSTATE;
+    END;
+    IF _sqlstate IS DISTINCT FROM '23502' THEN
+        RAISE EXCEPTION 'FAIL_R23_I: expected 23502 got %', COALESCE(_sqlstate, '<no error>');
+    END IF;
+END $$;
+SELECT CASE WHEN count(*) = 2 THEN 'PASS:R23_I_UPSERT_DONOTHING_CANDIDATE_23502'
+            ELSE 'FAIL:R23_I count=' || count(*) END AS t_r23_i
+  FROM public.t_r23;
+
+-- T_R23_J: valid UPDATE / INSERT / UPSERT must NOT be rejected by the
+--          eager check (guards against a false positive).
+UPDATE public.t_r23 SET v = 'ok1', ck = 101 WHERE id = 1;
+INSERT INTO public.t_r23 VALUES (4, 'ok4', 4) ON CONFLICT (id) DO NOTHING;
+INSERT INTO public.t_r23 VALUES (1, 'zz', 1)
+    ON CONFLICT (id) DO UPDATE SET v = 'ok-up';
+SELECT CASE WHEN count(*) = 3 THEN 'PASS:R23_J_LEGAL_OPS_OK'
+            ELSE 'FAIL:R23_J count=' || count(*) END AS t_r23_j
+  FROM public.t_r23;
+
+-- R23 cleanup: discard branch, drop test table.
+SELECT overlay_branch.discard_branch('br_r23');
+DROP TABLE public.t_r23;
 
 -- =====================================================================
 -- ===== Section G02 (REVIEW-260926 S13 §6):

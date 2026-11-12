@@ -257,13 +257,36 @@ overlay_delta_insert(int32 branch_id, Oid relid, const char *key,
 	nulls[4] = old_version ? ' ' : 'n';
 	nulls[5] = tuple_json_cstr ? ' ' : 'n';
 
+	/* The branch delta is keyed by (branch_id, relid, key), so every
+	 * statement for the same row overwrites the previous delta entry
+	 * (latest-wins).  One collapse needs special handling: DELETE a row that
+	 * exists in MAIN, then INSERT the same PK again (a "rebirth" -- the R21
+	 * pre-check explicitly permits it while a tombstone is present).  Storing
+	 * the resurrected image as op='I' with old_version=NULL would lose the
+	 * fact that the row already existed in MAIN, and the apply INSERT pass
+	 * would then report a spurious "MAIN row already present" conflict even
+	 * though the branch itself deleted that row.
+	 *
+	 * When the surviving delta entry overwrites a DELETE that claimed a MAIN
+	 * baseline (d.op='D' AND d.old_version IS NOT NULL) with a plain INSERT
+	 * (EXCLUDED.op='I' AND EXCLUDED.old_version IS NULL), rewrite it to an
+	 * UPDATE that keeps the deleted row's version token: the net branch effect
+	 * is "replace that MAIN row", which is exactly what the UPDATE apply pass
+	 * validates and replays.  A pure-delta tombstone (d.old_version IS NULL)
+	 * is left as a plain INSERT, since the row never existed in MAIN. */
 	ret = ob_spi_exec_params(
-							 "INSERT INTO " OBTABLE_DELTA " "
+							 "INSERT INTO " OBTABLE_DELTA " AS d "
 							 "(branch_id, relid, key, op, old_version, tuple_data) "
 							 "VALUES ($1, $2, $3, ($4)::bpchar, $5, $6) "
 							 "ON CONFLICT (branch_id, relid, key) DO UPDATE SET "
-							 "op = EXCLUDED.op, "
-							 "old_version = EXCLUDED.old_version, "
+							 "op = CASE WHEN d.op = 'D' AND EXCLUDED.op = 'I' "
+							 "               AND EXCLUDED.old_version IS NULL "
+							 "               AND d.old_version IS NOT NULL "
+							 "          THEN 'U'::bpchar ELSE EXCLUDED.op END, "
+							 "old_version = CASE WHEN d.op = 'D' AND EXCLUDED.op = 'I' "
+							 "               AND EXCLUDED.old_version IS NULL "
+							 "               AND d.old_version IS NOT NULL "
+							 "          THEN d.old_version ELSE EXCLUDED.old_version END, "
 							 "tuple_data = EXCLUDED.tuple_data, "
 							 "updated_at = now()",
 							 false, 1, 6, upsert_argtypes, values, nulls);
@@ -931,10 +954,15 @@ reconstruct_slot_from_delta(Relation rel, bytea *tuple_data,
 								 bytea_sql_lit);
 	pfree(bytea_sql_lit);
 
-	/* one-shot SPI turns the JSON blob → typed single-column result */
+	/* one-shot SPI turns the JSON blob → typed single-column result.
+	 * Must be `SELECT *`, not `SELECT (x).*`: the latter references the
+	 * range-table alias `x` by name, so a user column literally named `x`
+	 * shadows it and aborts with "type <T> is not composite".  `*` expands
+	 * to the record columns in declaration order with no name lookup, so the
+	 * index-based mapping below is unchanged. */
 	initStringInfo(&sql);
 	appendStringInfo(&sql,
-					 "SELECT (x).* FROM jsonb_to_record(%s) AS x(%s) LIMIT 1",
+					 "SELECT * FROM jsonb_to_record(%s) AS x(%s) LIMIT 1",
 					 convert_from_expr, cols.data);
 	pfree(convert_from_expr);
 	pfree(cols.data);
@@ -1728,7 +1756,6 @@ overlay_tuple_version(Relation rel, TupleTableSlot *slot)
 	char	   *sql;
 	char	   *ctid_cstr;
 	char	   *result = NULL;
-	bool		ctid_cstr_allocated = false;
 	Datum		values[1];
 	static const Oid argtypes[1] = {TEXTOID};
 
@@ -1748,7 +1775,6 @@ overlay_tuple_version(Relation rel, TupleTableSlot *slot)
 		snprintf(ctid_cstr, 32, "(%u,%u)",
 				 ItemPointerGetBlockNumber(ip),
 				 ItemPointerGetOffsetNumber(ip));
-		ctid_cstr_allocated = true;
 	}
 
 	overlay_overlay_helper_enter();
@@ -1795,9 +1821,7 @@ overlay_tuple_version(Relation rel, TupleTableSlot *slot)
 
 	SPI_finish();
 	overlay_overlay_helper_exit();
-	if (ctid_cstr_allocated && ctid_cstr)
-		pfree(ctid_cstr);
-	else if (ctid_cstr)
+	if (ctid_cstr)
 		pfree(ctid_cstr);
 	return result;
 }

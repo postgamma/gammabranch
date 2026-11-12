@@ -35,6 +35,29 @@
  *               in the branch delta, the delta shadows MAIN, so a second
  *               UPSERT (or a UPSERT after an UPDATE) must build its post-image
  *               from the delta value, not the stale MAIN row.
+ *   Section Z — EXPLAIN ANALYZE UPSERT conflict counters: because the write
+ *               path bypasses standard_ExecutorRun(), the ModifyTable node's
+ *               ntuples2 (Conflicting Tuples) and nfiltered1 (Rows Removed by
+ *               Conflict Filter) must be accumulated manually, or the root
+ *               node prints "(never executed)" and reports 0 conflicts.
+ *               Pins DO UPDATE / DO NOTHING / DO UPDATE WHERE false / plain
+ *               INSERT.
+ *   Section AA — UPSERT rebirth after a branch-local DELETE: an op='D'
+ *               tombstone shadows MAIN, so INSERT ... ON CONFLICT DO
+ *               NOTHING / DO UPDATE ... WHERE false must rebirth the row
+ *               instead of mis-reading the still-present MAIN row as a
+ *               conflict (Phase I previously saw only op='I'/'U'); a
+ *               genuine (non-deleted) MAIN conflict must still skip, and
+ *               apply_branch materializes every rebirth.
+ *   Section AB — same-statement duplicate arbiter keys (native parity): a
+ *               single INSERT command that proposes the same PK twice must
+ *               match upstream.  The redirect writes row-by-row and the
+ *               command counter never advances between rows of one command,
+ *               so the Phase I/II and R21 probes cannot see an earlier row
+ *               of the same command; the loop tracks the arbiter keys it has
+ *               already claimed for that statement — a later candidate whose
+ *               key was already written errors (plain INSERT → 23505,
+ *               DO UPDATE → 21000) or is skipped (DO NOTHING → first wins).
  *
  * ⚠️ Absolutely no DISCARD ALL / RESET between S→T→U: all three sections share the
  * catalog state of branches bs_S_br and bs_U_disc; if interrupted, Section T cannot find "bs_S_br" (already discarded in a different session).
@@ -543,4 +566,175 @@ FROM public.bs_Y_up WHERE id = 2;
 
 RESET client_min_messages;
 DROP TABLE public.bs_Y_up;
+
+-- =====================================================================
+-- ===== Section Z: EXPLAIN ANALYZE UPSERT conflict counters.
+-- =====   Because the write redirect short-circuits standard_ExecutorRun(),
+-- =====   the ModifyTable node's ntuples2 ("Conflicting Tuples") and
+-- =====   nfiltered1 ("Rows Removed by Conflict Filter") were never
+-- =====   accumulated, and the root node reported "(never executed)".  Z.1..Z.4
+-- =====   pin the stock figures for DO UPDATE / DO NOTHING / DO UPDATE WHERE
+-- =====   false / plain INSERT.
+-- =====================================================================
+SET client_min_messages = warning;
+DROP TABLE IF EXISTS public.bs_Z_up;
+CREATE TABLE public.bs_Z_up (id INT4 PRIMARY KEY, v TEXT);
+INSERT INTO public.bs_Z_up VALUES (1, 'a'), (2, 'a');
+SELECT overlay_branch.create_branch('bs_Z_br');
+SELECT overlay_branch.use_branch('bs_Z_br');
+
+-- Z.1 DO UPDATE, mixed (1 new + 2 conflicts).
+EXPLAIN (ANALYZE, TIMING OFF, SUMMARY OFF, COSTS OFF)
+  INSERT INTO public.bs_Z_up VALUES (1, 'x'), (2, 'y'), (99, 'n')
+  ON CONFLICT (id) DO UPDATE SET v = EXCLUDED.v;
+
+-- Z.2 DO NOTHING, mixed.
+EXPLAIN (ANALYZE, TIMING OFF, SUMMARY OFF, COSTS OFF)
+  INSERT INTO public.bs_Z_up VALUES (1, 'x'), (2, 'y'), (98, 'n')
+  ON CONFLICT (id) DO NOTHING;
+
+-- Z.3 DO UPDATE ... WHERE false: every conflict removed by the filter.
+EXPLAIN (ANALYZE, TIMING OFF, SUMMARY OFF, COSTS OFF)
+  INSERT INTO public.bs_Z_up VALUES (1, 'x'), (2, 'y'), (97, 'n')
+  ON CONFLICT (id) DO UPDATE SET v = EXCLUDED.v WHERE false;
+
+-- Z.4 plain INSERT: no conflict counters at all.
+EXPLAIN (ANALYZE, TIMING OFF, SUMMARY OFF, COSTS OFF)
+  INSERT INTO public.bs_Z_up VALUES (300, 'p'), (301, 'q');
+
+SELECT overlay_branch.use_branch(NULL);
+RESET overlay_branch.current;
+SET overlay_branch.current = '';
+SELECT overlay_branch.discard_branch('bs_Z_br');
+RESET client_min_messages;
+DROP TABLE public.bs_Z_up;
+
+-- =====================================================================
+-- ===== Section AA: UPSERT rebirth after a branch-local DELETE.
+-- =====   A branch-local DELETE leaves an op='D' tombstone that shadows
+-- =====   MAIN.  A following INSERT ... ON CONFLICT must therefore NOT
+-- =====   treat the still-present MAIN row as a conflict: DO NOTHING and
+-- =====   DO UPDATE ... WHERE false must rebirth the row, mirroring the
+-- =====   plain-INSERT R21 rule (a tombstone permits rebirth).  Before the
+-- =====   fix, Phase I only saw op='I'/'U', Phase II re-found the MAIN row,
+-- =====   and promotion stayed 0 (the row silently vanished from the branch).
+-- =====   AA.1/AA.2 pin the two mis-skipping paths, AA.3 the WHERE-true
+-- =====   path, AA.4 a genuine (non-deleted) MAIN conflict that must still
+-- =====   skip, AA.5/AA.6 the overlay read and apply materialization.
+-- =====================================================================
+SET client_min_messages = warning;
+DROP TABLE IF EXISTS public.bs_AA_up;
+CREATE TABLE public.bs_AA_up (id INT4 PRIMARY KEY, v TEXT);
+INSERT INTO public.bs_AA_up VALUES (1,'main1'),(2,'main2'),(3,'main3'),(4,'main4');
+SELECT overlay_branch.create_branch('bs_AA_br');
+SELECT overlay_branch.use_branch('bs_AA_br');
+
+-- AA.1 DELETE then DO NOTHING → rebirth (id=1)
+DELETE FROM public.bs_AA_up WHERE id = 1;
+INSERT INTO public.bs_AA_up VALUES (1, 'reborn1')
+  ON CONFLICT (id) DO NOTHING
+  RETURNING id, v;
+
+-- AA.2 DELETE then DO UPDATE ... WHERE false → rebirth (id=2)
+DELETE FROM public.bs_AA_up WHERE id = 2;
+INSERT INTO public.bs_AA_up VALUES (2, 'reborn2')
+  ON CONFLICT (id) DO UPDATE SET v = EXCLUDED.v WHERE false
+  RETURNING id, v;
+
+-- AA.3 DELETE then DO UPDATE ... WHERE true → rebirth (id=3)
+DELETE FROM public.bs_AA_up WHERE id = 3;
+INSERT INTO public.bs_AA_up VALUES (3, 'reborn3')
+  ON CONFLICT (id) DO UPDATE SET v = EXCLUDED.v WHERE true
+  RETURNING id, v;
+
+-- AA.4 genuine MAIN conflict (id=4, not deleted) DO NOTHING → still skipped
+INSERT INTO public.bs_AA_up VALUES (4, 'nope')
+  ON CONFLICT (id) DO NOTHING
+  RETURNING id, v;
+
+-- AA.5 overlay: three rebirths + id=4 untouched
+SELECT CASE WHEN count(*) = 4
+             AND count(*) FILTER (WHERE v IN ('reborn1','reborn2','reborn3')) = 3
+             AND bool_and(v <> 'nope')
+       THEN 'PASS:AA5_OVERLAY'
+       ELSE 'FAIL:'||string_agg(id||'='||v, ',' ORDER BY id) END AS aa5
+FROM overlay_branch.overlay_main_plus_delta('public.bs_AA_up') AS t(id int, v text);
+
+-- AA.6 leave branch + apply → MAIN carries the reborn values
+SELECT overlay_branch.use_branch(NULL);
+RESET overlay_branch.current;
+SET overlay_branch.current = '';
+SELECT overlay_branch.apply_branch('bs_AA_br');
+SELECT CASE WHEN count(*) = 4
+             AND count(*) FILTER (WHERE v IN ('reborn1','reborn2','reborn3')) = 3
+             AND bool_and(v <> 'nope')
+       THEN 'PASS:AA6_APPLIED'
+       ELSE 'FAIL:'||string_agg(id||'='||v, ',' ORDER BY id) END AS aa6
+FROM public.bs_AA_up;
+
+RESET client_min_messages;
+DROP TABLE public.bs_AA_up;
+
+-- =====================================================================
+-- ===== Section AB: same-statement duplicate arbiter keys (native parity).
+-- =====   A single INSERT command whose VALUES list proposes the same PK
+-- =====   twice must behave exactly like upstream PostgreSQL.  The redirect
+-- =====   writes row-by-row into the delta and the command counter never
+-- =====   advances between rows of one command, so the Phase I/II and R21
+-- =====   SPI probes cannot see an earlier row written by THIS command.  The
+-- =====   write path therefore tracks the arbiter keys it has already
+-- =====   claimed for the statement: a later candidate whose key was already
+-- =====   written errors (plain INSERT -> 23505 unique_violation,
+-- =====   DO UPDATE -> 21000 cardinality_violation) or is skipped
+-- =====   (DO NOTHING -> first row wins), matching native behavior.
+-- =====   AB.1..AB.5 pin the five outcomes; AB.6 distinct multi-row still
+-- =====   inserts cleanly; AB.7/AB.8 overlay + apply.
+-- =====================================================================
+SET client_min_messages = warning;
+DROP TABLE IF EXISTS public.bs_AB_up;
+CREATE TABLE public.bs_AB_up (id INT4 PRIMARY KEY, v TEXT);
+SELECT overlay_branch.create_branch('bs_AB_br');
+SELECT overlay_branch.use_branch('bs_AB_br');
+
+-- AB.1 empty table + DO NOTHING duplicate -> first row wins (INSERT 0 1)
+INSERT INTO public.bs_AB_up VALUES (1,'x'),(1,'y') ON CONFLICT (id) DO NOTHING;
+
+-- AB.2 empty table + DO UPDATE duplicate -> 21000 cardinality_violation
+INSERT INTO public.bs_AB_up VALUES (2,'x'),(2,'y') ON CONFLICT (id) DO UPDATE SET v = EXCLUDED.v;
+
+-- AB.3 empty table + plain INSERT duplicate -> 23505 unique_violation
+INSERT INTO public.bs_AB_up VALUES (3,'x'),(3,'y');
+
+-- AB.4 MAIN-hit + DO NOTHING duplicate -> both conflict, INSERT 0 0
+INSERT INTO public.bs_AB_up VALUES (10,'m10');
+INSERT INTO public.bs_AB_up VALUES (10,'x'),(10,'y') ON CONFLICT (id) DO NOTHING;
+
+-- AB.5 MAIN-hit + DO UPDATE duplicate -> 21000
+INSERT INTO public.bs_AB_up VALUES (11,'m11');
+INSERT INTO public.bs_AB_up VALUES (11,'x'),(11,'y') ON CONFLICT (id) DO UPDATE SET v = EXCLUDED.v;
+
+-- AB.6 distinct keys in one multi-row INSERT still insert cleanly (no false positive)
+INSERT INTO public.bs_AB_up VALUES (20,'a'),(21,'b'),(22,'c');
+
+-- AB.7 overlay: id=1 first-wins plus the five surviving distinct rows
+SELECT CASE WHEN count(*) = 6
+             AND max(v) FILTER (WHERE id = 1) = 'x'
+             AND count(*) FILTER (WHERE id IN (10,11,20,21,22)) = 5
+       THEN 'PASS:AB7_OVERLAY'
+       ELSE 'FAIL:'||coalesce(string_agg(id||'='||v, ',' ORDER BY id),'empty') END AS ab7
+FROM overlay_branch.overlay_main_plus_delta('public.bs_AB_up') AS t(id int, v text);
+
+-- AB.8 leave branch + apply -> MAIN carries the same set
+SELECT overlay_branch.use_branch(NULL);
+RESET overlay_branch.current;
+SET overlay_branch.current = '';
+SELECT overlay_branch.apply_branch('bs_AB_br');
+SELECT CASE WHEN count(*) = 6
+             AND max(v) FILTER (WHERE id = 1) = 'x'
+       THEN 'PASS:AB8_APPLIED'
+       ELSE 'FAIL:'||coalesce(string_agg(id||'='||v, ',' ORDER BY id),'empty') END AS ab8
+FROM public.bs_AB_up;
+
+RESET client_min_messages;
+DROP TABLE public.bs_AB_up;
 

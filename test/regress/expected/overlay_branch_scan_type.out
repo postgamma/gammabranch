@@ -17,6 +17,10 @@
  *               taken AFTER a middle column is dropped must still rebuild
  *               delta rows correctly -- the SPI result set is mapped to the
  *               heap TupleDesc by skipping dropped attnums.
+ *   Section L — reconstruction alias collision (BUG regression): the delta
+ *               read-back SQL used the field-selection `(x).*`, whose bare
+ *               name `x` is shadowed by a user column literally named `x`,
+ *               aborting the read with "type <T> is not composite".
  *
  * Sections share session; between F→G→H→I→J if the same bs_user table is reused keep it continuous without DISCARD.
  */
@@ -972,3 +976,88 @@ SELECT overlay_branch.discard_branch('bs_dropcol_b');
 
 RESET client_min_messages;
 DROP TABLE public.bs_dropcol;
+/* =========================================================== Section L */
+-- =====================================================================
+-- ===== Section L: reconstruction alias must not shadow a user column.
+-- =====   reconstruct_slot_from_delta() rebuilds a slot with
+-- =====     SELECT * FROM jsonb_to_record(...) AS x(<colspec>)
+-- =====   after any branch-local write.  The reference used to be the
+-- =====   field-selection `(x).*`, which resolves the bare name `x`; a user
+-- =====   column literally named `x` then shadows the range-table alias and
+-- =====   the read aborts with "type <T> is not composite".  `x` is a very
+-- =====   ordinary column name, so this path must never regress.
+-- =====================================================================
+SET client_min_messages = warning;
+DROP TABLE IF EXISTS public.bs_aliasx;
+CREATE TABLE public.bs_aliasx (id INT4 PRIMARY KEY, x INT4, label TEXT);
+INSERT INTO public.bs_aliasx VALUES (1, 10, 'main1');
+SELECT overlay_branch.create_branch('bs_aliasx_b');
+ create_branch 
+---------------
+            14
+(1 row)
+
+SELECT overlay_branch.use_branch('bs_aliasx_b');
+ use_branch 
+------------
+ 
+(1 row)
+
+INSERT INTO public.bs_aliasx VALUES (2, 20, 'delta2');   -- pure-delta INSERT
+UPDATE public.bs_aliasx SET x = 99 WHERE id = 1;         -- MAIN-row UPDATE -> delta
+-- L.1 overlay read of the pure-delta INSERT row (table has a column named `x`)
+SELECT CASE WHEN x = 20 AND label = 'delta2'
+            THEN 'PASS:L1_ALIAS_X_DELTA_INSERT'
+            ELSE 'FAIL:'||COALESCE(x::text,'NULL')||'/'||COALESCE(label,'NULL') END AS l1
+  FROM public.bs_aliasx WHERE id = 2;
+              l1              
+------------------------------
+ PASS:L1_ALIAS_X_DELTA_INSERT
+(1 row)
+
+-- L.2 overlay read of the redirected UPDATE row (write-redirect pre-image too)
+SELECT CASE WHEN x = 99 AND label = 'main1'
+            THEN 'PASS:L2_ALIAS_X_DELTA_UPDATE'
+            ELSE 'FAIL:'||COALESCE(x::text,'NULL')||'/'||COALESCE(label,'NULL') END AS l2
+  FROM public.bs_aliasx WHERE id = 1;
+              l2              
+------------------------------
+ PASS:L2_ALIAS_X_DELTA_UPDATE
+(1 row)
+
+-- L.3 aggregate read over the whole overlay
+SELECT CASE WHEN string_agg(id::text||':'||x::text||':'||label, ',' ORDER BY id)
+              = '1:99:main1,2:20:delta2'
+            THEN 'PASS:L3_ALIAS_X_OVERLAY_AGG'
+            ELSE 'FAIL:'||COALESCE(string_agg(id::text||':'||x::text||':'||label, ',' ORDER BY id),'NULL') END AS l3
+  FROM public.bs_aliasx;
+             l3              
+-----------------------------
+ PASS:L3_ALIAS_X_OVERLAY_AGG
+(1 row)
+
+SELECT overlay_branch.use_branch(NULL);
+ use_branch 
+------------
+ 
+(1 row)
+
+RESET overlay_branch.current;
+-- L.4 MAIN pristine (branch never applied)
+SELECT CASE WHEN count(*) = 1 AND max(x) = 10 AND max(label) = 'main1'
+            THEN 'PASS:L4_ALIAS_X_MAIN_PRISTINE'
+            ELSE 'FAIL' END AS l4
+  FROM public.bs_aliasx;
+              l4               
+-------------------------------
+ PASS:L4_ALIAS_X_MAIN_PRISTINE
+(1 row)
+
+SELECT overlay_branch.discard_branch('bs_aliasx_b');
+ discard_branch 
+----------------
+ 
+(1 row)
+
+RESET client_min_messages;
+DROP TABLE public.bs_aliasx;

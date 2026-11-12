@@ -1534,18 +1534,26 @@ ob_branchscan_planner_hook(PlannerInfo *root, RelOptInfo *rel,
         }
     }
 
-    /* B2 PRE-CHECK: we inject CustomScan for pure SELECT, and (ACC-1) for
-     * the DML target baserel of an UPDATE/DELETE so the DML subplan reads
-     * overlay rows.  Every other non-SELECT command (INSERT, and the FROM/USING
-     * side of UPDATE ... FROM / DELETE ... USING, which is a non-target RTI)
-     * still bails out here.  Guarded by the same reason as before: this runs
-     * above the is_active() call to avoid an unnecessary helper C entry. */
+    /* B2 PRE-CHECK: we inject the CustomScan for every RTE that is READ --
+     * pure SELECT, the ACC-1 DML target baserel of an UPDATE/DELETE (so the
+     * DML subplan reads overlay rows and its scan exposes the heap ctid), and
+     * the FROM/USING side of UPDATE ... FROM / DELETE ... USING and the source
+     * of INSERT ... SELECT.
+     *
+     * The one RTE we must NOT wrap is the INSERT target (rti == resultRelation
+     * with commandType CMD_INSERT): it is not read at all (its conflict
+     * detection runs through the write-redirect's own SPI probe, not this
+     * scan).  Every read source MUST see this branch's writes, exactly like a
+     * standalone SELECT and like a correlated subquery read source (a
+     * CMD_SELECT Query, which was already wrapped).  Previously only the DML
+     * target and pure SELECT were wrapped, so the same read written as a
+     * top-level FROM silently read MAIN while the subquery form read the
+     * overlay.  Guarded by the same reason as before: this runs above the
+     * is_active() call to avoid an unnecessary helper C entry. */
     if (root->parse != NULL && root->parse->type == T_Query)
     {
-        CmdType ct = ((Query *) root->parse)->commandType;
-        if (ct != CMD_SELECT &&
-            ((ct != CMD_UPDATE && ct != CMD_DELETE) ||
-             rti != ((Query *) root->parse)->resultRelation))
+        Query *pq = (Query *) root->parse;
+        if (pq->commandType == CMD_INSERT && rti == pq->resultRelation)
             return;
     }
 

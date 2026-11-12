@@ -12,6 +12,10 @@
 -- write-redirect loop use the OVERLAY row (MAIN (+) delta) as the
 -- pre-image, eliminating all three.
 --
+-- ACC1_RDSRC extends the same injection to the DML's READ sources (the
+-- FROM/USING side of UPDATE ... FROM / DELETE ... USING and the source of
+-- INSERT ... SELECT), so a managed source reads the overlay instead of MAIN.
+--
 -- Style rules (identical to the sibling regression files so pg_regress
 -- expected .out files stay diff-stable across machines/runs):
 --   * No \meta commands, no timestamps/OIDs/ctid/xmin in SELECT output.
@@ -206,4 +210,197 @@ SELECT discard_branch('acc1_neg_b');
 
 DROP TABLE acc1_neg;
 RESET overlay_branch.keyless_tables;
+-- ===== ACC1_JOINSRC: a read-only join source must not abort a target DML =====
+-- A no-PK relation used only as a READ source (the FROM/USING side of
+-- INSERT ... SELECT / UPDATE ... FROM / DELETE ... USING) is not a DML
+-- target; its rows come from MAIN just like any DQL read, so it must NOT
+-- trip the no-PK target guard and abort the whole statement.  The former
+-- Step7 guard walked the entire es_range_table and rejected these, which
+-- native PostgreSQL accepts.  This pins the target-only scope.
+SET overlay_branch.keyless_tables = off;
+CREATE TABLE acc1_src (k int, w text);              -- no PK: read-only source
+INSERT INTO acc1_src VALUES (10, 'sx'), (20, 'sy'), (40, 'sz');
+CREATE TABLE acc1_dst (id int PRIMARY KEY, v text);
+INSERT INTO acc1_dst VALUES (10, 'd10'), (20, 'd20'), (30, 'd30');
+SELECT create_branch('acc1_jsrc_b');
+ create_branch 
+---------------
+             3
+(1 row)
+
+SELECT use_branch('acc1_jsrc_b');
+ use_branch 
+------------
+ 
+(1 row)
+
+-- UPDATE ... FROM keyless source: only the PK target rows are redirected.
+UPDATE acc1_dst SET v = acc1_src.w FROM acc1_src WHERE acc1_dst.id = acc1_src.k;
+SELECT CASE WHEN string_agg(id || '=' || v, ',' ORDER BY id) = '10=sx,20=sy,30=d30'
+            THEN 'PASS:ACC1_JOINSRC_UPDATE'
+            ELSE 'FAIL:ACC1_JOINSRC_UPDATE:' || string_agg(id || '=' || v, ',' ORDER BY id)
+       END AS acc1_jsrc_up FROM acc1_dst;
+       acc1_jsrc_up       
+--------------------------
+ PASS:ACC1_JOINSRC_UPDATE
+(1 row)
+
+-- DELETE ... USING keyless source.
+DELETE FROM acc1_dst USING acc1_src WHERE acc1_dst.id = acc1_src.k AND acc1_src.w = 'sy';
+SELECT CASE WHEN string_agg(id || '=' || v, ',' ORDER BY id) = '10=sx,30=d30'
+            THEN 'PASS:ACC1_JOINSRC_DELETE'
+            ELSE 'FAIL:ACC1_JOINSRC_DELETE:' || string_agg(id || '=' || v, ',' ORDER BY id)
+       END AS acc1_jsrc_del FROM acc1_dst;
+      acc1_jsrc_del       
+--------------------------
+ PASS:ACC1_JOINSRC_DELETE
+(1 row)
+
+-- INSERT ... SELECT from keyless source.
+INSERT INTO acc1_dst SELECT k, w FROM acc1_src WHERE k = 40;
+SELECT CASE WHEN string_agg(id || '=' || v, ',' ORDER BY id) = '10=sx,30=d30,40=sz'
+            THEN 'PASS:ACC1_JOINSRC_INSERT'
+            ELSE 'FAIL:ACC1_JOINSRC_INSERT:' || string_agg(id || '=' || v, ',' ORDER BY id)
+       END AS acc1_jsrc_ins FROM acc1_dst;
+      acc1_jsrc_ins       
+--------------------------
+ PASS:ACC1_JOINSRC_INSERT
+(1 row)
+
+-- The no-PK guard MUST still fire when the no-PK table IS the DML target.
+DO $$
+BEGIN
+  UPDATE acc1_src SET w = 'x' WHERE k = 10;
+  RAISE NOTICE 'FAIL:ACC1_JOINSRC_TARGET_WAS_ALLOWED';
+EXCEPTION
+  WHEN SQLSTATE '0A000' THEN RAISE NOTICE 'PASS:ACC1_JOINSRC_TARGET_0A000';
+  WHEN OTHERS           THEN RAISE NOTICE 'FAIL:ACC1_JOINSRC_TARGET_OTHER_SQLSTATE=%', SQLSTATE;
+END $$;
+NOTICE:  PASS:ACC1_JOINSRC_TARGET_0A000
+-- Materialise and confirm MAIN matches the branch image.
+SELECT use_branch(NULL);
+ use_branch 
+------------
+ 
+(1 row)
+
+SELECT apply_branch('acc1_jsrc_b');
+NOTICE:  overlay_branch: APPLY BRANCH 'acc1_jsrc_b' (passes D→U→I with optimistic conflict detection)
+NOTICE:  overlay_branch: APPLY BRANCH 'acc1_jsrc_b' completed (state=applied, delta rows deleted)
+ apply_branch 
+--------------
+ 
+(1 row)
+
+SELECT CASE WHEN string_agg(id || '=' || v, ',' ORDER BY id) = '10=sx,30=d30,40=sz'
+            THEN 'PASS:ACC1_JOINSRC_APPLY'
+            ELSE 'FAIL:ACC1_JOINSRC_APPLY:' || string_agg(id || '=' || v, ',' ORDER BY id)
+       END AS acc1_jsrc_apply FROM acc1_dst;
+     acc1_jsrc_apply     
+-------------------------
+ PASS:ACC1_JOINSRC_APPLY
+(1 row)
+
+DROP TABLE acc1_dst;
+DROP TABLE acc1_src;
+RESET overlay_branch.keyless_tables;
+-- ===== ACC1_RDSRC: a MANAGED read source must see this branch's writes =====
+-- The FROM/USING side of UPDATE ... FROM / DELETE ... USING and the source of
+-- INSERT ... SELECT live at the TOP query level, so the B2 pre-check sees the
+-- DML's own commandType at that RTE.  The old check wrapped only the DML
+-- target, so these read sources silently read MAIN, while the equivalent
+-- correlated-subquery form (a CMD_SELECT Query) already read the overlay.  This
+-- pins that a managed PK read source now reads the overlay too, so both forms
+-- agree.  Each assertion is a discriminator: reading MAIN would give a
+-- different result.
+CREATE TABLE acc1_rsrc (id int PRIMARY KEY, w text);
+CREATE TABLE acc1_rdst (id int PRIMARY KEY, v text);
+INSERT INTO acc1_rsrc VALUES (1, 'm1'), (2, 'm2');
+INSERT INTO acc1_rdst VALUES (1, 'd1'), (2, 'd2'), (9, 'd9');
+SELECT create_branch('acc1_rsrc_b');
+ create_branch 
+---------------
+             4
+(1 row)
+
+SELECT use_branch('acc1_rsrc_b');
+ use_branch 
+------------
+ 
+(1 row)
+
+-- Branch-local edits on the SOURCE only: overlay is 1=>b1, 2=>m2, 3=>b3.
+UPDATE acc1_rsrc SET w = 'b1' WHERE id = 1;
+INSERT INTO acc1_rsrc VALUES (3, 'b3');
+-- R1 UPDATE ... FROM: dst 1,2 take the OVERLAY source values (b1, m2), and the
+-- overlay-only source row 3 matches no dst row yet.
+UPDATE acc1_rdst SET v = acc1_rsrc.w FROM acc1_rsrc WHERE acc1_rdst.id = acc1_rsrc.id;
+SELECT CASE WHEN string_agg(id || '=' || v, ',' ORDER BY id) = '1=b1,2=m2,9=d9'
+            THEN 'PASS:ACC1_RDSRC_UPDATE_FROM'
+            ELSE 'FAIL:ACC1_RDSRC_UPDATE_FROM:' || string_agg(id || '=' || v, ',' ORDER BY id)
+       END AS acc1_rsrc_up FROM acc1_rdst;
+        acc1_rsrc_up         
+-----------------------------
+ PASS:ACC1_RDSRC_UPDATE_FROM
+(1 row)
+
+-- R2 INSERT ... SELECT: the overlay-only source row 3 must be visible.
+INSERT INTO acc1_rdst SELECT id, w FROM acc1_rsrc WHERE id = 3;
+SELECT CASE WHEN string_agg(id || '=' || v, ',' ORDER BY id) = '1=b1,2=m2,3=b3,9=d9'
+            THEN 'PASS:ACC1_RDSRC_INSERT_SELECT'
+            ELSE 'FAIL:ACC1_RDSRC_INSERT_SELECT:' || string_agg(id || '=' || v, ',' ORDER BY id)
+       END AS acc1_rsrc_ins FROM acc1_rdst;
+         acc1_rsrc_ins         
+-------------------------------
+ PASS:ACC1_RDSRC_INSERT_SELECT
+(1 row)
+
+-- R3 DELETE ... USING: the predicate matches src.w = 'b1', a value that exists
+-- ONLY in the overlay (MAIN has 'm1'), so a MAIN read would delete 0 rows.
+DELETE FROM acc1_rdst USING acc1_rsrc
+  WHERE acc1_rdst.id = acc1_rsrc.id AND acc1_rsrc.w = 'b1';
+SELECT CASE WHEN string_agg(id || '=' || v, ',' ORDER BY id) = '2=m2,3=b3,9=d9'
+            THEN 'PASS:ACC1_RDSRC_DELETE_USING'
+            ELSE 'FAIL:ACC1_RDSRC_DELETE_USING:' || string_agg(id || '=' || v, ',' ORDER BY id)
+       END AS acc1_rsrc_del FROM acc1_rdst;
+        acc1_rsrc_del         
+------------------------------
+ PASS:ACC1_RDSRC_DELETE_USING
+(1 row)
+
+-- R4 apply: the branch image materialises onto MAIN.
+SELECT use_branch(NULL);
+ use_branch 
+------------
+ 
+(1 row)
+
+SELECT apply_branch('acc1_rsrc_b');
+NOTICE:  overlay_branch: APPLY BRANCH 'acc1_rsrc_b' (passes D→U→I with optimistic conflict detection)
+NOTICE:  overlay_branch: APPLY BRANCH 'acc1_rsrc_b' completed (state=applied, delta rows deleted)
+ apply_branch 
+--------------
+ 
+(1 row)
+
+SELECT CASE WHEN string_agg(id || '=' || v, ',' ORDER BY id) = '2=m2,3=b3,9=d9'
+            THEN 'PASS:ACC1_RDSRC_APPLY_DST'
+            ELSE 'FAIL:ACC1_RDSRC_APPLY_DST:' || string_agg(id || '=' || v, ',' ORDER BY id)
+       END AS acc1_rsrc_appdst FROM acc1_rdst;
+     acc1_rsrc_appdst      
+---------------------------
+ PASS:ACC1_RDSRC_APPLY_DST
+(1 row)
+
+SELECT CASE WHEN string_agg(id || '=' || w, ',' ORDER BY id) = '1=b1,2=m2,3=b3'
+            THEN 'PASS:ACC1_RDSRC_APPLY_SRC'
+            ELSE 'FAIL:ACC1_RDSRC_APPLY_SRC:' || string_agg(id || '=' || w, ',' ORDER BY id)
+       END AS acc1_rsrc_appsrc FROM acc1_rsrc;
+     acc1_rsrc_appsrc      
+---------------------------
+ PASS:ACC1_RDSRC_APPLY_SRC
+(1 row)
+
+DROP TABLE acc1_rdst;
+DROP TABLE acc1_rsrc;
 DROP EXTENSION overlay_branch CASCADE;

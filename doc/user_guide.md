@@ -340,6 +340,31 @@ SELECT * FROM overlay_branch.overlay_main_plus_delta('products')
  ORDER BY id;
 ```
 
+A read is not limited to a bare `SELECT`. Inside a branch, a DML statement's
+**read sources** — the FROM/USING side of `UPDATE ... FROM` / `DELETE ... USING`
+and the source of `INSERT ... SELECT` — also see this branch's writes, so the
+statement always operates on the same branch image a `SELECT` would return.
+
+```sql
+-- Branch sees products id=1 as price 100; a DML reading products must agree.
+UPDATE orders SET note = products.name FROM products WHERE orders.pid = products.id;
+```
+
+**Constraint checks are eager.** A branch-local write validates the target
+table's `NOT NULL` and `CHECK` constraints immediately, exactly like the same
+statement run on Main: an invalid row raises `23502` / `23514` and never lands
+in the branch delta (rather than being stored and only failing at apply time).
+For `INSERT ... ON CONFLICT` the candidate row is checked before the conflict is
+resolved, and a `DO UPDATE` re-checks the merged row, so the behavior matches
+Main even when `DO NOTHING` or `DO UPDATE` would otherwise discard the offending
+value.
+
+```sql
+SELECT use_branch('agent_workspace');
+UPDATE products SET price = NULL WHERE id = 1;
+-- ERROR: 23502: null value in column "price" of relation "products" violates not-null constraint
+```
+
 ### 2.5 Complete Overlay Example
 
 Using the 3 DML statements written in §2: id=1 UPDATE, id=2 DELETE, id=4 INSERT.
@@ -634,6 +659,19 @@ SELECT * FROM products WHERE id = 3;
  id |   name    | price
 ----+-----------+-------
   3 | Cherry_v5 |   999
+
+-- After a branch-local DELETE, an UPSERT rebirths the row: the branch has
+-- logically removed it, so ON CONFLICT must not treat the still-present MAIN
+-- row as a conflict.  DO NOTHING and DO UPDATE ... WHERE false rebirth too.
+DELETE FROM products WHERE id = 3;
+INSERT INTO products VALUES (3, 'Cherry_reborn', 1)
+  ON CONFLICT (id) DO UPDATE SET name  = EXCLUDED.name,
+                                  price = EXCLUDED.price
+  WHERE false;
+SELECT * FROM products WHERE id = 3;
+ id |     name      | price
+----+---------------+-------
+  3 | Cherry_reborn |     1
 ```
 
 ### 5.2 Data-Modifying CTE: Explicit ERROR
@@ -1045,6 +1083,11 @@ INSERT INTO logs VALUES ('x');
 ERROR:  overlay_branch: cannot INSERT relation "logs" inside active branch "b_logs": table must have a PRIMARY KEY for branch-mode DML (enable overlay_branch.keyless_tables for the experimental ctid fallback)
 DETAIL:  Target relation: logs.
 ```
+
+A no-PK table used only as a **read source** is not a DML target and is unaffected by
+this rule: `INSERT INTO t SELECT ... FROM logs`, `UPDATE t ... FROM logs` and
+`DELETE FROM t USING logs` read `logs` from Main (as any `SELECT` on a no-PK table
+does), so they need no primary key on `logs`.
 
 ```sql
 -- After enabling the experimental switch: one-line WARNING + normal read/write overlay

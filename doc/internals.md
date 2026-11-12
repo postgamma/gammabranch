@@ -132,8 +132,11 @@ while rewriting data columns, the `_base` image in the delta is compared against
 the current MAIN row, normalized by key.
 
 **Pure-delta rules** (`old_version IS NULL` = the row never existed in MAIN):
-`op=D` (inserted then deleted inside the branch) is a NOP; `op=I` goes to Pass 3;
-`op=U` is not produced by the current implementation (treated as DELETE + INSERT). **PK type
+`op=D` (inserted then deleted inside the branch) is a NOP; `op=I` goes to Pass 3.
+An `op=U` row always carries a version token — the MAIN baseline it was derived
+from, or (after a DELETE→re-INSERT rebirth collapse, §1.6) the token of the deleted
+MAIN row — so Pass 2 validates it; a pure-delta UPDATE with no MAIN baseline is
+materialised by Pass 3. **PK type
 constraint**: the chain must use the typmod-aware type name and `rtrim` BPCHAR
 keys on both sides, else `BPCHAR(N)` / `NUMERIC(p,s)` keys mismatch.
 
@@ -167,6 +170,29 @@ Entry is the `ExecutorRun` intercept. Core invariant: the MAIN heap is never
 written; every change is appended/overwritten into the delta by
 `overlay_delta_insert`, idempotent on `(branch_id, relid, key)`.
 
+**Rebirth collapse.** Because the delta key is `(branch_id, relid, key)`, a
+DELETE followed by a re-INSERT of the same PK in the same branch overwrites the
+tombstone. Collapsing that to a plain INSERT (`op='I'`, `old_version NULL`) would
+lose the fact that the row exists in MAIN, and the apply Pass 3 would raise a
+spurious "MAIN row already present" conflict even though the branch deleted the
+row. The R21 pre-check therefore permits the rebirth while a tombstone is
+present, and `overlay_delta_insert` rewrites a `D → I` overwrite that carried a
+MAIN baseline (`d.op='D'` with `d.old_version IS NOT NULL`, incoming `op='I'` with
+`old_version NULL`) to `op='U'`, preserving the deleted row's version token. The
+net branch effect is "replace the MAIN row", which is exactly what the apply
+UPDATE pass validates and replays. A pure-delta tombstone (no MAIN baseline)
+still collapses to a plain INSERT.
+
+**Locating the `ModifyTableState`.** For every supported top-level DML the
+planner places `ModifyTable` at the plan root, so the intercept takes
+`mt = queryDesc->planstate` directly. A defensive DFS over the planstate tree
+(stopping at scan nodes so it cannot descend into `BitmapIndexScan` internals)
+finds the first `ModifyTableState` descendant in the hypothetical case of a
+wrapping node; the found node is held in a **local** only — `queryDesc->planstate`
+is a caller-owned field that names the whole tree for `ExecEndPlan`, so
+overwriting it with an interior node would skip `ExecEndNode` on the wrappers
+above and leak their resources.
+
 **UPDATE / DELETE**, per junk subplan row: read the ctid from the junk slot;
 re-fetch a clean row by ctid (under the overlay-helper recursion guard so the
 planner hook does not re-inject BranchScan into its SPI SELECT); compute
@@ -188,6 +214,44 @@ exists, never the stale MAIN row.
 | false | true | DO_UPD + WHERE ok | 3 | UPDATE pure-delta row |
 | true | true | DO_UPD + WHERE ok | 3 | delta shadows MAIN |
 
+**Delta tombstone shadows MAIN.** Phase I records the delta's latest op for the
+key — including `op='D'` tombstones, not only the live `op='I'`/`'U'` states. A
+tombstone means the branch deleted the row, so an `INSERT ... ON CONFLICT` after
+a branch-local DELETE must rebirth it rather than re-read the still-present MAIN
+row as a conflict: the Phase II MAIN probe is suppressed and the dispatch falls
+through to `promo=1` (plain INSERT), where the rebirth collapse rewrites the
+overwrite into the `op='U'` replay (§1.6, "Rebirth collapse"). Without this,
+Phase I saw no delta hit, Phase II re-found the MAIN row, and the row silently
+vanished from the branch for `DO NOTHING` / `DO UPDATE ... WHERE <false>`.
+
+**Same-statement duplicate arbiter keys.** The command counter does not advance
+between the rows of a single command, so the Phase I/II and R21 SPI probes can
+never see a delta row written by an earlier row of the *same* command. The
+INSERT loop therefore keeps a per-statement hash set of the arbiter keys it has
+already claimed (single-column-PK tables only). A row claims its key exactly
+when it is written — `promo=1/2/3` add the key; a `DO NOTHING` skip or a
+`DO UPDATE ... WHERE <false>` skip does not. When a later candidate's key is
+already claimed, the loop reproduces native behavior: plain INSERT raises
+`23505` `unique_violation`, `DO UPDATE` raises `21000` `cardinality_violation`,
+and `DO NOTHING` skips the row (first row wins). This mirrors stock PostgreSQL,
+where a duplicate arbiter value inside one command is caught at the index level
+for plain INSERT / DO NOTHING and by the "cannot affect row a second time" check
+for `DO UPDATE`. A keyless table has no arbiter constraint to violate, so the
+set is not built and every row is inserted, exactly as upstream.
+
+**Eager NOT NULL / CHECK validation.** The write-redirect short-circuits
+`standard_ExecutorRun()`, so the executor's own `ExecConstraints()` never runs
+for a redirected row; without an explicit check an invalid post-image would be
+stored in the delta and only rejected at apply time. The path therefore calls
+`ExecConstraints()` on the post-image BEFORE `overlay_delta_insert`, so a
+branch-local UPDATE/INSERT/UPSERT fails eagerly with the native SQLSTATE
+(`23502` NOT NULL / `23514` CHECK), message and `Failing row contains (...)`
+detail. For `INSERT ... ON CONFLICT` the check runs on the **candidate** row
+before conflict resolution (mirroring `ExecInsert()`, which validates the
+proposed tuple first) and again on the merged row for a `DO UPDATE` (mirroring
+`ExecUpdate()`), so a candidate that is invalid even though `DO UPDATE` /
+`DO NOTHING` would discard it is still rejected, exactly as in MAIN.
+
 **Pure-delta post-processing**: rows living only in the delta (op I/U) are never
 seen by the UPDATE/DELETE subplan (which scans only MAIN). A post-pass collects
 delta I/U rows, keeps the latest per key, runs the subplan's qual on each
@@ -196,7 +260,31 @@ required: whole-table DML skips pure-delta rows to avoid deleting freshly
 inserted rows.
 
 **RETURNING** captures the affected rows into slots in `es_query_cxt` and replays
-them through `dest->receiveSlot()`.
+them through the plan's `DestReceiver`. Because the write path short-circuits
+`standard_ExecutorRun()`, the receiver lifecycle is **not** driven by the
+executor here: the replay must bracket `receiveSlot()` with
+`dest->rStartup(dest, operation, tupDesc)` and `dest->rShutdown(dest)` exactly as
+`standard_ExecutorRun()` does for a `sendTuples` plan. This is load-bearing for
+any receiver that allocates state in `rStartup` — SPI's `DestSPI` creates its
+`SPITupleTable` there, so omitting it makes `spi_printtup()` abort with
+"improper call to spi_printtup" (plpgsql `DML ... RETURNING ... INTO`), and a
+zero-row write additionally fails SPI's tuple-count check because no tuple table
+was created. The bracket runs whenever the plan `hasReturning`, including the
+zero-row case.
+
+**EXPLAIN ANALYZE root-node instrumentation.** The same short-circuit means the
+executor never runs the ModifyTable node's `ExecProcNode`, so the node's
+`Instrumentation` is never started and EXPLAIN ANALYZE prints the root node as
+`(never executed)`. The replay therefore brackets itself with one
+`InstrStartNode(mt->ps.instrument)` / `InstrStopNode(mt->ps.instrument, rows)`
+pair (rows = the RETURNING cardinality, 0 without RETURNING) so the node folds to
+`actual rows=N loops=1`. On the UPSERT path the two counters `nodeModifyTable.c`
+maintains are reproduced by hand: `InstrCountTuples2` for every proposed row that
+found a conflict (whether DO UPDATE applied it or DO NOTHING / `WHERE false`
+skipped it) and `InstrCountFiltered1` for a conflict removed by the
+`DO UPDATE ... WHERE` filter. That makes `Tuples Inserted` (source rows −
+conflicts), `Conflicting Tuples` and `Rows Removed by Conflict Filter` match
+stock. All calls are no-ops without instrumentation (`instrument == NULL`).
 
 A UPSERT whose `DO UPDATE SET` targetlist touches a PK column is refused
 (`0A000`, promo 2/3) before any delta write: the delta row is keyed by the
@@ -239,7 +327,14 @@ BPCHAR / NUMERIC / TIMESTAMPTZ stay correct (§2).
 Unsupported objects are rejected at `create_branch` time (0A000/55000):
 partitioned / foreign tables, views, matviews, foreign keys, multi-column PKs,
 non-PK UNIQUE. The guard checks cheapest-first (relkind, `relispartition`, user
-triggers, foreign keys, then no-PK). A utility-hook gate intercepts user DDL with
+triggers, foreign keys, then no-PK). The per-DML executor guard validates only
+the statement's DML **target** relations (the `ModifyTable` result relations):
+a range-table entry that is merely read — the FROM/USING side of `INSERT ...
+SELECT` / `UPDATE ... FROM` / `DELETE ... USING` — is not a target and is read
+through the ordinary overlay path (BranchScan injects for every read RTE, §2.5),
+so a managed read source sees this branch's writes. A no-PK read source is
+skipped by BranchScan's own no-PK test, so it reads MAIN and does not abort the
+statement. A utility-hook gate intercepts user DDL with
 a session-private TEMP whitelist. At the very top of the executor intercept,
 `COPY FROM`, `MERGE` and data-modifying CTEs raise 0A000; a write that reaches
 `standard_ExecutorRun` without the redirect raises ERROR 55000 (write-through
@@ -279,7 +374,7 @@ reordering it causes recursive re-entry or a wrong-branch read:
 | B0 | schema skip (`pg_catalog` / `information_schema` / `pg_toast*` / `overlay_branch`) | cheapest; must precede `is_active()` |
 | B1 | recursion guard (`ob_in_apply_operation` / `ob_in_write_redirect` / `ob_in_overlay_helper` / `ob_in_invalidation_check` / `ob_in_planner_hook`) | internal SPI must not be re-wrapped |
 | R16 | `hasModifyingCTE` → ERROR 0A000 | reject before building a path |
-| B2 | inject only for `CMD_SELECT`, plus `CMD_UPDATE`/`CMD_DELETE` on `resultRelation` (§2.5) | never touch other DML |
+| B2 | inject for every READ RTE: `CMD_SELECT`, the ACC-1 UPDATE/DELETE target, and the DML read sources; skip only the `INSERT` target (§2.5) | never wrap the insert target |
 | — | `overlay_branch_is_active()` | **after B0/B1**: it runs SPI that re-enters this hook |
 
 It then skips non-relation / non-`RELKIND_RELATION` / no-PK RTEs, builds a
@@ -333,18 +428,30 @@ dropping the MAIN rows the SPI pass filtered out) and any side effect
 runs in the same statement and snapshot, so both sites see the same value. The
 guard is exercised by `test/regress/sql/overlay_branch_pushdown.sql`.
 
-### 2.5 DML-target BranchScan (ACC-1)
+### 2.5 DML-target BranchScan (ACC-1) and read sources
 
-The hook injects only for `CMD_SELECT` by default, so the UPDATE/DELETE subplan
-scans MAIN rather than the overlay — consecutive in-branch writes then break
-(`SET v = v||'+1'` then `SET v = v||'+2'` lands on the MAIN value). ACC-1 also
-injects for the DML target baserel (`CMD_UPDATE`/`CMD_DELETE` when the RTE is
-`root->parse->resultRelation`), flagged in `custom_private`. This makes `ctid`
-reachable so WR can anchor `old_version`; the emitted slot is a real heap tuple
-allocated in `es_query_cxt` (**not** the scan context, which is deleted before
+The hook injects for `CMD_SELECT` and for every RTE of a DML that is **read**.
+The UPDATE/DELETE DML *target* baserel (`CMD_UPDATE`/`CMD_DELETE` when the RTE
+is `root->parse->resultRelation`) is injected too and flagged in
+`custom_private`: without it the UPDATE/DELETE subplan scans MAIN rather than the
+overlay, so consecutive in-branch writes break (`SET v = v||'+1'` then
+`SET v = v||'+2'` lands on the MAIN value). This makes `ctid` reachable so WR can
+anchor `old_version`; the emitted slot is a real heap tuple allocated in
+`es_query_cxt` (**not** the scan context, which is deleted before
 `ExecResetTupleTable`). WR's pre-image becomes "MAIN row for anchoring, overlay
 row for values"; a Pass 2 pure-delta row has an invalid ctid and takes the "no
 ctid → skip" branch, so the SELECT path is unaffected.
+
+Every other RTE of a DML is a read source — the FROM/USING side of
+`UPDATE ... FROM` / `DELETE ... USING` and the source of `INSERT ... SELECT` —
+and is injected the same way, so it sees this branch's writes exactly like a
+standalone `SELECT` or a correlated-subquery read source (a `CMD_SELECT` Query,
+which was always injected). The one RTE deliberately **not** wrapped is the
+`INSERT` target: it is not read at all (its conflict detection runs through WR's
+own SPI probe, not this scan). Injecting the read sources keeps the same read
+consistent whether it is written as a top-level `FROM` or as a subquery; a no-PK
+read source is skipped by the injection's own no-PK test (§1.8), so it still
+reads MAIN.
 
 ### 2.6 Executor unpacking protocol
 
@@ -766,8 +873,8 @@ columns, so all downstream promotion and apply behaviour is unchanged:
 - the arbiter must resolve to exactly one UNIQUE index (multi-column allowed);
   several candidate indexes, or an expression index, keep the 0A000 guard;
 - phase one matches a delta row whose stored image carries the proposed arbiter
-  values, restricted to the live insert/update states so a tombstone still
-  permits rebirth;
+  values, restricted to the live insert/update states (a tombstone stores no
+  image, so it is never matched here — see the limitation below);
 - phase two matches a MAIN row carrying the same arbiter values;
 - on a MAIN hit the delta is re-anchored to that row's ctid with its version
   token, on a delta hit the existing delta key and version are reused, and with
@@ -777,6 +884,10 @@ columns, so all downstream promotion and apply behaviour is unchanged:
 `MERGE` / `COPY FROM` / DML-CTE, and a keyless UPSERT whose arbiter does not
 resolve to exactly one UNIQUE index; consistency under concurrent `DELETE` /
 whole-table rewrites (silent drop on the read side, apply error as fallback).
+An UPSERT after a branch-local DELETE does **not** rebirth in keyless mode: the
+tombstone is keyed by the anchored ctid and carries no arbiter image, so phase
+one cannot see it and phase two's MAIN hit wins (the PK path handles this via the
+tombstone shadow, §1.6).
 
 ---
 
@@ -787,8 +898,9 @@ whole-table rewrites (silent drop on the read side, apply error as fallback).
 `N` = MAIN rows; `M` = delta rows; `A` = user columns; `S` = average bytes/row.
 The delta PK is `(branch_id, relid, key)` and every write lands in the
 `ON CONFLICT ... DO UPDATE` of `overlay_delta_insert`, so **`M` = distinct rows
-touched, independent of operation count** (the latest-wins `I→U→D` collapse in
-the read path is structurally unreachable). A delta row is far heavier than a
+touched, independent of operation count** (the write-side upsert performs the
+latest-wins collapse — including the DELETE→re-INSERT `D→U` rewrite of §1.6 — so
+the read path never sees two delta rows for one key). A delta row is far heavier than a
 heap tuple — key is the PK JSON, the tuple is the whole row JSON, and
 UPDATE/DELETE also store the previous image as `_base` — so a U/D row is roughly
 2× the row.

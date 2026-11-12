@@ -38,6 +38,8 @@
 #include "utils/memutils.h"
 #include "utils/rel.h"
 #include "utils/builtins.h"
+#include "common/hashfn.h"
+#include "utils/hsearch.h"
 
 #ifndef OBSCHEMA
 #define OBSCHEMA        "overlay_branch"
@@ -291,6 +293,108 @@ mt_state_result_rel(ModifyTableState *mt, int i)
 	return &mt->resultRelInfo[i];
 }
 
+/*
+ * ob_claimed_hash / ob_claimed_match / ob_claim_key
+ *
+ *	Same-statement duplicate-arbiter-key tracking for the INSERT redirect.
+ *	PostgreSQL detects a constrained value proposed twice within one command
+ *	at the heap/index level (plain INSERT / DO NOTHING) or via the "cannot
+ *	affect row a second time" check (ON CONFLICT DO UPDATE).  The redirect
+ *	writes every row into the delta under ON CONFLICT DO UPDATE, and a
+ *	command-counter bump never happens between the rows of a single command,
+ *	so the Phase I/II and R21 SPI probes cannot see an earlier row written by
+ *	THIS command.  This small hash set, alive for the duration of one
+ *	statement, lets the loop reproduce the native outcome: a later candidate
+ *	whose arbiter key was already written errors (plain INSERT ->
+ *	unique_violation, DO UPDATE -> cardinality_violation) or is skipped
+ *	(DO NOTHING), exactly as upstream does.
+ */
+typedef struct ObClaimedKey
+{
+	char	   *key;			/* NUL-terminated serialized identity (in cxt) */
+} ObClaimedKey;
+
+static uint32
+ob_claimed_hash(const void *key, Size keysize)
+{
+	const char *s = *((const char *const *) key);
+
+	(void) keysize;
+	return hash_bytes((const unsigned char *) s, (int) strlen(s));
+}
+
+static int
+ob_claimed_match(const void *key1, const void *key2, Size keysize)
+{
+	const char *s1 = *((const char *const *) key1);
+	const char *s2 = *((const char *const *) key2);
+
+	(void) keysize;
+	return strcmp(s1, s2);
+}
+
+static void
+ob_claim_key(HTAB *claimed, MemoryContext cxt, const char *pk)
+{
+	ObClaimedKey *ent;
+	char	   *probe = (char *) pk;
+	bool		found;
+	MemoryContext old;
+
+	ent = (ObClaimedKey *) hash_search(claimed, &probe, HASH_ENTER, &found);
+	if (!found)
+	{
+		old = MemoryContextSwitchTo(cxt);
+		ent->key = pstrdup(pk);
+		MemoryContextSwitchTo(old);
+	}
+}
+
+/*
+ * ob_pk_value_text
+ *
+ *	Return the textual output of the row's single-column PK, matching the
+ *	`(col)=(value)` wording used by the R21 pre-check and by native
+ *	PostgreSQL.  Returns NULL when the table has no PK or the value is NULL
+ *	(so callers can fall back to the serialized identity).
+ */
+static char *
+ob_pk_value_text(Relation rel, TupleTableSlot *slot, AttrNumber pk_attno)
+{
+	TupleDesc	reldesc;
+	int			pk_attidx;
+	Oid			pk_type;
+	Datum		pkdatum;
+	bool		pk_isnull = false;
+	Oid			pk_out_func;
+	bool		pk_is_varlena;
+
+	if (rel == NULL || slot == NULL || TupIsNull(slot) || pk_attno <= 0)
+		return NULL;
+
+	reldesc = RelationGetDescr(rel);
+	pk_attidx = pk_attno - 1;
+	pk_type = TupleDescAttr(reldesc, pk_attidx)->atttypid;
+
+	if (TTS_IS_VIRTUAL(slot))
+	{
+		if (slot->tts_nvalid < (AttrNumber) (pk_attidx + 1))
+			slot_getsomeattrs(slot, pk_attidx + 1);
+		pkdatum = slot->tts_values[pk_attidx];
+		pk_isnull = slot->tts_isnull[pk_attidx];
+	}
+	else
+	{
+		pkdatum = slot_getattr(slot, pk_attno, &pk_isnull);
+	}
+
+	if (pk_isnull)
+		return NULL;
+
+	getTypeOutputInfo(pk_type, &pk_out_func, &pk_is_varlena);
+	return OidOutputFunctionCall(pk_out_func, pkdatum);
+}
+
 /* ----------------------------------------------------------------
  * r21_check_insert_preconditions
  *
@@ -507,6 +611,52 @@ r21_check_insert_preconditions(Relation rel, TupleTableSlot *slot,
 
 		pfree(pkval_txt);
 	}
+}
+
+/* ----------------------------------------------------------------
+ * ob_validate_redirect_constraints
+ *
+ *   Apply the target relation's native NOT NULL and CHECK constraints to a
+ *   post-image tuple BEFORE it is written into the delta store, so a
+ *   branch-local INSERT/UPDATE fails eagerly with the same SQLSTATE and
+ *   message as the identical statement run against MAIN.
+ *
+ *   The write-redirect short-circuits standard_ExecutorRun(), so the executor
+ *   never reaches its own ExecConstraints() call for these rows.  Without this
+ *   check an invalid row is silently stored in the delta and only rejected
+ *   later, at apply time.
+ *
+ *   Delegates to the executor's ExecConstraints() so the error detail, the
+ *   failing-row description and the SQLSTATE match the native messages
+ *   exactly.  No-op when the relation declares no constraints, which is also
+ *   required because ExecConstraints() asserts on that case.
+ *
+ *   The per-tuple ExprContext's scan binding is saved and restored so the
+ *   CHECK evaluation cannot leak the temporary post-image slot to callers that
+ *   reuse that context (e.g. the UPSERT DO UPDATE WHERE predicate).
+ * ----------------------------------------------------------------
+ */
+static void
+ob_validate_redirect_constraints(ResultRelInfo *rri, Relation rel,
+								 TupleTableSlot *slot, EState *estate)
+{
+	TupleDesc	tupdesc;
+	ExprContext *ecx;
+	TupleTableSlot *save_scantuple;
+
+	if (rri == NULL || rel == NULL || slot == NULL || estate == NULL)
+		return;
+	if (TupIsNull(slot))
+		return;
+
+	tupdesc = RelationGetDescr(rel);
+	if (tupdesc->constr == NULL)
+		return;
+
+	ecx = GetPerTupleExprContext(estate);
+	save_scantuple = ecx->ecxt_scantuple;
+	ExecConstraints(rri, slot, estate);
+	ecx->ecxt_scantuple = save_scantuple;
 }
 
 /* ----------------------------------------------------------------
@@ -799,19 +949,24 @@ overlay_executor_run_intercept(QueryDesc *queryDesc,
 	/* B2-2a DFS walker: locate the FIRST ModifyTableState descendant
 	 * of queryDesc->planstate.
 	 *
-	 * For UPSERT (INSERT ... ON CONFLICT), PG planner often wraps the
-	 * ModifyTableState under one or more projection / result nodes.
-	 * The original `!IsA(ModifyTableState)` guard above would wrongly
-	 * return false and fall through to standard ExecutorRun → MAIN
-	 * drift.  We DFS the PlanState tree (64-deep manual stack to avoid
-	 * recursion) and accept the FIRST ModifyTableState descendant we
-	 * find.  This is safe because WR redirects DML only when
-	 * mt_nrels==1 && resultRelations==1 anyway.  Scan descent stops
-	 * early at baserel-type nodes (Seq/Index/BitmapHeapScan) per
-	 * Scan_ps degradation invariant — prevents BitmapIndexScan trap. */
+	 * Defensive fallback: for every top-level DML form we support
+	 * (INSERT / UPSERT / UPDATE / DELETE, incl. prepared statements and
+	 * SPI/plpgsql execution) the PG planner places ModifyTable at the
+	 * plan root, so the branch below is normally NOT taken.  It exists
+	 * only so that a hypothetical plan shape that wraps the
+	 * ModifyTableState under projection / result nodes still gets
+	 * redirected instead of silently falling through to
+	 * standard_ExecutorRun → MAIN drift.  We DFS the PlanState tree
+	 * (64-deep manual stack to avoid recursion) and accept the FIRST
+	 * ModifyTableState descendant we find.  This is safe because WR
+	 * redirects DML only when mt_nrels==1 && resultRelations==1 anyway.
+	 * Scan descent stops early at baserel-type nodes
+	 * (Seq/Index/BitmapHeapScan) per Scan_ps degradation invariant —
+	 * prevents BitmapIndexScan trap. */
 	if (!IsA(queryDesc->planstate, ModifyTableState))
 	{
 		PlanState  *stack[64];
+		PlanState  *mt_ps = NULL;
 		int			depth = 0;
 
 		stack[depth++] = queryDesc->planstate;
@@ -825,8 +980,13 @@ overlay_executor_run_intercept(QueryDesc *queryDesc,
 			tag = nodeTag(ps);
 			if (tag == T_ModifyTableState)
 			{
-				/* Found: adopt as our working ModifyTableState */
-				queryDesc->planstate = ps;
+				/* Found: keep it in a LOCAL, never overwrite
+				 * queryDesc->planstate.  That field owns the whole
+				 * planstate tree for ExecutorEnd/ExecutorFinish; pointing
+				 * it at an interior node would skip ExecEndNode of the
+				 * wrapper nodes above and leak their resources.  All
+				 * redirect logic below works off the local `mt` only. */
+				mt_ps = ps;
 				break;
 			}
 			/* Stop descent at baserel-type scan nodes: they never wrap
@@ -854,23 +1014,40 @@ overlay_executor_run_intercept(QueryDesc *queryDesc,
 			if (ps->lefttree != NULL && depth < 64)
 				stack[depth++] = ps->lefttree;
 		}
-		/* If still not a ModifyTableState after DFS → no DML in tree */
-		if (!IsA(queryDesc->planstate, ModifyTableState))
+		/* If DFS found no ModifyTableState → no DML in tree */
+		if (mt_ps == NULL)
 			return false;
+		mt = (ModifyTableState *) mt_ps;
 	}
+	else
+		mt = (ModifyTableState *) queryDesc->planstate;
 
 	overlay_write_redirect_enter();
 	PG_TRY();
 	{
-		mt = (ModifyTableState *) queryDesc->planstate;
 		plan = (ModifyTable *) mt->ps.plan;
 
-		/* --- Step7 DML hard guard (result rels + rtable) --- */
+		/* --- Step7 DML hard guard (result rels only) ---
+		 *
+		 * Validate ONLY the DML TARGET relations (the ModifyTable result
+		 * relations): those are the rows this statement writes, and each must
+		 * be a plain PK heap table (or a keyless table under the
+		 * overlay_branch.keyless_tables GUC).
+		 *
+		 * A range-table entry that is NOT a target is read-only here (the
+		 * FROM/USING side of INSERT ... SELECT / UPDATE ... FROM / DELETE
+		 * ... USING).  Such a read follows the same DQL policy as a standalone
+		 * SELECT: the executor reads MAIN directly (BranchScan's B2 pre-check
+		 * injects the overlay only for SELECT and for the UPDATE/DELETE target
+		 * baserel), so a no-PK read source must NOT abort the statement.
+		 * Walking the full es_range_table here wrongly rejected legitimate
+		 * statements such as
+		 *   UPDATE pk_t SET v = s.w FROM nopk_s s WHERE pk_t.id = s.k;
+		 * whose source is read from MAIN by design. */
 		{
 			int			i;
 			int			nres = mt->mt_nrels;
 			int			planres = list_length(plan->resultRelations);
-			EState	   *estate = mt->ps.state;
 
 			if (nres <= 0) nres = planres;
 			for (i = 0; i < nres; i++)
@@ -891,47 +1068,6 @@ overlay_executor_run_intercept(QueryDesc *queryDesc,
 				if (!overlay_guard_rel_ok(rel, &gr))
 					overlay_guard_ereport_fail(opstr,
 											   RelationGetRelationName(rel), NULL, gr);
-			}
-
-			if (estate != NULL)
-			{
-				int			rt_size = estate->es_range_table_size;
-				List	   *rtable = estate->es_range_table;
-
-				if (rtable != NULL)
-				{
-					for (i = 1; i <= rt_size; i++)
-					{
-						RangeTblEntry *rte = exec_rt_fetch(i, estate);
-						Relation	rel;
-						const char *opstr;
-						char	   *gr = NULL;
-
-						if (rte == NULL) continue;
-						if (rte->rtekind != RTE_RELATION) continue;
-
-						rel = ExecGetRangeTableRelation(estate, i);
-						if (rel == NULL) continue;
-
-						{
-							Oid			nspoid = RelationGetNamespace(rel);
-							char	   *nsp = get_namespace_name(nspoid);
-							bool		skip_catalog = false;
-							if (nsp && (strcmp(nsp, "pg_catalog") == 0 ||
-										strcmp(nsp, OBSCHEMA) == 0 ||
-										strncmp(nsp, "pg_toast", 8) == 0))
-								skip_catalog = true;
-							if (skip_catalog) continue;
-						}
-
-						opstr = cmd == CMD_INSERT ? "INSERT" :
-								cmd == CMD_UPDATE ? "UPDATE" :
-								cmd == CMD_DELETE ? "DELETE" : "DML";
-						if (!overlay_guard_rel_ok(rel, &gr))
-							overlay_guard_ereport_fail(opstr,
-													   RelationGetRelationName(rel), NULL, gr);
-					}
-				}
 			}
 		}
 
@@ -983,6 +1119,15 @@ overlay_executor_run_intercept(QueryDesc *queryDesc,
 								bms_add_member(pk_attnums_set, attno - 1);
 						}
 				}
+
+				/* EXPLAIN ANALYZE parity: the redirect short-circuits
+				 * standard_ExecutorRun(), so nothing ever drives the
+				 * ModifyTable node's own instrumentation.  Bracket the replay
+				 * with a start/stop pair so the root node reports real
+				 * rows/loops instead of "(never executed)".  No-op when
+				 * instrumentation is off (instrument == NULL). */
+				if (mt->ps.instrument != NULL)
+					InstrStartNode(mt->ps.instrument);
 
 				for (;;)
 				{
@@ -1197,6 +1342,14 @@ overlay_executor_run_intercept(QueryDesc *queryDesc,
 							}
 						}
 						MemoryContextSwitchTo(oldmc);
+
+						/* Eager native NOT NULL + CHECK check on the merged
+						 * post-image, so this branch-local UPDATE rejects an
+						 * invalid row immediately (23502 / 23514) instead of
+						 * storing it in the delta and failing at apply. */
+						ob_validate_redirect_constraints(rri, rel, old_clean_slot,
+														 queryDesc->estate);
+
 						tdata = overlay_serialize_tuple(rel, old_clean_slot);
 					}
 					else
@@ -1294,52 +1447,21 @@ overlay_executor_run_intercept(QueryDesc *queryDesc,
 				 * projection per reconstructed pure-delta row (via
 				 * ExecTargetList evaluation) instead of relying on
 				 * junk_slot which belongs to the last MAIN row.  Deferred.
-				 *
-				 * TEMP DEBUG: wrap pure-delta in a "enable/disable flag so we
-				 * can isolate crash. */
-/*
- * DEBUG BISect flags for pure-delta pass.
- * Set PURE_DELTA_STEP to the highest enabled step. Crash will be isolated
- * at the first step N that causes postmaster exit code 2.
- *   0 = fully disabled (baseline)
- *   1 = bid/relid only (no SPI, no alloc)
- *   2 = Phase A: initStringInfo + appendStringInfo + pfree(spiq)
- *   3 = Phase B: helper_enter + ob_spi_one_shot (SPI SELECT) + helper_exit +
- *               in_pure_delta=true, SPI_finish
- *   4 = Phase C: ret2 ok check + SPI_tuptable NULL guard
- *   5 = Phase D: deep copy pkstr+tdata into CurrentMemoryContext raw_rows[]
- *   6 = Phase E: overlay_delta_lookup + reconstruct_slot (cand_inserts)
- *   7 = Phase F: ExecQual walk over cand_inserts
- *   8 = FULL:     overlay_delta_insert DELETE write + RETURNING + cleanup
- */
-#define PURE_DELTA_STEP 8
+				 */
 
-#if PURE_DELTA_STEP >= 1
 				{
-#if PURE_DELTA_STEP >= 5
 					/* define early (cleanup block below uses it) */
 					struct WR_PDR1 { char *s; bytea *t; char *ov; };
 					struct WR_PDC1 { TupleTableSlot *slot; char *key; };
-#endif
 					int32 bid = overlay_branch_get_current_id();
 					Oid relid = RelationGetRelid(rel);
-#if PURE_DELTA_STEP >= 2
 					StringInfoData spiq;
-#endif
-#if PURE_DELTA_STEP >= 3
 					int ret2;
 					bool in_pure_delta = false;
-#endif
-#if PURE_DELTA_STEP >= 5
 					List *raw_rows = NIL;
-#endif
-#if PURE_DELTA_STEP >= 6
 					List *cand_inserts = NIL;
-#endif
 
-					(void)bid; (void)relid; /* prevent unused warnings */
 
-#if PURE_DELTA_STEP >= 2
 					initStringInfo(&spiq);
 					appendStringInfo(&spiq,
 						"SELECT d.key, d.tuple_data, d.old_version FROM %s d "
@@ -1347,27 +1469,17 @@ overlay_executor_run_intercept(QueryDesc *queryDesc,
 						OBTABLE_DELTA, (unsigned) bid, (unsigned) relid,
 						quote_literal_cstr("I"),
 						quote_literal_cstr("U"));
-#endif
 
-#if PURE_DELTA_STEP >= 3
 					overlay_overlay_helper_enter();
 					ret2 = ob_spi_one_shot(spiq.data, true, 0);
 					in_pure_delta = true;
-#endif
 
-#if PURE_DELTA_STEP >= 2
 					pfree(spiq.data);
-#endif
 
-#if PURE_DELTA_STEP >= 3
 					overlay_overlay_helper_exit();
-#endif
 
-#if PURE_DELTA_STEP >= 4
 					if (ret2 == SPI_OK_SELECT && SPI_tuptable && SPI_tuptable->vals)
 					{
-#endif
-#if PURE_DELTA_STEP >= 5
 						{
 							uint64 i;
 							MemoryContext oldmc;
@@ -1411,16 +1523,10 @@ overlay_executor_run_intercept(QueryDesc *queryDesc,
 							}
 							MemoryContextSwitchTo(oldmc);
 						}
-#endif
-#if PURE_DELTA_STEP >= 4
 					}
-#endif
 
-#if PURE_DELTA_STEP >= 3
 					if (in_pure_delta) SPI_finish();
-#endif
 
-#if PURE_DELTA_STEP >= 6
 					if (raw_rows != NIL)
 					{
 						ListCell *lc;
@@ -1489,9 +1595,7 @@ overlay_executor_run_intercept(QueryDesc *queryDesc,
 						list_free(raw_rows);
 						raw_rows = NIL;
 					}
-#endif
 
-#if PURE_DELTA_STEP >= 7
 					if (cand_inserts != NIL)
 					{
 						PlanState *scan_ps;
@@ -1569,7 +1673,6 @@ overlay_executor_run_intercept(QueryDesc *queryDesc,
 								}
 								MemoryContextSwitchTo(oldcxt);
 							}
-#if PURE_DELTA_STEP >= 8
 							/* safety guard: only run pure-delta write path if
 							 * there is an explicit WHERE (scan qual OR scan-type
 							 * specific extra qual non-NULL).  Full-table DML
@@ -2000,6 +2103,14 @@ overlay_executor_run_intercept(QueryDesc *queryDesc,
 								ExecClearTuple(post_image);
 								ExecStoreHeapTuple(post_htup, post_image, true);
 
+								/* Eager native NOT NULL + CHECK check on the
+								 * rewritten pure-delta post-image, mirroring
+								 * the MAIN-hit SET-merge path so both UPDATE
+								 * forms reject an invalid row identically. */
+								ob_validate_redirect_constraints(rri, rel,
+																 post_image,
+																 queryDesc->estate);
+
 								pk = pstrdup(c1_->key);
 								tdata = overlay_serialize_tuple(rel, post_image);
 
@@ -2057,7 +2168,6 @@ overlay_executor_run_intercept(QueryDesc *queryDesc,
 								ExecDropSingleTupleTableSlot(set_plan_slot);
 								FreeTupleDesc(jdesc);
 							}
-#endif /* >=8 */
 						}
 						foreach(lc, cand_inserts)
 						{
@@ -2069,9 +2179,7 @@ overlay_executor_run_intercept(QueryDesc *queryDesc,
 						list_free(cand_inserts);
 						cand_inserts = NIL;
 					}
-#endif /* >=7 */
 
-#if PURE_DELTA_STEP >= 5
 					if (raw_rows != NIL)
 					{
 						ListCell *lc;
@@ -2085,20 +2193,38 @@ overlay_executor_run_intercept(QueryDesc *queryDesc,
 						}
 						list_free(raw_rows);
 					}
-#endif
 				}
-#endif /* >=1 */
 
-				/* Replay collected RETURNING rows into dest. */
+				/* Replay collected RETURNING rows into dest.
+				 *
+				 * Because the write path short-circuits standard_ExecutorRun()
+				 * (we goto ob_write_redirect_done below), the executor never
+				 * drives the DestReceiver lifecycle.  We must do it ourselves:
+				 * SPI's DestSPI allocates its SPITupleTable in rStartup, and
+				 * its receiveSlot (spi_printtup) raises "improper call to
+				 * spi_printtup" when that table is missing.  Mirrors the
+				 * sendTuples handling in standard_ExecutorRun(). */
 				if (has_returning && queryDesc->dest != NULL)
 				{
 					int			k;
+
+					queryDesc->dest->rStartup(queryDesc->dest,
+											  queryDesc->operation,
+											  queryDesc->tupDesc);
 					for (k = 0; k < nretslots; k++)
 					{
 						(*queryDesc->dest->receiveSlot) (retslots[k], queryDesc->dest);
 					}
+					queryDesc->dest->rShutdown(queryDesc->dest);
 				}
 				/* Slots are owned by estate->es_query_cxt → no free needed here. */
+
+				/* Close the ModifyTable instrumentation opened before the
+				 * replay loop; nretslots is the number of RETURNING rows the
+				 * node would have emitted (0 without RETURNING), matching the
+				 * stock "actual rows" figure. */
+				if (mt->ps.instrument != NULL)
+					InstrStopNode(mt->ps.instrument, (double) nretslots);
 
 				queryDesc->estate->es_processed = ndone;
 				handled = true;
@@ -2123,6 +2249,8 @@ overlay_executor_run_intercept(QueryDesc *queryDesc,
 				OnConflictAction oc_action = ONCONFLICT_NONE;
 				ProjectionInfo *oc_proj = NULL;
 				ExprState  *oc_where = NULL;
+				HTAB	   *claimed = NULL;
+				MemoryContext claimed_cxt = NULL;
 
 				{
 					ResultRelInfo *rri0 = rri;
@@ -2181,6 +2309,34 @@ overlay_executor_run_intercept(QueryDesc *queryDesc,
 
 				subplan = outerPlanState(mt);
 
+				/* Per-statement "claimed arbiter keys" set (see ob_claim_key).
+				 * Only meaningful for a single-column PK: a keyless table has
+				 * no constraint to violate, so upstream inserts every row.
+				 * Parented to the query context so an error longjmp frees it. */
+				if (overlay_relation_has_pk(rel))
+				{
+					HASHCTL		ctl;
+
+					claimed_cxt =
+						AllocSetContextCreate(queryDesc->estate->es_query_cxt,
+											  "overlay_branch claimed keys",
+											  ALLOCSET_SMALL_SIZES);
+					memset(&ctl, 0, sizeof(ctl));
+					ctl.keysize = sizeof(char *);
+					ctl.entrysize = sizeof(ObClaimedKey);
+					ctl.hcxt = claimed_cxt;
+					ctl.hash = ob_claimed_hash;
+					ctl.match = ob_claimed_match;
+					claimed = hash_create("overlay_branch claimed keys", 64, &ctl,
+										  HASH_ELEM | HASH_FUNCTION | HASH_COMPARE | HASH_CONTEXT);
+				}
+
+			/* EXPLAIN ANALYZE parity: mirror the UPDATE/DELETE path — open
+			 * the ModifyTable node's instrumentation before the replay loop
+			 * so the root node is not reported as "(never executed)". */
+			if (mt->ps.instrument != NULL)
+				InstrStartNode(mt->ps.instrument);
+
 			for (;;)
 			{
 				char	   *pk;
@@ -2191,6 +2347,8 @@ overlay_executor_run_intercept(QueryDesc *queryDesc,
 				TupleTableSlot *pre_image_slot = NULL;
 				bytea	   *pure_tuple_bytes = NULL;
 				char	   *main_ctid = NULL;
+				bool	   delta_tombstone = false; /* delta holds op='D' for this key */
+				bool	   key_claimed = false; /* arbiter key written by an earlier row of this command */
 
 				CHECK_FOR_INTERRUPTS();
 
@@ -2202,6 +2360,27 @@ overlay_executor_run_intercept(QueryDesc *queryDesc,
 
 				pk = overlay_serialize_identity(rel, slot, DELTA_OP_INSERT);
 				tdata = overlay_serialize_tuple(rel, slot);
+
+				/* Eager native NOT NULL + CHECK check on the candidate row,
+				 * BEFORE conflict detection, mirroring ExecInsert(): the
+				 * executor validates the proposed tuple's constraints first
+				 * and only afterwards resolves ON CONFLICT.  Running it here
+				 * (rather than only on the rows that end up written) keeps a
+				 * branch-local INSERT ... ON CONFLICT in line with MAIN even
+				 * when the candidate is skipped (DO NOTHING on conflict) or
+				 * its invalid columns would be overwritten by DO UPDATE. */
+				ob_validate_redirect_constraints(rri, rel, slot,
+												 queryDesc->estate);
+
+				/* Same-statement duplicate check: was this arbiter key already
+				 * written by an earlier row of THIS command?  (PK tables only;
+				 * `claimed` stays NULL for keyless tables.) */
+				if (claimed != NULL)
+				{
+					char	   *pk_probe = pk;
+
+					(void) hash_search(claimed, &pk_probe, HASH_FIND, &key_claimed);
+				}
 
 				/* ================================================================
 				 * === B2 UPSERT: 2-Phase Conflict Detection (delta shadows
@@ -2225,6 +2404,10 @@ overlay_executor_run_intercept(QueryDesc *queryDesc,
 				 *   false     true      DO_UPD     false  0 (skip WHERE)
 				 *   false     true      DO_NOTHING -      0 (skip NOTHING)
 				 *   true      true      DO_UPD     true   3 (delta shadows MAIN)
+				 *
+				 * A delta tombstone (op='D') for the key suppresses the Phase
+				 * II MAIN probe entirely, so both main_hit and pure_hit stay
+				 * false and any oc_action takes promotion=1 (rebirth INSERT).
 				 * ================================================================ */
 
 				/* ---------- Phase I: Pure delta conflict lookup ---------- */
@@ -2300,7 +2483,7 @@ overlay_executor_run_intercept(QueryDesc *queryDesc,
 						sql_pure = pstrdup(
 							"SELECT d.op, d.old_version, d.tuple_data FROM "
 							OBTABLE_DELTA " d WHERE d.branch_id = $1 AND d.relid = $2 "
-							"AND d.key = $3 AND (d.op = 'I' OR d.op = 'U') LIMIT 1");
+							"AND d.key = $3 LIMIT 1");
 					}
 
 					overlay_overlay_helper_enter();
@@ -2427,6 +2610,17 @@ overlay_executor_run_intercept(QueryDesc *queryDesc,
 											* Phase II below */
 
 						}
+						else if (op_txt != NULL && strcmp(op_txt, "D") == 0)
+						{
+							/* The delta holds a tombstone (op='D') for this key: the
+							 * branch has logically deleted the row, so an INSERT ... ON
+							 * CONFLICT must rebirth it exactly like the plain-INSERT R21
+							 * path (which permits rebirth after a tombstone).  Flag it so
+							 * Phase II does NOT re-find the still-present MAIN row and
+							 * misclassify DO NOTHING / WHERE-false as a conflict; the promo
+							 * dispatch then falls through to promotion = 1 (INSERT). */
+							delta_tombstone = true;
+						}
 						if (op_txt) pfree(op_txt);
 						if (oldver_txt) pfree(oldver_txt);
 						if (td_hex) pfree(td_hex);
@@ -2436,7 +2630,8 @@ overlay_executor_run_intercept(QueryDesc *queryDesc,
 
 				/* ---------- Phase II: MAIN heap ctid lookup (delta-first
 				 * ---------- shadow: only consulted on a delta miss) --- */
-				if (oc_action != ONCONFLICT_NONE && (pk_attno > 0 || arb_natts > 0))
+				if (oc_action != ONCONFLICT_NONE && !delta_tombstone &&
+					(pk_attno > 0 || arb_natts > 0))
 				{
 					TupleDesc	reldesc = RelationGetDescr(rel);
 					int			ret3;
@@ -2613,13 +2808,27 @@ overlay_executor_run_intercept(QueryDesc *queryDesc,
 				{
 					bool main_hit = (main_ctid != NULL);
 					bool pure_hit = (pre_image_slot != NULL);
+					const char *dup_colname = (pk_attno > 0)
+						? NameStr(TupleDescAttr(RelationGetDescr(rel), pk_attno - 1)->attname)
+						: "key";
 					if (oc_action == ONCONFLICT_NONE)
 					{
+						if (key_claimed)
+						{
+							char	   *dup_pk_txt = ob_pk_value_text(rel, slot, pk_attno);
+
+							ereport(ERROR,
+								(errcode(ERRCODE_UNIQUE_VIOLATION),
+								 errmsg("duplicate key value violates unique constraint on relation \"%s\"",
+										RelationGetRelationName(rel)),
+								 errdetail("Key (%s)=(%s) already exists in this branch (same-statement duplicate).",
+										   dup_colname, dup_pk_txt ? dup_pk_txt : pk)));
+						}
 						r21_check_insert_preconditions(rel, slot, bid, relid,
 													   pk_attno, pk);
 						promotion = 1;
 					}
-					else if (!main_hit && !pure_hit)
+					else if (!main_hit && !pure_hit && !key_claimed)
 					{
 						/* No conflict → promo=1 INSERT (both DO NOTHING /
 						 * DO UPDATE fall through to insert) */
@@ -2629,11 +2838,20 @@ overlay_executor_run_intercept(QueryDesc *queryDesc,
 					{
 						/* Any conflict + DO NOTHING → promo=0 skip */
 						promotion = 0;
+						/* EXPLAIN ANALYZE: a skipped conflict still counts
+						 * as a conflicting tuple, mirroring the DO NOTHING
+						 * conflict path in nodeModifyTable.c. */
+						InstrCountTuples2(&mt->ps, 1);
 					}
 					else /* ONCONFLICT_UPDATE + at least one hit */
 					{
 						/* ========== WHERE cond (for DO UPDATE only) ========== */
 						bool where_ok = true;
+						if (key_claimed)
+							ereport(ERROR,
+								(errcode(ERRCODE_CARDINALITY_VIOLATION),
+								 errmsg("ON CONFLICT DO UPDATE command cannot affect row a second time"),
+								 errhint("Ensure that no rows proposed for insertion within the same command have duplicate constrained values.")));
 						if (oc_where != NULL)
 						{
 							ExprContext *ecx;
@@ -2701,6 +2919,11 @@ overlay_executor_run_intercept(QueryDesc *queryDesc,
 						if (!where_ok)
 						{
 							promotion = 0;
+							/* The conflicting tuple is counted both as a
+							 * conflict and as removed by the DO UPDATE ...
+							 * WHERE filter, matching nodeModifyTable.c. */
+							InstrCountTuples2(&mt->ps, 1);
+							InstrCountFiltered1(&mt->ps, 1);
 						}
 						else
 						{
@@ -2718,6 +2941,8 @@ overlay_executor_run_intercept(QueryDesc *queryDesc,
 							{
 								promotion = 2;
 							}
+							/* DO UPDATE applied to a conflicting tuple. */
+							InstrCountTuples2(&mt->ps, 1);
 						}
 					}
 				}
@@ -2903,6 +3128,13 @@ overlay_executor_run_intercept(QueryDesc *queryDesc,
 							overlay_typed_pk_free(pre_pk, pre_n);
 						}
 
+						/* Eager native NOT NULL + CHECK check on the UPSERT
+						 * DO UPDATE post-image, matching the plain INSERT
+						 * path so a branch-local UPSERT rejects an invalid
+						 * row immediately instead of at apply. */
+						ob_validate_redirect_constraints(rri, rel, post_image,
+														 queryDesc->estate);
+
 						tdata = overlay_serialize_tuple(rel, post_image);
 
 						{
@@ -2929,6 +3161,8 @@ overlay_executor_run_intercept(QueryDesc *queryDesc,
 
 							oldmc = MemoryContextSwitchTo(
 								queryDesc->estate->es_query_cxt);
+							if (claimed != NULL)
+								ob_claim_key(claimed, claimed_cxt, pk);
 							overlay_delta_insert(bid, relid, delta_key,
 												 DELTA_OP_UPDATE, old_version, tdata);
 							MemoryContextSwitchTo(oldmc);
@@ -2987,11 +3221,15 @@ overlay_executor_run_intercept(QueryDesc *queryDesc,
 
 				if (promotion == 1)
 				{
-					/* promo=1: fresh INSERT pass */
+					/* promo=1: fresh INSERT pass.  The candidate row was
+					 * already constraint-checked before conflict detection
+					 * above, so it is not re-checked here. */
 					{
 						MemoryContext oldmc;
 						oldmc = MemoryContextSwitchTo(
 							queryDesc->estate->es_query_cxt);
+						if (claimed != NULL)
+							ob_claim_key(claimed, claimed_cxt, pk);
 						overlay_delta_insert(bid, relid, pk,
 											 DELTA_OP_INSERT, NULL, tdata);
 						MemoryContextSwitchTo(oldmc);
@@ -3048,14 +3286,37 @@ overlay_executor_run_intercept(QueryDesc *queryDesc,
 				if (arb_attnos != NULL)
 					pfree(arb_attnos);
 
+				if (claimed_cxt != NULL)
+				{
+					MemoryContextDelete(claimed_cxt);
+					claimed_cxt = NULL;
+					claimed = NULL;
+				}
+
+				/* Replay collected RETURNING rows into dest.  As on the
+				 * UPDATE/DELETE path, we bypassed standard_ExecutorRun(), so
+				 * the DestReceiver lifecycle must be driven here — notably
+				 * SPI's DestSPI needs rStartup to allocate its SPITupleTable
+				 * before spi_printtup can accept rows. */
 				if (has_returning && queryDesc->dest != NULL)
 				{
 					int			k;
+
+					queryDesc->dest->rStartup(queryDesc->dest,
+											  queryDesc->operation,
+											  queryDesc->tupDesc);
 					for (k = 0; k < nretslots; k++)
 						(*queryDesc->dest->receiveSlot) (retslots[k], queryDesc->dest);
+					queryDesc->dest->rShutdown(queryDesc->dest);
 					for (k = 0; k < nretslots; k++)
 						ExecDropSingleTupleTableSlot(retslots[k]);
 				}
+
+				/* Close the ModifyTable instrumentation opened before the
+				 * replay loop; nretslots is the number of RETURNING rows the
+				 * node would have emitted (0 without RETURNING). */
+				if (mt->ps.instrument != NULL)
+					InstrStopNode(mt->ps.instrument, (double) nretslots);
 
 				queryDesc->estate->es_processed = ninserted;
 				handled = true;
