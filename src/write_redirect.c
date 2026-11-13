@@ -152,11 +152,16 @@ ob_project_returning(ResultRelInfo *rri, TupleTableSlot *scanSlot,
  *   property so the arbiter probe can pick the right comparison
  *   operator (a NULL arbiter value must not match under the default
  *   NULLS DISTINCT index, exactly like a native unique check).
+ *   `is_pk_out` reports whether that UNIQUE index is the table's PRIMARY
+ *   KEY index: a PK arbiter keeps the fast d.key / PK-ctid probe, while a
+ *   non-PK UNIQUE arbiter must rebind the detector to its columns (see
+ *   the UPSERT redirect).
  * ----------------------------------------------------------------
  */
 static bool
 ob_resolve_upsert_arbiter(ResultRelInfo *rri, AttrNumber **attnos_out,
-						  int *n_out, bool *nulls_not_distinct_out)
+						  int *n_out, bool *nulls_not_distinct_out,
+						  bool *is_pk_out)
 {
 	List	   *arbiters = rri->ri_onConflictArbiterIndexes;
 	Oid			idxoid;
@@ -180,6 +185,18 @@ ob_resolve_upsert_arbiter(ResultRelInfo *rri, AttrNumber **attnos_out,
 		return false;
 	}
 
+	/* A partial index cannot be rebound to a plain column probe: the
+	 * predicate would be ignored, so a candidate whose columns match a row
+	 * OUTSIDE the predicate's domain would be misread as a conflict (a
+	 * spurious DO NOTHING skip, or a DO UPDATE against the wrong row).
+	 * Refuse so the caller raises 0A000 instead of silently corrupting a
+	 * row; expression indexes are refused below by the attnum check. */
+	if (ii->ii_Predicate != NIL)
+	{
+		index_close(idxrel, AccessShareLock);
+		return false;
+	}
+
 	attnos = (AttrNumber *) palloc(sizeof(AttrNumber) * n);
 	for (i = 0; i < n; i++)
 	{
@@ -195,6 +212,8 @@ ob_resolve_upsert_arbiter(ResultRelInfo *rri, AttrNumber **attnos_out,
 	}
 
 	*nulls_not_distinct_out = ii->ii_NullsNotDistinct;
+	if (is_pk_out)
+		*is_pk_out = (idxoid == RelationGetPrimaryKeyIndex(rri->ri_RelationDesc));
 	index_close(idxrel, AccessShareLock);
 	*attnos_out = attnos;
 	*n_out = n;
@@ -689,6 +708,573 @@ ob_validate_redirect_constraints(ResultRelInfo *rri, Relation rel,
 }
 
 /* ----------------------------------------------------------------
+ * ob_build_arbiter_key
+ *
+ *   Serialize the arbiter columns of a candidate row into one stable
+ *   NUL-terminated string, used ONLY as a same-statement duplicate-claim
+ *   key.  Returns NULL when the key cannot conflict at all: under the
+ *   default NULLS DISTINCT unique index a NULL never matches, so no claim
+ *   is recorded.  Each component is length-prefixed so values that embed
+ *   the separators cannot alias a different column tuple.
+ * ----------------------------------------------------------------
+ */
+static char *
+ob_build_arbiter_key(Relation rel, TupleTableSlot *slot, AttrNumber *attnos,
+					 int natts, bool nulls_not_distinct)
+{
+	StringInfoData buf;
+	MemoryContext old;
+	char	   *result;
+	int			i;
+
+	initStringInfo(&buf);
+	for (i = 0; i < natts; i++)
+	{
+		bool		isnull = false;
+		char	   *txt = ob_slot_col_text(rel, slot, attnos[i], &isnull);
+
+		if (isnull)
+		{
+			if (!nulls_not_distinct)
+			{
+				/* NULLS DISTINCT: a NULL arbiter never conflicts. */
+				pfree(buf.data);
+				return NULL;
+			}
+			appendStringInfoString(&buf, "N;");
+		}
+		else
+		{
+			appendStringInfo(&buf, "V%d:%s;", (int) strlen(txt), txt);
+			pfree(txt);
+		}
+	}
+
+	old = MemoryContextSwitchTo(TopMemoryContext);
+	result = pstrdup(buf.data);
+	MemoryContextSwitchTo(old);
+	pfree(buf.data);
+	return result;
+}
+
+/* ----------------------------------------------------------------
+ * ob_unique_target_conflict
+ *
+ *   Probe the branch delta and MAIN for a row conflicting with the
+ *   candidate on a SINGLE plain-column UNIQUE index.  Used by the
+ *   no-target ON CONFLICT DO NOTHING path (native PostgreSQL checks
+ *   every unique index, not just the PK).  Like the UPSERT arbiter
+ *   probe this is delta-first: the delta part matches the op='I'/'U'
+ *   stored images, and the MAIN part excludes any row the branch has
+ *   already shadowed (its version token equals some delta old_version),
+ *   so a branch-local DELETE -- or an UPDATE that moved the unique
+ *   value -- does not leave a stale MAIN row counted as a conflict.
+ *
+ *   `exclude_ctid` / `exclude_key`, when non-NULL, skip the SOURCE row of
+ *   an UPDATE (its MAIN ctid string and/or its delta identity key) so the
+ *   row being rewritten is not counted as a conflict against itself: its
+ *   MAIN anchor still carries the OLD column values and its pre-existing
+ *   delta row still carries the PRE-image, either of which would match an
+ *   unchanged UNIQUE value and raise a spurious 23505.
+ * ----------------------------------------------------------------
+ */
+static bool
+ob_unique_target_conflict(Relation rel, TupleTableSlot *slot, int32 bid,
+						  Oid relid, AttrNumber *attnos, int natts,
+						  bool nulls_not_distinct,
+						  const char *exclude_ctid, const char *exclude_key)
+{
+	StringInfoData wbuf_delta;
+	StringInfoData wbuf_main;
+	Oid		   *argtypes;
+	Datum	   *vals;
+	char	   *nulls;
+	char	   *sql;
+	int			nargs;
+	int			i;
+	int			ret;
+	bool		hit;
+
+	nargs = 2 + natts;
+	initStringInfo(&wbuf_delta);
+	initStringInfo(&wbuf_main);
+	argtypes = (Oid *) palloc(sizeof(Oid) * nargs);
+	vals = (Datum *) palloc0(sizeof(Datum) * nargs);
+	nulls = (char *) palloc(sizeof(char) * nargs);
+	argtypes[0] = INT4OID;
+	vals[0] = Int32GetDatum(bid);
+	nulls[0] = ' ';
+	argtypes[1] = OIDOID;
+	vals[1] = ObjectIdGetDatum(relid);
+	nulls[1] = ' ';
+
+	for (i = 0; i < natts; i++)
+	{
+		AttrNumber	attno = attnos[i];
+		Form_pg_attribute att = TupleDescAttr(RelationGetDescr(rel), attno - 1);
+		bool		cn = false;
+		char	   *ct = ob_slot_col_text(rel, slot, attno, &cn);
+
+		appendStringInfo(&wbuf_delta,
+						 " AND (jsonb_populate_record(NULL::%s, "
+						 "convert_from(d.tuple_data, 'UTF8')::jsonb)).%s "
+						 "%s $%d::text::%s",
+						 quote_qualified_identifier(
+							 get_namespace_name(RelationGetNamespace(rel)),
+							 RelationGetRelationName(rel)),
+						 quote_identifier(NameStr(att->attname)),
+						 nulls_not_distinct ? "IS NOT DISTINCT FROM" : "=",
+						 i + 3, format_type_be(att->atttypid));
+		appendStringInfo(&wbuf_main, "%sm.%s %s $%d::text::%s",
+						 (i == 0) ? " WHERE " : " AND ",
+						 quote_identifier(NameStr(att->attname)),
+						 nulls_not_distinct ? "IS NOT DISTINCT FROM" : "=",
+						 i + 3, format_type_be(att->atttypid));
+		argtypes[i + 2] = TEXTOID;
+		if (cn)
+		{
+			vals[i + 2] = (Datum) 0;
+			nulls[i + 2] = 'n';
+		}
+		else
+		{
+			vals[i + 2] = CStringGetTextDatum(ct);
+			nulls[i + 2] = ' ';
+		}
+		if (ct != NULL)
+			pfree(ct);
+	}
+
+	/* Skip the UPDATE source row itself (its pre-existing delta row still
+	 * holds the PRE-image, which would match an unchanged UNIQUE value). */
+	if (exclude_key != NULL)
+	{
+		char	   *qk = quote_literal_cstr(exclude_key);
+
+		appendStringInfo(&wbuf_delta, " AND d.key <> %s", qk);
+		pfree(qk);
+	}
+	/* Skip the UPDATE source row's MAIN anchor (it still holds the OLD
+	 * column values, which would match an unchanged UNIQUE value). */
+	if (exclude_ctid != NULL)
+	{
+		char	   *qc = quote_literal_cstr(exclude_ctid);
+
+		appendStringInfo(&wbuf_main, " AND m.ctid <> %s::tid", qc);
+		pfree(qc);
+	}
+
+	sql = psprintf("SELECT 1 FROM " OBTABLE_DELTA " d WHERE d.branch_id = $1 "
+				   "AND d.relid = $2 AND (d.op = 'I' OR d.op = 'U')%s "
+				   "UNION ALL SELECT 1 FROM %s m%s "
+				   "AND NOT EXISTS (SELECT 1 FROM " OBTABLE_DELTA " d2 "
+				   "WHERE d2.branch_id = $1 AND d2.relid = $2 "
+				   "AND d2.old_version = "
+				   "(replace(translate(m.ctid::text, '()', ''), ',', ':') "
+				   "|| '-x' || m.xmin::text)) LIMIT 1",
+				   wbuf_delta.data,
+				   quote_qualified_identifier(
+					 get_namespace_name(RelationGetNamespace(rel)),
+					 RelationGetRelationName(rel)),
+				   wbuf_main.data);
+
+	overlay_overlay_helper_enter();
+	overlay_write_redirect_exit();
+	ret = ob_spi_exec_params(sql, true, 0, nargs, argtypes, vals, nulls);
+	overlay_write_redirect_enter();
+	overlay_overlay_helper_exit();
+	hit = (ret == SPI_OK_SELECT && SPI_tuptable != NULL && SPI_processed >= 1);
+	SPI_finish();
+
+	pfree(sql);
+	pfree(wbuf_delta.data);
+	pfree(wbuf_main.data);
+	for (i = 2; i < nargs; i++)
+		if (DatumGetPointer(vals[i]) != NULL)
+			pfree(DatumGetPointer(vals[i]));
+	pfree(vals);
+	pfree(argtypes);
+	pfree(nulls);
+	return hit;
+}
+
+/* ----------------------------------------------------------------
+ * ob_other_unique_conflict
+ *
+ *   Scan every plain-column, non-partial UNIQUE index EXCEPT the table's
+ *   PRIMARY KEY index and `skip_idx` (the caller's resolved arbiter
+ *   index, when it has one) for a row that conflicts with the candidate
+ *   on the delta (op='I'/'U') or in MAIN.  Returns the OID of the first
+ *   conflicting index, or InvalidOid when none does.
+ *
+ *   Native INSERT checks the PK and every other unique index as soon as
+ *   the arbiter itself does NOT match — a hit is a hard 23505, never a
+ *   DO NOTHING skip; a targetless DO NOTHING checks them too.  The caller
+ *   has already probed the PK (and, for a targetless DO NOTHING, nothing
+ *   else), so this scans the remainder.  Expression / partial indexes
+ *   cannot be rebound to a text probe and are skipped: their violation
+ *   stays deferred to apply, exactly like a branch-local plain INSERT.
+ * ----------------------------------------------------------------
+ */
+static Oid
+ob_other_unique_conflict(Relation rel, TupleTableSlot *slot, int32 bid,
+						 Oid relid, Oid skip_idx,
+						 const char *exclude_ctid, const char *exclude_key)
+{
+	List	   *indexoids;
+	ListCell   *lc;
+	Oid			pkidx;
+	Oid			hit = InvalidOid;
+
+	indexoids = RelationGetIndexList(rel);
+	pkidx = RelationGetPrimaryKeyIndex(rel);
+
+	foreach(lc, indexoids)
+	{
+		Oid			idxoid = lfirst_oid(lc);
+		Relation	idxrel;
+		IndexInfo  *ii;
+		AttrNumber	attnos[INDEX_MAX_KEYS];
+		bool		nnd;
+		bool		ok = true;
+		int			n;
+		int			i;
+
+		/* The PK is probed by the caller's PK path; the arbiter (when the
+		 * caller passes one) has already been found not to match. */
+		if (idxoid == pkidx || idxoid == skip_idx)
+			continue;
+
+		idxrel = index_open(idxoid, AccessShareLock);
+		ii = BuildIndexInfo(idxrel);
+		n = ii->ii_NumIndexAttrs;
+		nnd = ii->ii_NullsNotDistinct;
+
+		if (!ii->ii_Unique || n <= 0 || n > INDEX_MAX_KEYS ||
+			ii->ii_Predicate != NIL)
+			ok = false;
+		for (i = 0; ok && i < n; i++)
+		{
+			if (ii->ii_IndexAttrNumbers[i] <= 0)
+			{
+				ok = false;
+				break;
+			}
+			attnos[i] = ii->ii_IndexAttrNumbers[i];
+		}
+		index_close(idxrel, AccessShareLock);
+
+		if (!ok)
+			continue;
+
+		if (ob_unique_target_conflict(rel, slot, bid, relid, attnos, n, nnd,
+									  exclude_ctid, exclude_key))
+		{
+			hit = idxoid;
+			break;
+		}
+	}
+
+	list_free(indexoids);
+	return hit;
+}
+
+/* ----------------------------------------------------------------
+ * ob_relation_has_resolvable_unique
+ *
+ *   True when `rel` carries at least one PLAIN-COLUMN, non-partial UNIQUE
+ *   index that is not the PRIMARY KEY index.  Such an index can be probed
+ *   by the text-rebinding conflict check, so the INSERT/UPDATE redirect
+ *   must build its per-statement same-claim set for it.
+ * ----------------------------------------------------------------
+ */
+static bool
+ob_relation_has_resolvable_unique(Relation rel)
+{
+	List	   *indexoids = RelationGetIndexList(rel);
+	Oid			pkidx = RelationGetPrimaryKeyIndex(rel);
+	ListCell   *lc;
+	bool		found = false;
+
+	foreach(lc, indexoids)
+	{
+		Oid			idxoid = lfirst_oid(lc);
+		Relation	idxrel;
+		IndexInfo  *ii;
+		bool		ok;
+		int			i;
+
+		if (idxoid == pkidx)
+			continue;
+
+		idxrel = index_open(idxoid, AccessShareLock);
+		ii = BuildIndexInfo(idxrel);
+		ok = (ii->ii_Unique && ii->ii_NumIndexAttrs > 0 &&
+			  ii->ii_NumIndexAttrs <= INDEX_MAX_KEYS &&
+			  ii->ii_Predicate == NIL);
+		for (i = 0; ok && i < ii->ii_NumIndexAttrs; i++)
+			if (ii->ii_IndexAttrNumbers[i] <= 0)
+				ok = false;
+		index_close(idxrel, AccessShareLock);
+
+		if (ok)
+		{
+			found = true;
+			break;
+		}
+	}
+
+	list_free(indexoids);
+	return found;
+}
+
+/* ----------------------------------------------------------------
+ * ob_unique_key_build
+ *
+ *   Serialize the indexed columns of `slot` for UNIQUE index `idxoid`
+ *   into one stable NUL-terminated string, prefixed with the index OID,
+ *   used as the per-statement same-claim key.  Returns NULL when the key
+ *   can never conflict (a NULL column under a NULLS DISTINCT index).
+ *   Each component is length-prefixed so values that embed the separators
+ *   cannot alias a different column tuple.  The result is palloc'd in the
+ *   caller's memory context and must be pfree'd by the caller.
+ * ----------------------------------------------------------------
+ */
+static char *
+ob_unique_key_build(Relation rel, Oid idxoid, TupleTableSlot *slot,
+					AttrNumber *attnos, int natts, bool nulls_not_distinct)
+{
+	StringInfoData buf;
+	int			i;
+
+	initStringInfo(&buf);
+	appendStringInfo(&buf, "u%u|", idxoid);
+	for (i = 0; i < natts; i++)
+	{
+		bool		isnull = false;
+		char	   *txt = ob_slot_col_text(rel, slot, attnos[i], &isnull);
+
+		if (isnull)
+		{
+			if (!nulls_not_distinct)
+			{
+				/* NULLS DISTINCT: a NULL never conflicts. */
+				pfree(buf.data);
+				return NULL;
+			}
+			appendStringInfoString(&buf, "N;");
+		}
+		else
+		{
+			appendStringInfo(&buf, "V%d:%s;", (int) strlen(txt), txt);
+			pfree(txt);
+		}
+	}
+	return buf.data;
+}
+
+/* ----------------------------------------------------------------
+ * ob_unique_claim_lookup
+ *
+ *   Return the OID of the first resolvable non-PK UNIQUE index of `rel`
+ *   whose key for `slot` was already claimed by an earlier row of the
+ *   SAME command, or InvalidOid when none was.  Mirrors native's
+ *   immediate index-level duplicate detection (the command counter does
+ *   not advance between rows of one command, so the SPI probes cannot
+ *   see a sibling row).
+ * ----------------------------------------------------------------
+ */
+static Oid
+ob_unique_claim_lookup(Relation rel, TupleTableSlot *slot, HTAB *claimed)
+{
+	List	   *indexoids = RelationGetIndexList(rel);
+	Oid			pkidx = RelationGetPrimaryKeyIndex(rel);
+	ListCell   *lc;
+	Oid			hit = InvalidOid;
+
+	foreach(lc, indexoids)
+	{
+		Oid			idxoid = lfirst_oid(lc);
+		Relation	idxrel;
+		IndexInfo  *ii;
+		AttrNumber	attnos[INDEX_MAX_KEYS];
+		bool		nnd;
+		bool		ok = true;
+		int			n;
+		int			i;
+		char	   *key;
+		char	   *probe;
+		bool		found;
+
+		if (idxoid == pkidx)
+			continue;
+
+		idxrel = index_open(idxoid, AccessShareLock);
+		ii = BuildIndexInfo(idxrel);
+		n = ii->ii_NumIndexAttrs;
+		nnd = ii->ii_NullsNotDistinct;
+		if (!ii->ii_Unique || n <= 0 || n > INDEX_MAX_KEYS ||
+			ii->ii_Predicate != NIL)
+			ok = false;
+		for (i = 0; ok && i < n; i++)
+		{
+			if (ii->ii_IndexAttrNumbers[i] <= 0)
+			{
+				ok = false;
+				break;
+			}
+			attnos[i] = ii->ii_IndexAttrNumbers[i];
+		}
+		index_close(idxrel, AccessShareLock);
+
+		if (!ok)
+			continue;
+
+		key = ob_unique_key_build(rel, idxoid, slot, attnos, n, nnd);
+		if (key == NULL)
+			continue;
+		probe = key;
+		(void) hash_search(claimed, &probe, HASH_FIND, &found);
+		pfree(key);
+		if (found)
+		{
+			hit = idxoid;
+			break;
+		}
+	}
+
+	list_free(indexoids);
+	return hit;
+}
+
+/* ----------------------------------------------------------------
+ * ob_unique_claims_add
+ *
+ *   Record, in `claimed`, the per-index UNIQUE keys of a row the redirect
+ *   has just written, so a later row of the same command that proposes
+ *   the same value is caught (native index-level detection).  Only the
+ *   resolvable non-PK UNIQUE indexes are recorded; the PK / arbiter key
+ *   is claimed separately by ob_claim_key().
+ * ----------------------------------------------------------------
+ */
+static void
+ob_unique_claims_add(Relation rel, TupleTableSlot *slot, HTAB *claimed,
+					 MemoryContext cxt)
+{
+	List	   *indexoids = RelationGetIndexList(rel);
+	Oid			pkidx = RelationGetPrimaryKeyIndex(rel);
+	ListCell   *lc;
+
+	foreach(lc, indexoids)
+	{
+		Oid			idxoid = lfirst_oid(lc);
+		Relation	idxrel;
+		IndexInfo  *ii;
+		AttrNumber	attnos[INDEX_MAX_KEYS];
+		bool		nnd;
+		bool		ok = true;
+		int			n;
+		int			i;
+		char	   *key;
+
+		if (idxoid == pkidx)
+			continue;
+
+		idxrel = index_open(idxoid, AccessShareLock);
+		ii = BuildIndexInfo(idxrel);
+		n = ii->ii_NumIndexAttrs;
+		nnd = ii->ii_NullsNotDistinct;
+		if (!ii->ii_Unique || n <= 0 || n > INDEX_MAX_KEYS ||
+			ii->ii_Predicate != NIL)
+			ok = false;
+		for (i = 0; ok && i < n; i++)
+		{
+			if (ii->ii_IndexAttrNumbers[i] <= 0)
+			{
+				ok = false;
+				break;
+			}
+			attnos[i] = ii->ii_IndexAttrNumbers[i];
+		}
+		index_close(idxrel, AccessShareLock);
+
+		if (!ok)
+			continue;
+
+		key = ob_unique_key_build(rel, idxoid, slot, attnos, n, nnd);
+		if (key != NULL)
+		{
+			ob_claim_key(claimed, cxt, key);
+			pfree(key);
+		}
+	}
+
+	list_free(indexoids);
+}
+
+/* ----------------------------------------------------------------
+ * ob_enforce_plain_unique
+ *
+ *   Eagerly enforce every resolvable non-PK UNIQUE index for a PLAIN
+ *   INSERT (promo=1) or a redirected UPDATE, raising 23505 immediately
+ *   exactly like native PostgreSQL instead of letting the violation sit
+ *   in the delta until apply.  Three steps, in native's order:
+ *
+ *     1. same-statement: the key was already claimed by an earlier row of
+ *        THIS command (the command counter does not advance between rows,
+ *        so the SPI probes below cannot see a sibling row);
+ *     2. delta / MAIN: a conflicting row already exists in this branch.
+ *        `exclude_ctid` / `exclude_key` skip the UPDATE source row so it
+ *        is not counted against itself (its OLD values would otherwise
+ *        match an unchanged UNIQUE column);
+ *     3. record `slot`'s keys so a later row of this command is caught by
+ *        step 1.
+ *
+ *   `claimed` may be NULL (no same-statement tracking), in which case
+ *   steps 1 and 3 are skipped; step 2 always runs.
+ * ----------------------------------------------------------------
+ */
+static void
+ob_enforce_plain_unique(Relation rel, TupleTableSlot *slot, int32 bid,
+						Oid relid, const char *exclude_ctid,
+						const char *exclude_key,
+						HTAB *claimed, MemoryContext claimed_cxt)
+{
+	Oid			hit;
+
+	if (claimed != NULL)
+	{
+		hit = ob_unique_claim_lookup(rel, slot, claimed);
+		if (OidIsValid(hit))
+		{
+			char	   *idxname = get_rel_name(hit);
+
+			ereport(ERROR,
+					(errcode(ERRCODE_UNIQUE_VIOLATION),
+					 errmsg("duplicate key value violates unique constraint \"%s\"",
+							idxname ? idxname : RelationGetRelationName(rel)),
+					 errdetail("A row proposed earlier in the same command already holds the same key (same-statement duplicate).")));
+		}
+	}
+
+	hit = ob_other_unique_conflict(rel, slot, bid, relid, InvalidOid,
+								   exclude_ctid, exclude_key);
+	if (OidIsValid(hit))
+	{
+		char	   *idxname = get_rel_name(hit);
+
+		ereport(ERROR,
+				(errcode(ERRCODE_UNIQUE_VIOLATION),
+				 errmsg("duplicate key value violates unique constraint \"%s\"",
+						idxname ? idxname : RelationGetRelationName(rel)),
+				 errdetail("A conflicting row already exists in this branch (overlay INSERT/UPDATE pre-check).")));
+	}
+
+	if (claimed != NULL)
+		ob_unique_claims_add(rel, slot, claimed, claimed_cxt);
+}
+
+/* ----------------------------------------------------------------
  * overlay_executor_run_intercept
  *
  *   Full write-redirection body extracted from overlay_ExecutorRun.
@@ -1131,6 +1717,11 @@ overlay_executor_run_intercept(QueryDesc *queryDesc,
 				 * would otherwise fail under -Wdeclaration-after-statement).
 				 * ============================================================= */
 				Bitmapset  *pk_attnums_set = NULL;
+				/* Per-statement non-PK UNIQUE same-claim set for CMD_UPDATE
+				 * (see ob_enforce_plain_unique).  Built only when the target
+				 * carries a resolvable non-PK UNIQUE index; NULL otherwise. */
+				HTAB	   *claimed_uq = NULL;
+				MemoryContext claimed_cxt = NULL;
 				/* ACC-1: branch id + target relid, resolved once for the
 				 * redirect loop (both the MAIN-anchored and the pure-delta
 				 * branches key their delta lookups / inserts on them). */
@@ -1140,6 +1731,25 @@ overlay_executor_run_intercept(QueryDesc *queryDesc,
 				subplan = outerPlanState(mt);
 				bid = overlay_branch_get_current_id();
 				relid = RelationGetRelid(rel);
+
+				if (cmd == CMD_UPDATE && ob_relation_has_resolvable_unique(rel))
+				{
+					HASHCTL		ctl;
+
+					claimed_cxt =
+						AllocSetContextCreate(queryDesc->estate->es_query_cxt,
+											  "overlay_branch update claimed uniq keys",
+											  ALLOCSET_SMALL_SIZES);
+					memset(&ctl, 0, sizeof(ctl));
+					ctl.keysize = sizeof(char *);
+					ctl.entrysize = sizeof(ObClaimedKey);
+					ctl.hcxt = claimed_cxt;
+					ctl.hash = ob_claimed_hash;
+					ctl.match = ob_claimed_match;
+					claimed_uq = hash_create("overlay_branch update claimed uniq keys", 64,
+											 &ctl,
+											 HASH_ELEM | HASH_FUNCTION | HASH_COMPARE | HASH_CONTEXT);
+				}
 
 				if (cmd == CMD_UPDATE)
 				{
@@ -1506,6 +2116,33 @@ overlay_executor_run_intercept(QueryDesc *queryDesc,
 					else
 						pk = overlay_serialize_identity(rel, old_clean_slot, op);
 
+					/* Eagerly enforce every resolvable non-PK UNIQUE index
+					 * on the merged post-image, so a branch-local UPDATE
+					 * that moves a UNIQUE column onto an existing value (or
+					 * that a later row of this same command proposes) raises
+					 * 23505 now, exactly like native PostgreSQL, instead of
+					 * leaving the violation in the delta until apply.  The
+					 * row being rewritten is excluded by its MAIN anchor ctid
+					 * (MAIN-anchored rows) and its delta key, so an UPDATE
+					 * that leaves the UNIQUE column untouched is legal. */
+					if (cmd == CMD_UPDATE && claimed_uq != NULL)
+					{
+						char		ctid_buf[32];
+						const char *excl_ctid = NULL;
+
+						if (main_row != NULL &&
+							ItemPointerIsValid(&main_row->tts_tid))
+						{
+							snprintf(ctid_buf, sizeof(ctid_buf), "(%u,%u)",
+									 ItemPointerGetBlockNumber(&main_row->tts_tid),
+									 ItemPointerGetOffsetNumber(&main_row->tts_tid));
+							excl_ctid = ctid_buf;
+						}
+						ob_enforce_plain_unique(rel, old_clean_slot, bid, relid,
+												excl_ctid, pk,
+												claimed_uq, claimed_cxt);
+					}
+
 					overlay_delta_insert(bid, relid, pk, op, oldver, tdata);
 					ndone++;
 
@@ -1595,6 +2232,13 @@ overlay_executor_run_intercept(QueryDesc *queryDesc,
 				if (mt->ps.instrument != NULL)
 					InstrStopNode(mt->ps.instrument, (double) nretslots);
 
+				if (claimed_cxt != NULL)
+				{
+					MemoryContextDelete(claimed_cxt);
+					claimed_cxt = NULL;
+					claimed_uq = NULL;
+				}
+
 				queryDesc->estate->es_processed = ndone;
 				handled = true;
 				goto ob_write_redirect_done;
@@ -1616,59 +2260,88 @@ overlay_executor_run_intercept(QueryDesc *queryDesc,
 				AttrNumber *arb_attnos = NULL;
 				int			arb_natts = 0;
 				bool		arb_nulls_not_distinct = false;
+				bool		arb_is_pk = false;
+				Oid			arb_idx_oid = InvalidOid;
+				bool		no_target_nothing = false;
 				OnConflictAction oc_action = ONCONFLICT_NONE;
 				ProjectionInfo *oc_proj = NULL;
 				ExprState  *oc_where = NULL;
 				HTAB	   *claimed = NULL;
 				MemoryContext claimed_cxt = NULL;
+				HTAB	   *claimed_uq = NULL;	/* non-PK UNIQUE same-claim set */
 
 				{
 					ResultRelInfo *rri0 = rri;
-					/* Primary derivation: use ModifyTable plan fields
-					 * because PG17 does NOT always populate
-					 * plan->onConflictAction for DO NOTHING (stays 0),
-					 * and rri->ri_onConflict can be NULL for DO NOTHING
-					 * when no SET targetlist is needed.
-					 * Rule:
-					 *   plan->arbiterIndexes == NIL → NONE (0, plain INSERT)
-					 *   arbiterIndexes set + (onConflictSet set OR
-					 *     rri ri_onConflict has ProjInfo) → UPDATE (2)
-					 *   arbiterIndexes set + no SET → NOTHING (1)
+
+					/*
+					 * Derive the ON CONFLICT action from the ModifyTable plan
+					 * node.  PG17 fills node->onConflictAction = onconflict->action
+					 * for EVERY inferred clause (createplan.c), including a
+					 * TARGETLESS DO NOTHING — which still leaves arbiterIndexes
+					 * NIL.  The previous "arbiterIndexes == NIL -> plain INSERT"
+					 * test therefore misclassified a targetless DO NOTHING and
+					 * surfaced a spurious unique_violation instead of skipping
+					 * the conflicting row silently.
 					 */
-					if (plan->arbiterIndexes == NIL)
-					{
-						oc_action = ONCONFLICT_NONE;
-					}
-					else if (plan->onConflictSet != NIL ||
-							 (rri0->ri_onConflict != NULL &&
-							  rri0->ri_onConflict->oc_ProjInfo != NULL))
-					{
+					oc_action = plan->onConflictAction;
+					if (oc_action == ONCONFLICT_NONE &&
+						(plan->onConflictSet != NIL ||
+						 (rri0->ri_onConflict != NULL &&
+						  rri0->ri_onConflict->oc_ProjInfo != NULL)))
 						oc_action = ONCONFLICT_UPDATE;
-						if (rri0->ri_onConflict != NULL)
+					if (oc_action == ONCONFLICT_UPDATE && rri0->ri_onConflict != NULL)
+					{
+						oc_proj = rri0->ri_onConflict->oc_ProjInfo;
+						oc_where = rri0->ri_onConflict->oc_WhereClause;
+					}
+				}
+				/* Resolve the ON CONFLICT arbiter under two shapes that need
+				 * the mode-explicit detector instead of the plain PK probe:
+				 *   • a KEYLESS table whose arbiter is a resolvable UNIQUE
+				 *     index (its ctid identity is unknown up front), and
+				 *   • a KEYED table whose arbiter is a NON-primary UNIQUE
+				 *     index: the conflict must be matched on the arbiter
+				 *     columns and the delta written under the CONFLICTED
+				 *     row's real PK, not the proposed one.
+				 * A PK arbiter keeps the fast d.key / PK-ctid probe.  A
+				 * targetless DO NOTHING has no arbiter at all: native checks
+				 * every unique index (ob_other_unique_conflict).
+				 * An UPSERT whose arbiter does NOT resolve to exactly one
+				 * non-partial UNIQUE index over plain columns (expression /
+				 * partial / several) is refused (0A000) for BOTH keyless and
+				 * keyed tables: the plain column probe cannot honour an index
+				 * predicate or an expression, so proceeding would silently
+				 * match the wrong row (a spurious DO NOTHING skip or a
+				 * DO UPDATE against a row the statement never named). */
+				if (oc_action != ONCONFLICT_NONE)
+				{
+					if (plan->arbiterIndexes == NIL)
+						no_target_nothing = true;
+					else if (ob_resolve_upsert_arbiter(rri, &arb_attnos, &arb_natts,
+													   &arb_nulls_not_distinct,
+													   &arb_is_pk))
+					{
+						/* Remember the arbiter index: once it has NOT matched,
+						 * the candidate still has to clear the PK and every
+						 * other unique index (native hard 23505) unless it is
+						 * that very arbiter. */
+						arb_idx_oid = (rri->ri_onConflictArbiterIndexes != NIL)
+							? linitial_oid(rri->ri_onConflictArbiterIndexes)
+							: InvalidOid;
+						if (arb_is_pk)
 						{
-							oc_proj = rri0->ri_onConflict->oc_ProjInfo;
-							oc_where = rri0->ri_onConflict->oc_WhereClause;
+							pfree(arb_attnos);
+							arb_attnos = NULL;
+							arb_natts = 0;
 						}
 					}
 					else
 					{
-						oc_action = ONCONFLICT_NOTHING;
-					}
-				}
-				/* keyless ctid mode has no PK to arbitrate ON CONFLICT
-				 * against; resolve the statement's UNIQUE arbiter instead
-				 * and rebind the 2-phase detector to its columns.  A
-				 * keyless UPSERT whose arbiter is not exactly one
-				 * plain-column UNIQUE index is refused (0A000) rather than
-				 * silently mis-promoted. */
-				if (!overlay_relation_has_pk(rel) && oc_action != ONCONFLICT_NONE)
-				{
-					if (!ob_resolve_upsert_arbiter(rri, &arb_attnos, &arb_natts,
-												   &arb_nulls_not_distinct))
 						ereport(ERROR,
 								(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
-								 errmsg("overlay_branch: INSERT ... ON CONFLICT (UPSERT) on a table without a PRIMARY KEY requires exactly one UNIQUE arbiter index"),
-								 errhint("Add a PRIMARY KEY, or target exactly one UNIQUE constraint.")));
+								 errmsg("overlay_branch: INSERT ... ON CONFLICT (UPSERT) requires exactly one non-partial UNIQUE arbiter index over plain columns"),
+								 errhint("Target exactly one non-partial UNIQUE constraint whose columns are plain table columns (no expressions).")));
+					}
 				}
 
 				{
@@ -1680,27 +2353,42 @@ overlay_executor_run_intercept(QueryDesc *queryDesc,
 
 				subplan = outerPlanState(mt);
 
-				/* Per-statement "claimed arbiter keys" set (see ob_claim_key).
-				 * Only meaningful for a table with a PK (single- or
-				 * multi-column; keyed by serialized identity): a keyless table
-				 * has no constraint to violate, so upstream inserts every row.
-				 * Parented to the query context so an error longjmp frees it. */
-				if (overlay_relation_has_pk(rel))
+				/* Per-statement "claimed arbiter keys" set (see ob_claim_key),
+				 * plus a second set for non-PK UNIQUE same-claim keys.
+				 * The arbiter/PK set is keyed by serialized identity and is
+				 * only meaningful for a table with a PK (a keyless table has
+				 * no PK identity to violate); the UNIQUE set is built for any
+				 * table carrying a resolvable non-PK UNIQUE index (a keyless
+				 * table may still own one, e.g. the UPSERT arbiter).  Both
+				 * are parented to the query context so an error longjmp frees
+				 * them. */
 				{
-					HASHCTL		ctl;
+					bool		has_pk = overlay_relation_has_pk(rel);
+					bool		has_uq = ob_relation_has_resolvable_unique(rel);
 
-					claimed_cxt =
-						AllocSetContextCreate(queryDesc->estate->es_query_cxt,
-											  "overlay_branch claimed keys",
-											  ALLOCSET_SMALL_SIZES);
-					memset(&ctl, 0, sizeof(ctl));
-					ctl.keysize = sizeof(char *);
-					ctl.entrysize = sizeof(ObClaimedKey);
-					ctl.hcxt = claimed_cxt;
-					ctl.hash = ob_claimed_hash;
-					ctl.match = ob_claimed_match;
-					claimed = hash_create("overlay_branch claimed keys", 64, &ctl,
-										  HASH_ELEM | HASH_FUNCTION | HASH_COMPARE | HASH_CONTEXT);
+					if (has_pk || has_uq)
+					{
+						HASHCTL		ctl;
+
+						claimed_cxt =
+							AllocSetContextCreate(queryDesc->estate->es_query_cxt,
+												  "overlay_branch claimed keys",
+												  ALLOCSET_SMALL_SIZES);
+						memset(&ctl, 0, sizeof(ctl));
+						ctl.keysize = sizeof(char *);
+						ctl.entrysize = sizeof(ObClaimedKey);
+						ctl.hcxt = claimed_cxt;
+						ctl.hash = ob_claimed_hash;
+						ctl.match = ob_claimed_match;
+						if (has_pk)
+							claimed = hash_create("overlay_branch claimed keys", 64,
+												  &ctl,
+												  HASH_ELEM | HASH_FUNCTION | HASH_COMPARE | HASH_CONTEXT);
+						if (has_uq)
+							claimed_uq = hash_create("overlay_branch claimed uniq keys", 64,
+													 &ctl,
+													 HASH_ELEM | HASH_FUNCTION | HASH_COMPARE | HASH_CONTEXT);
+					}
 				}
 
 			/* EXPLAIN ANALYZE parity: mirror the UPDATE/DELETE path — open
@@ -1715,6 +2403,8 @@ overlay_executor_run_intercept(QueryDesc *queryDesc,
 				char	   *tdata;
 				char	   *old_version = NULL;
 				char	   *pure_delta_key = NULL;
+				char	   *claim_key = NULL;   /* arbiter-key claim string (arbiter path) */
+				char	   *conflict_key = NULL; /* conflicted row's own PK (keyed arbiter path) */
 				int			promotion = 0; /* 0=skip 1=INSERT 2=UPDATE(main) 3=UPDATE(pure) */
 				TupleTableSlot *pre_image_slot = NULL;
 				bytea	   *pure_tuple_bytes = NULL;
@@ -1746,11 +2436,22 @@ overlay_executor_run_intercept(QueryDesc *queryDesc,
 
 				/* Same-statement duplicate check: was this arbiter key already
 				 * written by an earlier row of THIS command?  (PK tables only;
-				 * `claimed` stays NULL for keyless tables.) */
+				 * `claimed` stays NULL for keyless tables.)  On the arbiter
+				 * path the claim key is the arbiter columns — a non-PK arbiter
+				 * may match a row whose PK differs from the proposed one, so
+				 * the PK is not the conflict identity there. */
 				if (claimed != NULL)
 				{
 					char	   *pk_probe = pk;
 
+					if (arb_natts > 0)
+					{
+						claim_key = ob_build_arbiter_key(rel, slot, arb_attnos,
+														 arb_natts,
+														 arb_nulls_not_distinct);
+						if (claim_key != NULL)
+							pk_probe = claim_key;
+					}
 					(void) hash_search(claimed, &pk_probe, HASH_FIND, &key_claimed);
 				}
 
@@ -2066,7 +2767,7 @@ overlay_executor_run_intercept(QueryDesc *queryDesc,
 							char	   *ct = ob_slot_col_text(rel, slot, attno, &cn);
 
 							appendStringInfo(&wbuf,
-											 "%s%s %s $%d::text::%s",
+											 "%sm.%s %s $%d::text::%s",
 											 (i == 0) ? " WHERE " : " AND ",
 											 quote_identifier(NameStr(att->attname)),
 											 arb_nulls_not_distinct
@@ -2087,11 +2788,29 @@ overlay_executor_run_intercept(QueryDesc *queryDesc,
 							if (ct != NULL)
 								pfree(ct);
 						}
-						sql2 = psprintf("SELECT ctid FROM %s%s LIMIT 1",
+						/* DELTA-FIRST SHADOW (arbiter path): exclude any MAIN
+						 * row this branch already carries a delta row for.
+						 * Phase I cannot see such a shadow -- it matches the
+						 * delta row's *stored image* on the arbiter columns,
+						 * which a tombstone (op='D') does not have and an
+						 * op='U' row rewrites.  The delta row's old_version is
+						 * the "<blk>:<off>-x<xmin>" CAS token of the MAIN row
+						 * it shadowed (the same token the apply path compares
+						 * against), so a MAIN row whose current token equals
+						 * some delta old_version is logically deleted /
+						 * rewritten and must NOT be re-found as a conflict
+						 * (the candidate must INSERT, not resurrect the stale
+						 * MAIN row). */
+						sql2 = psprintf("SELECT m.ctid FROM %s m%s "
+										"AND NOT EXISTS (SELECT 1 FROM "
+										OBTABLE_DELTA " d WHERE d.branch_id = %d "
+										"AND d.relid = %u AND d.old_version = "
+										"(replace(translate(m.ctid::text, '()', ''), ',', ':') "
+										"|| '-x' || m.xmin::text)) LIMIT 1",
 										quote_qualified_identifier(
 											get_namespace_name(RelationGetNamespace(rel)),
 											RelationGetRelationName(rel)),
-										wbuf.data);
+										wbuf.data, (int) bid, (unsigned int) relid);
 						pfree(wbuf.data);
 					}
 					else if (pk_attno > 0)
@@ -2328,10 +3047,46 @@ overlay_executor_run_intercept(QueryDesc *queryDesc,
 						r21_check_insert_preconditions(rel, slot, bid, relid, pk);
 						promotion = 1;
 					}
-					else if (!main_hit && !pure_hit && !key_claimed)
+					else if (!main_hit && !pure_hit && !key_claimed &&
+							 !(no_target_nothing &&
+							   OidIsValid(ob_other_unique_conflict(rel, slot, bid,
+																   relid,
+																   InvalidOid,
+																   NULL, NULL))))
 					{
-						/* No conflict → promo=1 INSERT (both DO NOTHING /
-						 * DO UPDATE fall through to insert) */
+						/* No conflict → promo=1 INSERT.  A targetless
+						 * DO NOTHING additionally checks EVERY resolvable
+						 * UNIQUE index (native semantics), not just the PK
+						 * the two phases probed; a hit there falls into the
+						 * DO NOTHING skip branch below.
+						 *
+						 * A TARGETED ON CONFLICT reaches this point only when
+						 * the arbiter did NOT match.  Native then proceeds
+						 * with the INSERT and hard-errors 23505 if the row
+						 * violates the PK (a non-primary arbiter leaves the
+						 * PK unprobed) or any OTHER unique index (the arbiter
+						 * does not cover them).  Reproduce that eagerly so the
+						 * violation is not silently deferred to apply. */
+						if (arb_natts > 0)
+							r21_check_insert_preconditions(rel, slot, bid, relid, pk);
+						if (OidIsValid(arb_idx_oid))
+						{
+							Oid			conflict_idx =
+								ob_other_unique_conflict(rel, slot, bid, relid,
+														 arb_idx_oid,
+														 NULL, NULL);
+
+							if (OidIsValid(conflict_idx))
+							{
+								char	   *idxname = get_rel_name(conflict_idx);
+
+								ereport(ERROR,
+									(errcode(ERRCODE_UNIQUE_VIOLATION),
+									 errmsg("duplicate key value violates unique constraint \"%s\"",
+											idxname ? idxname : RelationGetRelationName(rel)),
+									 errdetail("A conflicting row already exists in this branch (overlay arbiter INSERT pre-check).")));
+							}
+						}
 						promotion = 1;
 					}
 					else if (oc_action == ONCONFLICT_NOTHING)
@@ -2468,6 +3223,15 @@ overlay_executor_run_intercept(QueryDesc *queryDesc,
 															 queryDesc->estate->es_query_cxt);
 						if (old_version == NULL)
 							old_version = overlay_tuple_version(rel, pre_image_slot);
+						/* G-1: a non-PK UNIQUE arbiter matched a MAIN row whose
+						 * own PK differs from the proposed one.  Capture that
+						 * row's real PK now, while the pre-image is still live
+						 * (ExecProject below clears the pre-image slot), so the
+						 * delta is keyed by the row DO UPDATE actually rewrites. */
+						if (arb_natts > 0 && overlay_relation_has_pk(rel) &&
+							pre_image_slot != NULL && !TupIsNull(pre_image_slot))
+							conflict_key = overlay_serialize_identity(
+								rel, pre_image_slot, DELTA_OP_UPDATE);
 					}
 					else
 					{
@@ -2642,14 +3406,21 @@ overlay_executor_run_intercept(QueryDesc *queryDesc,
 							char	   *anchored_key = NULL;
 							MemoryContext oldmc;
 
-							/* Keyless UPSERT writes under the conflicted
-							 * row's identity, not the VALUES slot's (which
-							 * would mint a fresh synthetic key and duplicate
-							 * the row on read): a pure-delta hit reuses the
-							 * existing delta key + version, a MAIN hit
-							 * re-anchors to that row's ctid. */
+							/* An UPSERT writes under the CONFLICTED row's
+							 * identity, not the VALUES slot's:
+							 *   • a pure-delta hit reuses the existing delta
+							 *     key + version;
+							 *   • a keyed table matched through a non-PK
+							 *     UNIQUE arbiter uses the conflicted row's
+							 *     real PK (captured as conflict_key), not the
+							 *     proposed key;
+							 *   • a keyless MAIN hit re-anchors to that row's
+							 *     ctid (a fresh synthetic key would duplicate
+							 *     the row on read). */
 							if (pure_delta_key != NULL)
 								delta_key = pure_delta_key;
+							else if (conflict_key != NULL)
+								delta_key = conflict_key;
 							else if (!overlay_relation_has_pk(rel) &&
 									 main_ctid != NULL)
 							{
@@ -2659,10 +3430,23 @@ overlay_executor_run_intercept(QueryDesc *queryDesc,
 									delta_key = anchored_key;
 							}
 
+							/* Enforce the non-PK UNIQUE indexes on the DO
+							 * UPDATE post-image (native hard 23505 when the
+							 * SET collides with another row).  The conflicted
+							 * source row is excluded by its delta key and,
+							 * on a MAIN hit, its anchor ctid, so rewriting a
+							 * row without moving its UNIQUE value is legal. */
+							if (claimed_uq != NULL)
+								ob_enforce_plain_unique(rel, post_image, bid,
+														relid, main_ctid,
+														delta_key,
+														claimed_uq, claimed_cxt);
+
 							oldmc = MemoryContextSwitchTo(
 								queryDesc->estate->es_query_cxt);
 							if (claimed != NULL)
-								ob_claim_key(claimed, claimed_cxt, pk);
+								ob_claim_key(claimed, claimed_cxt,
+											 claim_key != NULL ? claim_key : pk);
 							overlay_delta_insert(bid, relid, delta_key,
 												 DELTA_OP_UPDATE, old_version, tdata);
 							MemoryContextSwitchTo(oldmc);
@@ -2722,14 +3506,26 @@ overlay_executor_run_intercept(QueryDesc *queryDesc,
 				if (promotion == 1)
 				{
 					/* promo=1: fresh INSERT pass.  The candidate row was
-					 * already constraint-checked before conflict detection
-					 * above, so it is not re-checked here. */
+					 * already NOT NULL / CHECK checked before conflict
+					 * detection above; the PK / arbiter uniqueness was
+					 * handled by R21 (plain INSERT) or by R21 + the arbiter
+					 * pre-check (UPSERT fall-through).  The remaining
+					 * non-PK UNIQUE indexes are enforced HERE, uniformly for
+					 * both plain INSERT and the UPSERT fall-through, so a
+					 * duplication is caught now (23505) rather than at apply.
+					 * A plain INSERT (oc_action == ONCONFLICT_NONE) reaches
+					 * this point straight from the R21 pre-check. */
+					if (claimed_uq != NULL)
+						ob_enforce_plain_unique(rel, slot, bid, relid,
+												NULL, NULL,
+												claimed_uq, claimed_cxt);
 					{
 						MemoryContext oldmc;
 						oldmc = MemoryContextSwitchTo(
 							queryDesc->estate->es_query_cxt);
 						if (claimed != NULL)
-							ob_claim_key(claimed, claimed_cxt, pk);
+							ob_claim_key(claimed, claimed_cxt,
+										 claim_key != NULL ? claim_key : pk);
 						overlay_delta_insert(bid, relid, pk,
 											 DELTA_OP_INSERT, NULL, tdata);
 						MemoryContextSwitchTo(oldmc);
@@ -2779,6 +3575,8 @@ overlay_executor_run_intercept(QueryDesc *queryDesc,
 				if (tdata) pfree(tdata);
 				if (old_version) pfree(old_version);
 				if (pure_delta_key) pfree(pure_delta_key);
+				if (claim_key) pfree(claim_key);
+				if (conflict_key) pfree(conflict_key);
 				ExecClearTuple(slot);
 			}
 
@@ -2791,6 +3589,7 @@ overlay_executor_run_intercept(QueryDesc *queryDesc,
 					MemoryContextDelete(claimed_cxt);
 					claimed_cxt = NULL;
 					claimed = NULL;
+					claimed_uq = NULL;
 				}
 
 				/* Replay collected RETURNING rows into dest.  As on the

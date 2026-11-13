@@ -51,7 +51,7 @@ CREATE TABLE nl_drv(g int PRIMARY KEY);
 INSERT INTO nl_drv VALUES (1),(2),(3);
 
 -- ===== Branch creation + 3 writes =====
-SELECT public.create_branch('br_a2_main');
+SELECT public.create_branch('br_a2_main') > 0 AS a2_branch_created;
 SELECT public.use_branch('br_a2_main');
 
 INSERT INTO a2_self(id, grp, amt) VALUES

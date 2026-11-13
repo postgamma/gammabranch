@@ -29,6 +29,7 @@ REGRESS = \
   overlay_branch_scan_type \
   overlay_branch_puredelta_mix \
   overlay_branch_upsert \
+  overlay_branch_upsert_arbiter \
   overlay_branch_puredelta \
   overlay_branch_mvcc_usage \
   overlay_branch_mvcc_bounds \

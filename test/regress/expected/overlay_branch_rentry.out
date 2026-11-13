@@ -29,6 +29,11 @@
  *       cross-branch ROLLBACK current_branch() reports no branch (the GUC is
  *       stale) and writes land on MAIN; after an explicit exit a plain user SET
  *       re-enters the branch (writes land in its delta).
+ *   §R24 eager non-PK UNIQUE enforcement: a branch-local INSERT / UPDATE /
+ *       UPSERT that would duplicate a non-primary UNIQUE value (against the
+ *       delta, MAIN, or a sibling row of the same command) must raise 23505 at
+ *       write time, while an UPDATE that leaves the UNIQUE column untouched
+ *       stays legal (the source row is excluded by its ctid + delta key).
  * GLOBAL CLEANUP: DROP TABLE r_entry_t + DROP 2 branches; RESET client_min_messages
  */
 -- ===== 0. Prerequisite guard (same as the other regression files) =====
@@ -2408,4 +2413,263 @@ SELECT overlay_branch.discard_branch('br_ctx_b');
 (1 row)
 
 DROP TABLE public.r_ctx_bug_t;
+-- =====================================================================
+-- Section R24 : Eager non-PK UNIQUE enforcement on branch-local writes.
+--
+--   A branch-managed table may carry a UNIQUE index that is not the PK.
+--   The write-redirect must reject a branch-local INSERT / UPDATE / UPSERT
+--   that would duplicate such a value with the native SQLSTATE (23505) at
+--   write time, instead of silently storing an unappliable delta row whose
+--   conflict would surface only at apply_branch.  The probe spans the
+--   branch delta (live op I/U rows), the shadow-aware MAIN side, and — as
+--   the command counter does not advance between rows of one command — a
+--   per-statement same-command claim set.  The UPDATE / UPSERT source row
+--   is excluded by its MAIN anchor ctid and its delta key, so rewriting a
+--   row without moving its UNIQUE value never raises a false positive.
+--
+-- COVERAGE:
+--   R24_A : plain INSERT collides with a MAIN row's UNIQUE value    -> 23505
+--   R24_B : two rows of ONE INSERT propose the same UNIQUE value    -> 23505
+--   R24_C : MAIN-anchored UPDATE moves the UNIQUE value onto a peer -> 23505
+--   R24_D : MAIN-anchored UPDATE leaves the UNIQUE value untouched  -> OK
+--   R24_E : one UPDATE sets two rows to the same UNIQUE value       -> 23505
+--   R24_F : NULLS DISTINCT — several NULLs coexist                  -> OK
+--   R24_G : UPSERT (arbiter=PK) DO UPDATE collides on peer UNIQUE   -> 23505
+--   R24_H : targetless DO NOTHING on a peer-UNIQUE conflict         -> skip
+--   R24_I : pure-delta UPDATE moves onto a live MAIN value          -> 23505
+--   R24_J : legal INSERT / UPDATE still succeed (no false positive)
+--   R24_K : MAIN pristine after leaving the branch; apply materializes
+-- =====================================================================
+SET client_min_messages = WARNING;
+CREATE TABLE public.t_r24 (
+    id  integer PRIMARY KEY,
+    u   integer UNIQUE,
+    v   text
+);
+INSERT INTO public.t_r24 VALUES (1, 10, 'm1'), (2, 20, 'm2'), (3, 30, 'm3');
+SELECT overlay_branch.create_branch('br_r24');
+ create_branch 
+---------------
+            21
+(1 row)
+
+SELECT overlay_branch.use_branch('br_r24');
+ use_branch 
+------------
+ 
+(1 row)
+
+-- R24_A: a plain INSERT whose UNIQUE value collides with a MAIN row.
+DO $$
+BEGIN
+    BEGIN
+        INSERT INTO public.t_r24 VALUES (9, 10, 'dup_main');
+        RAISE EXCEPTION 'FAIL_R24_A_NO_ERROR';
+    EXCEPTION WHEN OTHERS THEN
+        IF SQLSTATE <> '23505' THEN
+            RAISE EXCEPTION 'FAIL_R24_A: expected 23505 got %: %', SQLSTATE, SQLERRM;
+        END IF;
+    END;
+END $$;
+SELECT CASE WHEN count(*) = 0 THEN 'PASS:R24_A_INSERT_DUP_UNIQUE_23505'
+            ELSE 'FAIL:R24_A delta_rows=' || count(*) END AS r24_a
+  FROM overlay_branch.pg_branch_delta d
+  JOIN overlay_branch.pg_branch b USING (branch_id)
+ WHERE b.branch_name = 'br_r24';
+               r24_a                
+------------------------------------
+ PASS:R24_A_INSERT_DUP_UNIQUE_23505
+(1 row)
+
+-- R24_B: one INSERT, two rows, same UNIQUE value in the SAME command
+--        (the command counter does not advance, so the delta probe cannot
+--        see the sibling row — the same-command claim set must catch it).
+DO $$
+BEGIN
+    BEGIN
+        INSERT INTO public.t_r24 VALUES (7, 11, 'b1'), (8, 11, 'b2');
+        RAISE EXCEPTION 'FAIL_R24_B_NO_ERROR';
+    EXCEPTION WHEN OTHERS THEN
+        IF SQLSTATE <> '23505' THEN
+            RAISE EXCEPTION 'FAIL_R24_B: expected 23505 got %: %', SQLSTATE, SQLERRM;
+        END IF;
+    END;
+END $$;
+SELECT CASE WHEN count(*) = 0 THEN 'PASS:R24_B_SAME_STMT_INSERT_23505'
+            ELSE 'FAIL:R24_B delta_rows=' || count(*) END AS r24_b
+  FROM overlay_branch.pg_branch_delta d
+  JOIN overlay_branch.pg_branch b USING (branch_id)
+ WHERE b.branch_name = 'br_r24';
+               r24_b               
+-----------------------------------
+ PASS:R24_B_SAME_STMT_INSERT_23505
+(1 row)
+
+-- R24_C: a MAIN-anchored UPDATE that moves u onto a peer's live value.
+DO $$
+BEGIN
+    BEGIN
+        UPDATE public.t_r24 SET u = 20 WHERE id = 1;
+        RAISE EXCEPTION 'FAIL_R24_C_NO_ERROR';
+    EXCEPTION WHEN OTHERS THEN
+        IF SQLSTATE <> '23505' THEN
+            RAISE EXCEPTION 'FAIL_R24_C: expected 23505 got %: %', SQLSTATE, SQLERRM;
+        END IF;
+    END;
+END $$;
+SELECT CASE WHEN u = 10 THEN 'PASS:R24_C_UPDATE_DUP_UNIQUE_23505'
+            ELSE 'FAIL:R24_C u=' || u END AS r24_c
+  FROM public.t_r24 WHERE id = 1;
+               r24_c                
+------------------------------------
+ PASS:R24_C_UPDATE_DUP_UNIQUE_23505
+(1 row)
+
+-- R24_D: a MAIN-anchored UPDATE that leaves u untouched is legal (the row
+--        must not be counted as a conflict against itself).
+UPDATE public.t_r24 SET v = 'm1b' WHERE id = 1;
+SELECT CASE WHEN v = 'm1b' AND u = 10 THEN 'PASS:R24_D_UPDATE_SELF_OK'
+            ELSE 'FAIL:R24_D v=' || v || ' u=' || u END AS r24_d
+  FROM public.t_r24 WHERE id = 1;
+           r24_d           
+---------------------------
+ PASS:R24_D_UPDATE_SELF_OK
+(1 row)
+
+-- R24_E: one UPDATE setting two rows' u to the same value.
+DO $$
+BEGIN
+    BEGIN
+        UPDATE public.t_r24 SET u = 99 WHERE id IN (1, 2);
+        RAISE EXCEPTION 'FAIL_R24_E_NO_ERROR';
+    EXCEPTION WHEN OTHERS THEN
+        IF SQLSTATE <> '23505' THEN
+            RAISE EXCEPTION 'FAIL_R24_E: expected 23505 got %: %', SQLSTATE, SQLERRM;
+        END IF;
+    END;
+END $$;
+SELECT CASE WHEN count(*) = 2 THEN 'PASS:R24_E_SAME_STMT_UPDATE_23505'
+            ELSE 'FAIL:R24_E cnt=' || count(*) END AS r24_e
+  FROM public.t_r24 WHERE id IN (1, 2) AND u IN (10, 20);
+               r24_e               
+-----------------------------------
+ PASS:R24_E_SAME_STMT_UPDATE_23505
+(1 row)
+
+-- R24_F: NULLS DISTINCT — many NULL UNIQUE values coexist.
+INSERT INTO public.t_r24 VALUES (11, NULL, 'n1'), (12, NULL, 'n2');
+SELECT CASE WHEN count(*) = 2 THEN 'PASS:R24_F_NULLS_DISTINCT_OK'
+            ELSE 'FAIL:R24_F null_cnt=' || count(*) END AS r24_f
+  FROM public.t_r24 WHERE id IN (11, 12) AND u IS NULL;
+            r24_f             
+------------------------------
+ PASS:R24_F_NULLS_DISTINCT_OK
+(1 row)
+
+-- R24_G: UPSERT (arbiter=PK) DO UPDATE whose SET collides on the peer UNIQUE.
+DO $$
+BEGIN
+    BEGIN
+        INSERT INTO public.t_r24 VALUES (3, 10, 'g')
+            ON CONFLICT (id) DO UPDATE SET u = EXCLUDED.u;
+        RAISE EXCEPTION 'FAIL_R24_G_NO_ERROR';
+    EXCEPTION WHEN OTHERS THEN
+        IF SQLSTATE <> '23505' THEN
+            RAISE EXCEPTION 'FAIL_R24_G: expected 23505 got %: %', SQLSTATE, SQLERRM;
+        END IF;
+    END;
+END $$;
+SELECT CASE WHEN u = 30 THEN 'PASS:R24_G_UPSERT_DOUPDATE_23505'
+            ELSE 'FAIL:R24_G u=' || u END AS r24_g
+  FROM public.t_r24 WHERE id = 3;
+              r24_g               
+----------------------------------
+ PASS:R24_G_UPSERT_DOUPDATE_23505
+(1 row)
+
+-- R24_H: targetless DO NOTHING against a peer-UNIQUE conflict skips silently.
+INSERT INTO public.t_r24 VALUES (9, 10, 'h') ON CONFLICT DO NOTHING;
+SELECT CASE WHEN count(*) = 0 THEN 'PASS:R24_H_TARGETLESS_DONOTHING_SKIP'
+            ELSE 'FAIL:R24_H inserted=' || count(*) END AS r24_h
+  FROM public.t_r24 WHERE id = 9;
+                r24_h                 
+--------------------------------------
+ PASS:R24_H_TARGETLESS_DONOTHING_SKIP
+(1 row)
+
+-- R24_I: a pure-delta row's UPDATE moving u onto a live MAIN value.
+INSERT INTO public.t_r24 VALUES (14, 14, 'i1');
+DO $$
+BEGIN
+    BEGIN
+        UPDATE public.t_r24 SET u = 10 WHERE id = 14;
+        RAISE EXCEPTION 'FAIL_R24_I_NO_ERROR';
+    EXCEPTION WHEN OTHERS THEN
+        IF SQLSTATE <> '23505' THEN
+            RAISE EXCEPTION 'FAIL_R24_I: expected 23505 got %: %', SQLSTATE, SQLERRM;
+        END IF;
+    END;
+END $$;
+SELECT CASE WHEN u = 14 THEN 'PASS:R24_I_PUREDELTA_UPDATE_23505'
+            ELSE 'FAIL:R24_I u=' || u END AS r24_i
+  FROM public.t_r24 WHERE id = 14;
+               r24_i               
+-----------------------------------
+ PASS:R24_I_PUREDELTA_UPDATE_23505
+(1 row)
+
+-- R24_J: legal INSERT / UPDATE must still succeed (no false positive).
+INSERT INTO public.t_r24 VALUES (15, 15, 'j1');
+UPDATE public.t_r24 SET u = 16 WHERE id = 2;
+SELECT CASE WHEN count(*) = 1 THEN 'PASS:R24_J_LEGAL_INSERT_OK'
+            ELSE 'FAIL:R24_J cnt=' || count(*) END AS r24_j
+  FROM public.t_r24 WHERE id = 15 AND u = 15;
+           r24_j            
+----------------------------
+ PASS:R24_J_LEGAL_INSERT_OK
+(1 row)
+
+SELECT CASE WHEN u = 16 THEN 'PASS:R24_J_LEGAL_UPDATE_OK'
+            ELSE 'FAIL:R24_J u=' || u END AS r24_j2
+  FROM public.t_r24 WHERE id = 2;
+           r24_j2           
+----------------------------
+ PASS:R24_J_LEGAL_UPDATE_OK
+(1 row)
+
+-- R24_K: MAIN pristine until apply; apply materializes the delta.
+SELECT overlay_branch.use_branch(NULL);
+ use_branch 
+------------
+ 
+(1 row)
+
+RESET overlay_branch.current;
+SET overlay_branch.current = '';
+SELECT CASE WHEN count(*) = 3 THEN 'PASS:R24_K_MAIN_PRISTINE'
+            ELSE 'FAIL:R24_K main_cnt=' || count(*) END AS r24_k
+  FROM public.t_r24;
+          r24_k           
+--------------------------
+ PASS:R24_K_MAIN_PRISTINE
+(1 row)
+
+SELECT overlay_branch.apply_branch('br_r24');
+ apply_branch 
+--------------
+ 
+(1 row)
+
+SELECT CASE WHEN count(*) = 7 THEN 'PASS:R24_K_APPLY_MATERIALIZED'
+            ELSE 'FAIL:R24_K applied_cnt=' || count(*) END AS r24_k2
+  FROM public.t_r24;
+            r24_k2             
+-------------------------------
+ PASS:R24_K_APPLY_MATERIALIZED
+(1 row)
+
+-- R24 teardown (the branch is left in the terminal 'applied' state, like the
+-- other apply-based sections; only the table is dropped).
+RESET client_min_messages;
+DROP TABLE public.t_r24;
 RESET client_min_messages;

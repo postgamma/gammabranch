@@ -29,7 +29,7 @@ INSERT INTO a8_planner(id, grp, amt)
 ANALYZE a8_planner;
 SELECT count(*) AS a8_main_cnt FROM a8_planner;       -- expect 200
 
-SELECT overlay_branch.create_branch('a8_cost_branch');
+SELECT overlay_branch.create_branch('a8_cost_branch') > 0 AS a8_branch_created;
 SELECT overlay_branch.use_branch('a8_cost_branch');
 
 -- Overlay edits: 13 rows (6.5% × 200 matches our default M_est ratio)

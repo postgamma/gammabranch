@@ -33,6 +33,7 @@
   - [4.2 APPLY Conflict Path](#42-apply-conflict-path)
 - [5. Not-Yet-Supported Scenarios (Explicit Errors) + Implemented UPSERT](#5-not-yet-supported-scenarios-explicit-errors--implemented-upsert)
   - [5.1 UPSERT Implementation Example](#51-upsert-implementation-example)
+  - [5.1.1 Conflict Target Selection](#511-conflict-target-selection)
   - [5.2 Data-Modifying CTE: Explicit ERROR](#52-data-modifying-cte-explicit-error)
   - [5.3 Support Matrix](#53-support-matrix)
 - [6. Special Cases](#6-special-cases)
@@ -398,6 +399,12 @@ DELETE FROM products USING price_ref WHERE products.id = price_ref.pid;
 table's `NOT NULL` and `CHECK` constraints immediately, exactly like the same
 statement run on Main: an invalid row raises `23502` / `23514` and never lands
 in the branch delta (rather than being stored and only failing at apply time).
+A duplicate against any plain-column, non-partial **`UNIQUE`** index is caught
+the same way — whether the conflicting row lives in the branch delta, in Main,
+or is proposed by an earlier row of the *same command* — and raises `23505`
+before anything is written, so it is never deferred to `apply_branch`. An
+`UPDATE` that leaves a `UNIQUE` column unchanged stays legal: the row being
+rewritten is excluded from its own conflict probe.
 For `INSERT ... ON CONFLICT` the candidate row is checked before the conflict is
 resolved, and a `DO UPDATE` re-checks the merged row, so the behavior matches
 Main even when `DO NOTHING` or `DO UPDATE` would otherwise discard the offending
@@ -407,6 +414,16 @@ value.
 SELECT use_branch('agent_workspace');
 UPDATE products SET price = NULL WHERE id = 1;
 -- ERROR: 23502: null value in column "price" of relation "products" violates not-null constraint
+```
+
+```sql
+-- (the UNIQUE index must exist in Main before entering the branch)
+SELECT use_branch(NULL);
+CREATE TABLE products_sku (id int PRIMARY KEY, sku text UNIQUE, price int);
+INSERT INTO products_sku VALUES (1, 'A', 10);
+SELECT use_branch('agent_workspace');
+INSERT INTO products_sku VALUES (2, 'A', 20);   -- sku conflicts with the Main row id=1
+-- ERROR: 23505: duplicate key value violates unique constraint "products_sku_sku_key"
 ```
 
 ### 2.5 Complete Overlay Example
@@ -642,7 +659,7 @@ The following scenarios are **explicitly rejected** (they do not silently pass t
 
 ### 5.1 UPSERT Implementation Example
 
-`INSERT ... ON CONFLICT DO NOTHING / DO UPDATE` (for PK conflicts) works normally inside a branch:
+`INSERT ... ON CONFLICT DO NOTHING / DO UPDATE` (for PK or UNIQUE-arbiter conflicts) works normally inside a branch:
 
 ```sql
 SELECT create_branch('br_upsert_demo');
@@ -720,6 +737,65 @@ SELECT * FROM products WHERE id = 3;
   3 | Cherry_reborn |     1
 ```
 
+### 5.1.1 Conflict Target Selection
+
+`ON CONFLICT (target)` honors the named target, not always the primary key:
+
+```sql
+-- (fresh MAIN table + branch)
+CREATE TABLE sku_items (id int PRIMARY KEY, sku text UNIQUE, qty int);
+INSERT INTO sku_items VALUES (1, 'A', 10);
+SELECT create_branch('br_arb');
+SELECT use_branch('br_arb');
+
+-- arbiter on a NON-primary UNIQUE column: the conflict matches on `sku`, and
+-- the delta row is re-keyed to the conflicted row's real PK
+INSERT INTO sku_items VALUES (999, 'A', 20)
+  ON CONFLICT (sku) DO UPDATE SET qty = EXCLUDED.qty;
+SELECT * FROM sku_items;           -- id=1 updated in place; no id=999 row
+ id | sku | qty
+----+-----+-----
+  1 | A   |  20
+
+-- targetless DO NOTHING checks EVERY UNIQUE index: any conflict skips
+INSERT INTO sku_items VALUES (1, 'B', 1) ON CONFLICT DO NOTHING;   -- PK id=1        → skip
+INSERT 0 0
+INSERT INTO sku_items VALUES (2, 'A', 1) ON CONFLICT DO NOTHING;   -- UNIQUE sku='A' → skip
+INSERT 0 0
+
+-- once the arbiter does NOT match, the row is still validated against the PK
+-- and every other UNIQUE index: a hit is a hard duplicate-key error (23505),
+-- exactly like Main -- never a delta write deferred to apply
+INSERT INTO sku_items VALUES (1, 'C', 1) ON CONFLICT (sku) DO NOTHING;
+ERROR:  duplicate key value violates unique constraint (23505)
+
+-- a branch-local DELETE (or an UPDATE that moves the value away) FREES the
+-- arbiter value: a later UPSERT on that value must INSERT, exactly like Main
+-- -- the deleted row is gone, so ON CONFLICT must not resurrect the stale
+-- MAIN row nor update the branch row that moved off the value
+DELETE FROM sku_items WHERE id = 1;
+INSERT INTO sku_items VALUES (2, 'A', 30)
+  ON CONFLICT (sku) DO UPDATE SET qty = EXCLUDED.qty;
+SELECT * FROM sku_items;
+ id | sku | qty
+----+-----+-----
+  2 | A   |  30
+```
+
+The named target must resolve to exactly one **non-partial** UNIQUE index over
+plain columns. An arbiter that is a **partial** index (`... WHERE <predicate>`)
+or an **expression** index (`... ON (lower(col))`), or that names more than one
+index, is rejected with `0A000` — for BOTH keyed and keyless tables:
+
+```sql
+-- partial-index arbiter -> 0A000 (the predicate could not be honoured, so the
+-- probe would silently match a row outside the predicate's domain)
+INSERT INTO sku_items VALUES (999, 'A', 1)
+  ON CONFLICT (sku) WHERE id > 0 DO NOTHING;
+ERROR:  overlay_branch: INSERT ... ON CONFLICT (UPSERT) requires exactly one
+        non-partial UNIQUE arbiter index over plain columns (0A000)
+```
+
 ### 5.2 Data-Modifying CTE: Explicit ERROR
 
 Embedding DML in a CTE and then selecting from it in an outer SELECT is not allowed:
@@ -738,8 +814,8 @@ Alternative: use top-level DML with `RETURNING` directly (see §6.2).
 | Capability | Status |
 | --- | --- |
 | plain INSERT/UPDATE/DELETE | ✅ Supported |
-| Duplicate-key INSERT (single- or multi-column PK) | ❌ Rejected eagerly with `23505`, same as Main — nothing is written to the delta |
-| INSERT … ON CONFLICT (UPSERT) | ✅ Supported (arbitrates on the PK, or on the single UNIQUE constraint in keyless mode — see §6.8) |
+| Duplicate-key INSERT (single- or multi-column PK, or any plain-column non-partial `UNIQUE` index) | ❌ Rejected eagerly with `23505`, same as Main — nothing is written to the delta |
+| INSERT … ON CONFLICT (UPSERT) | ✅ Supported (arbitrates on the PK, or on the single non-partial plain-column `UNIQUE` index named in the statement — see §5.1.1); partial / expression arbiters are rejected with `0A000`; any *other* `UNIQUE` index (and the PK) is still enforced eagerly, and the `DO UPDATE` post-image is re-checked (`23505`) |
 | UPSERT on a composite (multi-column) PK | ✅ Supported — the same conflict detection runs on every PK column, so `DO UPDATE` / `DO NOTHING` behave as in Main |
 | UPDATE/DELETE … RETURNING | ✅ Supported |
 | PK predicates (`pk = c` / `pk IN (…)` / `pk BETWEEN …` / `pk > c` / their `AND`/`OR` combinations) | ✅ Recommended path (goes through the PK index) |
@@ -1169,6 +1245,13 @@ SELECT create_branch('b_ctr');
 SELECT use_branch('b_ctr');
 INSERT INTO counters VALUES (1, 11) ON CONFLICT (id) DO UPDATE SET n = EXCLUDED.n;
 SELECT * FROM counters;              -- 1 = 11 (branch image)
+
+-- a branch-local DELETE frees id=1: the later UPSERT inserts a fresh row,
+-- exactly like Main (the deleted row is not resurrected)
+DELETE FROM counters WHERE id = 1;
+INSERT INTO counters VALUES (1, 12) ON CONFLICT (id) DO UPDATE SET n = EXCLUDED.n;
+SELECT * FROM counters;              -- 1 = 12 (reborn)
+
 SELECT use_branch(NULL);
 SELECT * FROM counters;              -- 1 = 10 (Main untouched)
 SELECT apply_branch('b_ctr');
@@ -1182,7 +1265,7 @@ Key behavior points:
 | WARNING | Emitted once per session the first time a no-PK table is hit |
 | Read/write overlay | INSERT/UPDATE/DELETE/SELECT/apply/discard are the same as for PK tables |
 | Row identity | Based on the row's **physical location** (best-effort): if another session modifies a Main row that the branch anchored to while the branch is alive, apply reports a conflict |
-| UPSERT | `INSERT ... ON CONFLICT` arbitrates on the single `UNIQUE` index named in the statement (single- or multi-column); an arbiter that does not resolve to exactly one plain-column `UNIQUE` index (e.g. an expression index) is still rejected with `0A000` |
+| UPSERT | `INSERT ... ON CONFLICT` arbitrates on the single `UNIQUE` index named in the statement (single- or multi-column); an arbiter that does not resolve to exactly one non-partial plain-column `UNIQUE` index (a partial or expression index, or several) is rejected with `0A000` — exactly as for a keyed table (see §5.1.1) |
 | UPSERT with a NULL arbiter value | Follows the index's null handling: under the default `UNIQUE` (NULLS DISTINCT) a NULL never matches, so the statement degrades to a plain INSERT; under `UNIQUE NULLS NOT DISTINCT` a NULL conflicts with an existing NULL row, just like Main |
 
 > This feature does not aim for full parity with PK tables and is recommended only for experimental / short-term draft scenarios; for long-term use, add a primary key to the table. For design and limitations, see [internals.md](internals.md) §4.

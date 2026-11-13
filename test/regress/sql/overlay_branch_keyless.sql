@@ -30,8 +30,10 @@
  *            detector is rebound to the statement's UNIQUE arbiter
  *            columns (single- or multi-column); DO NOTHING skips, DO
  *            UPDATE rewrites a MAIN or a branch-born row in place (no
- *            synthetic duplicate), and an arbiter that is not one
- *            plain-column UNIQUE index is still rejected with 0A000.
+ *            synthetic duplicate), a branch-local DELETE frees the
+ *            arbiter value so a later UPSERT rebirths the row, and an
+ *            arbiter that is not one plain-column UNIQUE index is still
+ *            rejected with 0A000.
  *   Part G — read-side version-chain resolution (B2): after a concurrent
  *            MAIN rewrite moves an anchored row's ctid, an overlay SELECT
  *            still shows the branch edit over the moved row (no silent
@@ -72,7 +74,9 @@ END $$;
 SET client_min_messages = warning;
 DROP TABLE IF EXISTS public.kn_off, public.kn_on, public.kn_race,
                      public.kn_pk,  public.kn_ups, public.kn_ups2,
-                     public.kn_move, public.kn_nd, public.kn_nd2 CASCADE;
+                     public.kn_expr, public.kn_move, public.kn_da,
+                     public.kn_db, public.kn_nd, public.kn_nd2,
+                     public.kn_reb CASCADE;
 DROP EXTENSION IF EXISTS overlay_branch CASCADE;
 RESET client_min_messages;
 CREATE EXTENSION IF NOT EXISTS overlay_branch;
@@ -337,6 +341,8 @@ SELECT discard_branch('kn_expr_br');
 --     a MAIN hit overwrites one row and a no-hit lands a synthetic insert.
 CREATE TABLE public.kn_ups2 (a int, b int, v text, UNIQUE (a, b));
 INSERT INTO public.kn_ups2 VALUES (1, 1, 'x');
+CREATE TABLE public.kn_reb (id int UNIQUE, v text);
+INSERT INTO public.kn_reb VALUES (1, 'a'), (2, 'b');
 SELECT create_branch('kn_ups2_br') AS id_kn_ups2_br;
 SELECT use_branch('kn_ups2_br');
 INSERT INTO public.kn_ups2 VALUES (1, 1, 'x2') ON CONFLICT (a, b) DO UPDATE SET v = EXCLUDED.v;
@@ -345,6 +351,19 @@ SELECT CASE WHEN string_agg(a::text||','||b::text||'='||v, ';' ORDER BY a, b) = 
             THEN 'PASS:F9_KEYLESS_MULTICOL_UPSERT'
             ELSE 'FAIL:F9_KEYLESS_MULTICOL_UPSERT:'||string_agg(a::text||','||b::text||'='||v, ';' ORDER BY a, b) END AS f9
 FROM public.kn_ups2;
+
+-- F.10 (same branch) a branch-local DELETE frees the arbiter value: the
+--      later UPSERT on that value must INSERT (rebirth), mirroring native and
+--      the PK path.  The tombstone is keyed by the anchored ctid and carries
+--      no arbiter image, so the phase-two MAIN probe must itself drop the
+--      shadowed row.
+DELETE FROM public.kn_reb WHERE id = 1;
+INSERT INTO public.kn_reb VALUES (1, 'a2') ON CONFLICT (id) DO UPDATE SET v = EXCLUDED.v;
+SELECT CASE WHEN string_agg(id::text||'='||v, ',' ORDER BY id) = '1=a2,2=b'
+            THEN 'PASS:F10_KEYLESS_REBIRTH_OVERLAY'
+            ELSE 'FAIL:F10_KEYLESS_REBIRTH:'||string_agg(id::text||'='||v, ',' ORDER BY id) END AS f10
+FROM public.kn_reb;
+
 SELECT use_branch(NULL);
 RESET overlay_branch.current;
 SET overlay_branch.current = '';
@@ -353,6 +372,10 @@ SELECT CASE WHEN string_agg(a::text||','||b::text||'='||v, ';' ORDER BY a, b) = 
             THEN 'PASS:F9_KEYLESS_MULTICOL_APPLIED'
             ELSE 'FAIL:F9_KEYLESS_MULTICOL_APPLIED:'||string_agg(a::text||','||b::text||'='||v, ';' ORDER BY a, b) END AS f9b
 FROM public.kn_ups2;
+SELECT CASE WHEN string_agg(id::text||'='||v, ',' ORDER BY id) = '1=a2,2=b'
+            THEN 'PASS:F10_KEYLESS_REBIRTH_APPLIED'
+            ELSE 'FAIL:F10_KEYLESS_REBIRTH_APPLIED:'||string_agg(id::text||'='||v, ',' ORDER BY id) END AS f10b
+FROM public.kn_reb;
 
 /* =====================================================================
  * Part G — read-side version-chain resolution (B2): a concurrent MAIN
@@ -518,5 +541,6 @@ SET client_min_messages = warning;
 DROP TABLE IF EXISTS public.kn_off, public.kn_on, public.kn_race,
                      public.kn_pk,  public.kn_ups, public.kn_ups2,
                      public.kn_expr, public.kn_move, public.kn_da,
-                     public.kn_db, public.kn_nd, public.kn_nd2 CASCADE;
+                     public.kn_db, public.kn_nd, public.kn_nd2,
+                     public.kn_reb CASCADE;
 RESET client_min_messages;

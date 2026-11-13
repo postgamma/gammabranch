@@ -240,6 +240,24 @@ overwrite into the `op='U'` replay (§1.6, "Rebirth collapse"). Without this,
 Phase I saw no delta hit, Phase II re-found the MAIN row, and the row silently
 vanished from the branch for `DO NOTHING` / `DO UPDATE ... WHERE <false>`.
 
+**Delta-first shadow on the arbiter and targetless probes.** The tombstone
+suppression above works because the PK path's Phase I probe reads the delta by
+`key` (the row identity) and therefore sees an `op='D'` row directly. The
+**arbiter** path does not: Phase I matches the delta row's *stored image* on the
+arbiter columns, which a tombstone lacks (it stores no tuple) and an `op='U'`
+rewrites to the new value. So after the branch DELETE-d a row, or UPDATE-d it so
+its arbiter value moved away, Phase I finds nothing and the phase-two MAIN probe
+re-finds the stale MAIN row — resurrecting a row the branch removed, or
+`DO UPDATE`-ing a row whose arbiter value the branch already changed. The MAIN
+probe (and its per-index sibling `ob_unique_target_conflict`, used by the
+targetless `DO NOTHING` path) therefore excludes any MAIN row the branch already
+shadows: a `NOT EXISTS` over the delta matched on `d.old_version = <the MAIN
+row's "<blk>:<off>-x<xmin>" token>` — the same CAS token the apply path compares
+against. A row whose current token equals some delta `old_version` is logically
+dead / rewritten in the branch and must not be re-found as a conflict; the
+candidate INSERTs instead. A branch UPDATE that leaves the arbiter value
+unchanged still hits Phase I by its stored image and keeps `DO UPDATE` semantics.
+
 **Same-statement duplicate arbiter keys.** The command counter does not advance
 between the rows of a single command, so the Phase I/II and R21 SPI probes can
 never see a delta row written by an earlier row of the *same* command. The
@@ -280,6 +298,54 @@ delta `key`), and the MAIN probe folds a per-PK-column
 `col = $n::text::<type>` conjunctive `WHERE`. A delta tombstone (`op='D'`) makes
 the MAIN row logically invisible in the branch, so the MAIN probe is skipped and
 a rebirth is permitted (see "Rebirth collapse").
+
+**Resolvable non-PK UNIQUE enforcement.** A branch-local plain INSERT or UPSERT
+fall-through that would duplicate a value in a non-primary `UNIQUE` index is
+rejected eagerly with `23505`, matching native PostgreSQL, instead of being
+stored in the delta and surfacing only at `apply_branch`. The probe binds the
+indexed columns as text against the branch delta (live `I`/`U` rows) and then the
+shadow-aware MAIN side, and — as the command counter does not advance between
+rows of one command — a per-statement "claimed" set catches a duplicate proposed
+by an earlier row of the same statement (the same device the arbiter path uses
+for its PK / arbiter key). Only plain-column, non-partial indexes are probed; an
+expression or partial index is not resolvable by the text check, so a violation
+of one is not caught here and surfaces at apply, like any other branch-local
+write the redirect cannot model.
+
+**Eager UPDATE uniqueness.** `CMD_UPDATE` builds the same per-statement set and,
+before writing each merged post-image, probes every resolvable non-PK `UNIQUE`
+index, **excluding the row being rewritten** by its MAIN anchor ctid and its
+delta key. That exclusion is what keeps an UPDATE that leaves the `UNIQUE` column
+untouched legal: without it, the row's own MAIN anchor (which still holds the OLD
+values) or its pre-existing delta row (the PRE-image) would match and raise a
+spurious `23505`. An UPSERT `DO UPDATE` post-image is enforced identically, with
+the conflicted source row excluded the same way.
+
+**Arbiter selection and the eager residual check.** `ON CONFLICT (target)`
+resolves to exactly one arbiter index. A **PK arbiter** keeps the fast
+`d.key` / PK-ctid probe; a **non-primary UNIQUE arbiter** (keyed or keyless)
+rebinds both phases to the arbiter columns, and the delta row is written under
+the *conflicted* row's real identity, never the proposed one. An arbiter that
+does **not** resolve to exactly one **non-partial** UNIQUE index over plain
+columns — an expression index, a **partial** index, or several inferred
+indexes — is **refused (0A000) for both keyless and keyed tables**: the plain
+column probe cannot honour an index predicate or an expression, so proceeding
+would silently match a row outside the predicate's domain (a spurious
+`DO NOTHING` skip, or a `DO UPDATE` against a row the statement never named).
+A **targetless** `DO NOTHING` (`arbiterIndexes == NIL`) carries no arbiter:
+native checks *every* unique index, so the dispatch scans the PK and every
+other resolvable plain-column, non-partial unique index, and a hit is a skip.
+
+Once the arbiter does **not** match, a targeted `ON CONFLICT` proceeds with the
+INSERT, and native hard-errors `23505` if the candidate violates the PK (which a
+non-primary arbiter leaves unprobed) or any *other* unique index (the arbiter
+does not cover them). The redirect reproduces this eagerly: the PK is re-checked
+through the R21 path (tombstone-aware rebirth included) and every remaining
+resolvable unique index through a delta+MAIN probe, so the violation is raised
+before any delta write instead of being deferred to apply. For this *residual*
+scan, expression and partial indexes are skipped, as they are everywhere: they
+are not resolvable by the plain-column text probe, so their violation is not
+caught here and surfaces at apply.
 
 **Pure-delta target rows (synthetic ctid).** A row that exists only in the delta
 (op `I`/`U`, no MAIN baseline) has no physical ctid, so the DML-target BranchScan
@@ -362,7 +428,7 @@ BPCHAR / NUMERIC / TIMESTAMPTZ stay correct (§2).
 ### 1.8 Scope & gating + ACL double-defense
 
 Unsupported objects are rejected at `create_branch` time (0A000/55000):
-partitioned / foreign tables, views, matviews, foreign keys, non-PK UNIQUE. The
+partitioned / foreign tables, views, matviews, foreign keys. The
 guard checks cheapest-first (relkind, `relispartition`, user
 triggers, foreign keys, then no-PK). The per-DML executor guard validates only
 the statement's DML **target** relations (the `ModifyTable` result relations):
@@ -1014,16 +1080,17 @@ columns, so all downstream promotion and apply behaviour is unchanged:
   datum once crashed the server when SPI dereferenced it;
 - on a MAIN hit the delta is re-anchored to that row's ctid with its version
   token, on a delta hit the existing delta key and version are reused, and with
-  no hit the row takes a synthetic key as a plain insert.
+  no hit the row takes a synthetic key as a plain insert;
+- a branch-local DELETE frees the arbiter value: the tombstone stores no arbiter
+  image, so phase one cannot see it, but the phase-two MAIN probe drops any row
+  the delta shadows (its token equals a delta `old_version`), so the later
+  UPSERT rebirths the row — a plain insert under a fresh synthetic key, exactly
+  like the keyed path (see "Delta-first shadow", §1.6).
 
 **Unsupported (existing 0A000 style):** keyless + partitioned / foreign-key /
 `MERGE` / `COPY FROM` / DML-CTE, and a keyless UPSERT whose arbiter does not
 resolve to exactly one UNIQUE index; consistency under concurrent `DELETE` /
 whole-table rewrites (silent drop on the read side, apply error as fallback).
-An UPSERT after a branch-local DELETE does **not** rebirth in keyless mode: the
-tombstone is keyed by the anchored ctid and carries no arbiter image, so phase
-one cannot see it and phase two's MAIN hit wins (the PK path handles this via the
-tombstone shadow, §1.6).
 
 ---
 
