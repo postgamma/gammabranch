@@ -35,6 +35,7 @@
 #include "executor/spi.h"
 #include "executor/tuptable.h"
 #include "nodes/execnodes.h"
+#include "utils/array.h"
 #include "utils/builtins.h"
 #include "utils/datum.h"
 #include "utils/fmgrprotos.h"
@@ -42,11 +43,14 @@
 #include "utils/hsearch.h"
 #include "utils/inval.h"
 #include "utils/json.h"
+#include "utils/jsonb.h"
 #include "utils/lsyscache.h"
 #include "utils/memutils.h"
+#include "utils/rangetypes.h"
 #include "utils/rel.h"
 #include "utils/snapmgr.h"
 #include "utils/syscache.h"
+#include "utils/timestamp.h"
 
 /* ---------------------------------------------------------------
  * Bypass helpers: all internal SPI calls that must hit the MAIN
@@ -933,6 +937,8 @@ reconstruct_slot_from_delta(Relation rel, bytea *tuple_data,
 	bool		bytea_out_varlena;
 	char	   *bytea_sql_lit;
 	char	   *convert_from_expr;
+	bool		needs_lc_pin = false;
+	int			guc_nl = 0;
 
 	Assert(rel != NULL && tuple_data != NULL);
 	natts = reldesc->natts;
@@ -945,6 +951,8 @@ reconstruct_slot_from_delta(Relation rel, bytea *tuple_data,
 
 		if (ratt->attisdropped)
 			continue;
+		if (ob_type_needs_lc_monetary_pin(ratt->atttypid))
+			needs_lc_pin = true;
 		if (cols.len > 0)
 			appendStringInfoChar(&cols, ',');
 		appendStringInfo(&cols, "%s %s",
@@ -974,7 +982,23 @@ reconstruct_slot_from_delta(Relation rel, bytea *tuple_data,
 	pfree(convert_from_expr);
 	pfree(cols.data);
 
-	ret = ob_spi_one_shot(sql.data, true, 1);
+	/* The stored payload text was rendered (and must therefore be parsed)
+	 * under the canonical GUCs; a money column additionally needs the
+	 * reading side pinned so cash_in accepts the C-rendered currency
+	 * symbol (see ob_type_needs_lc_monetary_pin).  Pin only around the
+	 * parse so the surrounding statement keeps the session's own locale. */
+	if (needs_lc_pin)
+		guc_nl = ob_canonical_guc_pin();
+	PG_TRY();
+	{
+		ret = ob_spi_one_shot(sql.data, true, 1);
+	}
+	PG_FINALLY();
+	{
+		if (needs_lc_pin)
+			ob_canonical_guc_unpin(guc_nl);
+	}
+	PG_END_TRY();
 	pfree(sql.data);
 
 	if (ret != SPI_OK_SELECT || SPI_processed != 1 ||
@@ -1504,16 +1528,23 @@ overlay_serialize_identity(Relation rel, TupleTableSlot *slot, char op)
  * A handful of output functions are NOT pure functions of the value:
  * they read session GUCs — TimeZone / DateStyle for the date-time
  * family, IntervalStyle for interval, extra_float_digits for
- * float4/float8, bytea_output for bytea.  Left alone, two sessions with
- * different settings either fail to match on the SAME value (identity
- * key → the delta PK (branch_id, relid, key) stores two rows and every
- * text-key probe misses) or re-parse the payload into a DIFFERENT value
- * (silent corruption).  Whenever a column is such a type we pin those
- * GUCs to a canonical value for the duration of the serialization only,
- * using GUC_ACTION_SAVE so guc.c unwinds the change automatically on
- * error (and because SAVE is the one action permitted inside a parallel
- * worker).  GUC-insensitive types (int, text, uuid, …) skip the pin
- * entirely, so the hot common path pays nothing.
+ * float4/float8, bytea_output for bytea, lc_monetary for money.  Left
+ * alone, two sessions with different settings either fail to match on
+ * the SAME value (identity key → the delta PK (branch_id, relid, key)
+ * stores two rows and every text-key probe misses) or re-parse the
+ * payload into a DIFFERENT value (silent corruption).  Whenever a
+ * column is such a type we pin those GUCs to a canonical value for the
+ * duration of the serialization only, using GUC_ACTION_SAVE so guc.c
+ * unwinds the change automatically on error (and because SAVE is the
+ * one action permitted inside a parallel worker).  GUC-insensitive
+ * types (int, text, uuid, …) skip the pin entirely, so the hot common
+ * path pays nothing.
+ *
+ * money is special: the write-side pin makes the STORED text canonical
+ * ("$1,234.56"), but cash_in still refuses that text in a differently
+ * configured reader (see ob_type_needs_lc_monetary_pin), so the reader
+ * must pin lc_monetary too.  Every re-parse site therefore gates on
+ * ob_type_needs_lc_monetary_pin() and pins around the parse.
  * ================================================================ */
 static bool
 ob_identity_type_is_guc_sensitive(Oid typid)
@@ -1532,6 +1563,13 @@ ob_identity_type_is_guc_sensitive(Oid typid)
 	if (OidIsValid(elem))
 		return ob_identity_type_is_guc_sensitive(elem);
 
+	/* A range renders each bound through its SUBTYPE's output function
+	 * (timestamp / date / timestamptz / …), so recurse into the subtype:
+	 * a tsrange / daterange / tstzrange key must pin DateStyle / TimeZone
+	 * exactly like its base type. */
+	if (get_typtype(typid) == TYPTYPE_RANGE)
+		return ob_identity_type_is_guc_sensitive(get_range_subtype(typid));
+
 	switch (typid)
 	{
 		case TIMESTAMPTZOID:
@@ -1542,6 +1580,7 @@ ob_identity_type_is_guc_sensitive(Oid typid)
 		case FLOAT4OID:
 		case FLOAT8OID:
 		case BYTEAOID:
+		case MONEYOID:
 			return true;
 		default:
 			return false;
@@ -1577,6 +1616,12 @@ ob_payload_type_roundtrip_unsafe(Oid typid)
 	if (OidIsValid(elem))
 		return ob_payload_type_roundtrip_unsafe(elem);
 
+	/* A range renders through its subtype's output, so a tsrange /
+	 * daterange / tstzrange payload re-parses differently (or fails) in a
+	 * session with another DateStyle / TimeZone — pin it via the subtype. */
+	if (get_typtype(typid) == TYPTYPE_RANGE)
+		return ob_payload_type_roundtrip_unsafe(get_range_subtype(typid));
+
 	switch (typid)
 	{
 		case TIMESTAMPOID:
@@ -1585,13 +1630,74 @@ ob_payload_type_roundtrip_unsafe(Oid typid)
 		case INTERVALOID:
 		case FLOAT4OID:
 		case FLOAT8OID:
+		case MONEYOID:
 			return true;
 		default:
 			return false;
 	}
 }
 
-static int
+/*
+ * ob_type_needs_lc_monetary_pin
+ *
+ *	The one type whose payload round trip is NOT cured by a write-side pin
+ *	alone.  money_out prints the lc_monetary currency symbol ("$1,234.56"
+ *	under C, "£1,234.56" under en_GB), and cash_in accepts ONLY the reading
+ *	session's own currency symbol / separators: it breaks on any foreign
+ *	character and raises "invalid input syntax for type money".  So a
+ *	canonical (C-written) money payload still cannot be re-read by a
+ *	session in another locale — the READER must ALSO run under the same
+ *	lc_monetary.  Every place that re-parses a stored money payload
+ *	(reconstruct_slot_from_delta(), the delta probes in write_redirect.c,
+ *	the apply replay) therefore pins lc_monetary=C around the parse.
+ *
+ *	Arrays of money / domains over money inherit the dependency, so we
+ *	recurse exactly like the two predicates above.
+ */
+bool
+ob_type_needs_lc_monetary_pin(Oid typid)
+{
+	Oid			elem;
+
+	typid = getBaseType(typid);
+
+	elem = get_element_type(typid);
+	if (OidIsValid(elem))
+		return ob_type_needs_lc_monetary_pin(elem);
+
+	if (get_typtype(typid) == TYPTYPE_RANGE)
+		return ob_type_needs_lc_monetary_pin(get_range_subtype(typid));
+
+	return typid == MONEYOID;
+}
+
+/*
+ * ob_relation_needs_lc_monetary_pin
+ *
+ *	True when any live column of `rel` carries money (directly, as an
+ *	array / domain / range, or via a nested type).  Callers use it to gate
+ *	the lc_monetary pin on the parse of a stored payload, so a table
+ *	without a money column pays nothing.
+ */
+bool
+ob_relation_needs_lc_monetary_pin(Relation rel)
+{
+	TupleDesc	desc = RelationGetDescr(rel);
+	int			i;
+
+	for (i = 0; i < desc->natts; i++)
+	{
+		Form_pg_attribute att = TupleDescAttr(desc, i);
+
+		if (att->attisdropped)
+			continue;
+		if (ob_type_needs_lc_monetary_pin(att->atttypid))
+			return true;
+	}
+	return false;
+}
+
+int
 ob_canonical_guc_pin(void)
 {
 	int			nl = NewGUCNestLevel();
@@ -1611,10 +1717,18 @@ ob_canonical_guc_pin(void)
 	(void) set_config_option("bytea_output", "hex",
 							 PGC_USERSET, PGC_S_SESSION,
 							 GUC_ACTION_SAVE, true, 0, false);
+	/* lc_monetary is PGC_USERSET (vartype string), so it can be pinned the
+	 * same way.  Pinning it is what makes a money payload written under one
+	 * locale re-readable under another (see ob_type_needs_lc_monetary_pin):
+	 * money_out then always emits the C symbol "$", and cash_in below (or in
+	 * the reading session's pinned parse) always accepts it. */
+	(void) set_config_option("lc_monetary", "C",
+							 PGC_USERSET, PGC_S_SESSION,
+							 GUC_ACTION_SAVE, true, 0, false);
 	return nl;
 }
 
-static void
+void
 ob_canonical_guc_unpin(int nestlevel)
 {
 	AtEOXact_GUC(true, nestlevel);
@@ -1623,6 +1737,331 @@ ob_canonical_guc_unpin(int nestlevel)
 /* ================================================================
  * PK / row serialization (JSON)
  * ================================================================ */
+
+/*
+ * ob_canonicalize_interval
+ *
+ *	Map an interval to the single representative of its '='-equality class.
+ *	interval equality (interval_cmp_value) folds months into 30 days and days
+ *	into 24 hours and compares the resulting microsecond span, so '1 mon',
+ *	'30 days' and '720:00:00' are one value -- yet interval_out prints them
+ *	differently, the same identity split numeric_trim_scale / the float
+ *	signed-zero fold close for their types.  Re-express the value as a bare
+ *	time span (month = day = 0, time = the folded microsecond total) so every
+ *	spelling of one equality class renders identically.  The span formula
+ *	mirrors interval_cmp_value (which likewise does no overflow checking).
+ */
+static Datum
+ob_canonicalize_interval(Datum val)
+{
+	Interval   *iv = DatumGetIntervalP(val);
+	Interval   *res;
+	int64		span;
+
+	span = iv->time;
+	span += (int64) iv->day * INT64CONST(86400) * INT64CONST(1000000);
+	span += (int64) iv->month * INT64CONST(30) *
+		INT64CONST(86400) * INT64CONST(1000000);
+
+	res = (Interval *) palloc(sizeof(Interval));
+	res->month = 0;
+	res->day = 0;
+	res->time = span;
+	return IntervalPGetDatum(res);
+}
+
+/*
+ * ob_canonicalize_jsonb
+ *
+ *	Map a jsonb value to the single representative of its '='-equality
+ *	class.  jsonb equality (jsonb_eq) compares numbers with numeric_eq, but
+ *	jsonb preserves a number's dscale as written, so '{"a":1.0}' and
+ *	'{"a":1.00}' are '='-equal yet jsonb_out prints them differently -- the
+ *	very identity split numeric_trim_scale closes for a bare NUMERIC.
+ *	Numbers are the ONLY non-canonical degree of freedom: jsonb canonicalizes
+ *	whitespace, key order and string escapes on input, so trimming every
+ *	number to its scale-invariant form is enough.  The tree is rebuilt with
+ *	the jsonb iterator API; the result is a fresh jsonb (never the input), so
+ *	the caller can pfree it unconditionally.  Container nodes are re-pushed
+ *	untouched (the iterator reports every nested open/close) so only the
+ *	numeric leaves are rewritten.
+ */
+static Datum
+ob_canonicalize_jsonb(Datum val)
+{
+	Jsonb	   *jb = DatumGetJsonbP(val);
+	JsonbIterator *it;
+	JsonbParseState *ps = NULL;
+	JsonbValue	v;
+	JsonbValue *res = NULL;
+	JsonbIteratorToken type;
+
+	if (JB_ROOT_IS_SCALAR(jb))
+	{
+		/* A scalar root is a bare JSON number / string / bool / null; only a
+		 * number needs the fold.  JsonbValueToJsonb deep-copies (and re-wraps
+		 * a scalar into its raw-scalar container), so this yields a fresh
+		 * jsonb exactly like the container path below. */
+		v = *getIthJsonbValueFromContainer(&jb->root, 0);
+		if (v.type == jbvNumeric)
+			v.val.numeric = DatumGetNumeric(
+				DirectFunctionCall1(numeric_trim_scale,
+									NumericGetDatum(v.val.numeric)));
+		return JsonbPGetDatum(JsonbValueToJsonb(&v));
+	}
+
+	it = JsonbIteratorInit(&jb->root);
+	while ((type = JsonbIteratorNext(&it, &v, false)) != WJB_DONE)
+	{
+		if (type == WJB_VALUE || type == WJB_ELEM)
+		{
+			if (v.type == jbvNumeric)
+				v.val.numeric = DatumGetNumeric(
+					DirectFunctionCall1(numeric_trim_scale,
+										NumericGetDatum(v.val.numeric)));
+			res = pushJsonbValue(&ps, type, &v);
+		}
+		else if (type == WJB_KEY)
+		{
+			/* A key is always a string, so it needs no fold, but
+			 * pushJsonbValue still wants the value -- passing NULL here
+			 * would dereference a NULL JsonbValue. */
+			res = pushJsonbValue(&ps, type, &v);
+		}
+		else
+			res = pushJsonbValue(&ps, type, NULL);
+	}
+	return JsonbPGetDatum(JsonbValueToJsonb(res));
+}
+
+/*
+ * ob_identity_scalar_needs_fold
+ *
+ *	True for a scalar base type whose output function is NOT canonical for
+ *	its '='-equality class and therefore must be folded before rendering:
+ *	NUMERIC (scale), FLOAT4 / FLOAT8 (signed zero), INTERVAL (month/day
+ *	span).  These are exactly the element folds ob_normalize_pk_array uses.
+ */
+static bool
+ob_identity_scalar_needs_fold(Oid basetypid)
+{
+	basetypid = getBaseType(basetypid);
+	return basetypid == NUMERICOID || basetypid == FLOAT8OID ||
+		basetypid == FLOAT4OID || basetypid == INTERVALOID;
+}
+
+/*
+ * ob_identity_range_needs_fold
+ *
+ *	True when `typid` (any type) is a range whose SUBTYPE needs a value
+ *	fold, e.g. numrange.  Such a range must be rebuilt with canonical
+ *	bounds (see ob_canonicalize_range); a range over an already-canonical
+ *	subtype (int4range / int8range / daterange / tsrange …) is left alone —
+ *	it renders through the pinned GUCs and needs no value fold.
+ */
+static bool
+ob_identity_range_needs_fold(Oid typid)
+{
+	typid = getBaseType(typid);
+	if (get_typtype(typid) != TYPTYPE_RANGE)
+		return false;
+	return ob_identity_scalar_needs_fold(get_range_subtype(typid));
+}
+
+/*
+ * ob_fold_range_bound
+ *
+ *	Fold one FINITE range bound exactly as the scalar identity path folds a
+ *	bare value.  *allocated is set when the result is a freshly palloc'd
+ *	varlena the caller must pfree; the by-value float fold leaves it false.
+ */
+static Datum
+ob_fold_range_bound(Datum val, Oid subtype, bool *allocated)
+{
+	*allocated = false;
+
+	subtype = getBaseType(subtype);
+	if (subtype == NUMERICOID)
+	{
+		*allocated = true;
+		return DirectFunctionCall1(numeric_trim_scale, val);
+	}
+	if (subtype == INTERVALOID)
+	{
+		*allocated = true;
+		return ob_canonicalize_interval(val);
+	}
+	if (subtype == FLOAT8OID && DatumGetFloat8(val) == 0.0)
+		return Float8GetDatum((float8) 0.0);
+	if (subtype == FLOAT4OID && DatumGetFloat4(val) == 0.0)
+		return Float4GetDatum((float4) 0.0);
+	return val;
+}
+
+/*
+ * ob_canonicalize_range
+ *
+ *	Rebuild a range with its finite bounds folded to the representative of
+ *	their '='-equality class (numrange numeric scale, interval span, float
+ *	signed zero), preserving each bound's inclusivity and infinities and
+ *	the empty flag, so two '='-equal ranges render to one identity text.
+ *	Always returns a freshly palloc'd range (never the input), so the
+ *	caller can pfree it unconditionally.  The caller must first confirm the
+ *	subtype actually needs folding (ob_identity_range_needs_fold).
+ */
+static Datum
+ob_canonicalize_range(Datum val)
+{
+	RangeType  *range = DatumGetRangeTypeP(val);
+	Oid			rngtypid = RangeTypeGetOid(range);
+	Oid			subtype = get_range_subtype(rngtypid);
+	TypeCacheEntry *typcache;
+	RangeBound	lower;
+	RangeBound	upper;
+	bool		empty;
+	bool		lo_alloc = false;
+	bool		up_alloc = false;
+	RangeType  *res;
+
+	typcache = lookup_type_cache(rngtypid, TYPECACHE_RANGE_INFO);
+	range_deserialize(typcache, range, &lower, &upper, &empty);
+
+	if (empty)
+		return RangeTypePGetDatum(make_empty_range(typcache));
+
+	if (!lower.infinite)
+		lower.val = ob_fold_range_bound(lower.val, subtype, &lo_alloc);
+	if (!upper.infinite)
+		upper.val = ob_fold_range_bound(upper.val, subtype, &up_alloc);
+
+	res = range_serialize(typcache, &lower, &upper, false, NULL);
+
+	if (lo_alloc)
+		pfree(DatumGetPointer(lower.val));
+	if (up_alloc)
+		pfree(DatumGetPointer(upper.val));
+
+	return RangeTypePGetDatum(res);
+}
+
+/*
+ * ob_identity_array_elem_normalizable
+ *
+ *	If `typid` (already a base type) is an array whose ELEMENT type needs a
+ *	canonical identity rendering, return that base element type; else
+ *	InvalidOid.
+ *
+ *	Array equality (array_eq) compares element-wise with the element type's
+ *	'=' operator, so ARRAY[1.0] and ARRAY[1.00] on a NUMERIC[] key are
+ *	'='-equal, yet array_out prints "{1.00}" and "{1.0}" -- two identity keys
+ *	for one logical row, the very split the scalar path avoids with
+ *	numeric_trim_scale / the float signed-zero fold.  The element types that
+ *	need it are the scalar ones that are not already canonical (NUMERIC /
+ *	FLOAT4 / FLOAT8 / INTERVAL), jsonb (number dscale), and, one level down,
+ *	a range over such a subtype (numrange, a range over interval), whose
+ *	bounds array_out prints through the subtype's output fn.  bpchar is
+ *	excluded because array_out never r-trims elements, so both producers
+ *	render the padded element identically already.
+ */
+static Oid
+ob_identity_array_elem_normalizable(Oid typid)
+{
+	Oid			elem;
+
+	elem = get_element_type(typid);
+	if (!OidIsValid(elem))
+		return InvalidOid;
+
+	elem = getBaseType(elem);
+	if (elem == NUMERICOID || elem == FLOAT8OID || elem == FLOAT4OID ||
+		elem == INTERVALOID || elem == JSONBOID)
+		return elem;
+
+	/* An array of a not-yet-canonical range: fold each element's bounds. */
+	if (ob_identity_range_needs_fold(elem))
+		return elem;
+	return InvalidOid;
+}
+
+/*
+ * ob_normalize_pk_array
+ *
+ *	Rebuild an array value with each element canonicalized the same way the
+ *	scalar identity path canonicalizes a bare element (NUMERIC scale fold,
+ *	float8/float4 signed-zero collapse, INTERVAL month/day fold).  The
+ *	array's dimensionality and lower bounds are preserved: array_eq treats a
+ *	different shape or lower bound as a DIFFERENT value, so collapsing them
+ *	would invent a false 23505.  `elem_norm` is the base element type
+ *	returned by ob_identity_array_elem_normalizable.
+ */
+static Datum
+ob_normalize_pk_array(Datum arrval, Oid elem_norm)
+{
+	ArrayType  *arr;
+	Oid			eltype;
+	Datum	   *elems;
+	bool	   *nulls;
+	int			nelems;
+	int16		elmlen;
+	bool		elmbyval;
+	char		elmalign;
+	Datum	   *newelems;
+	Datum		result;
+	int			i;
+
+	/* Read the array's OWN element type (it may be a domain over the base
+	 * `elem_norm`); deconstruct_array asserts the two agree. */
+	arr = DatumGetArrayTypeP(arrval);
+	eltype = ARR_ELEMTYPE(arr);
+	get_typlenbyvalalign(eltype, &elmlen, &elmbyval, &elmalign);
+	deconstruct_array(arr, eltype, elmlen, elmbyval, elmalign,
+					  &elems, &nulls, &nelems);
+
+	newelems = (Datum *) palloc(sizeof(Datum) * nelems);
+	for (i = 0; i < nelems; i++)
+	{
+		if (nulls[i])
+			newelems[i] = elems[i];
+		else if (elem_norm == NUMERICOID)
+			newelems[i] = DirectFunctionCall1(numeric_trim_scale, elems[i]);
+		else if (elem_norm == INTERVALOID)
+			newelems[i] = ob_canonicalize_interval(elems[i]);
+		else if (elem_norm == FLOAT8OID && DatumGetFloat8(elems[i]) == 0.0)
+			newelems[i] = Float8GetDatum((float8) 0.0);
+		else if (elem_norm == FLOAT4OID && DatumGetFloat4(elems[i]) == 0.0)
+			newelems[i] = Float4GetDatum((float4) 0.0);
+		else if (elem_norm == JSONBOID)
+			newelems[i] = ob_canonicalize_jsonb(elems[i]);
+		else if (ob_identity_range_needs_fold(elem_norm))
+			newelems[i] = ob_canonicalize_range(elems[i]);
+		else
+			newelems[i] = elems[i];
+	}
+
+	result = PointerGetDatum(construct_md_array(newelems, nulls,
+												ARR_NDIM(arr), ARR_DIMS(arr),
+												ARR_LBOUND(arr),
+												eltype,
+												elmlen, elmbyval, elmalign));
+
+	/* construct_md_array deep-copies every element, so the freshly
+	 * allocated NUMERIC / INTERVAL / JSONB / RANGE results and all scratch
+	 * can be freed. */
+	if (elem_norm == NUMERICOID || elem_norm == INTERVALOID ||
+		elem_norm == JSONBOID || ob_identity_range_needs_fold(elem_norm))
+	{
+		for (i = 0; i < nelems; i++)
+		{
+			if (!nulls[i])
+				pfree(DatumGetPointer(newelems[i]));
+		}
+	}
+	pfree(newelems);
+	pfree(elems);
+	pfree(nulls);
+
+	return result;
+}
 
 /*
  * ob_serialize_pk_body
@@ -1679,6 +2118,7 @@ ob_serialize_pk_body(Relation rel, TupleTableSlot *slot, ObPkRelMeta *pm)
 			char	   *valstr;
 			Datum		outval = val;
 			bool		have_trimmed = false;
+			Oid			elem_norm = ob_identity_array_elem_normalizable(typid);
 
 			/* Canonicalize NUMERIC to a scale-invariant rendering so that
 			 * two PK values that are '='-equal but print with a different
@@ -1694,7 +2134,16 @@ ob_serialize_pk_body(Relation rel, TupleTableSlot *slot, ObPkRelMeta *pm)
 			 * `CAST(... AS <pktype>)::text` normalization the const-side
 			 * serializer (overlay_serialize_pk_from_single_datum) applies,
 			 * so the two producers stay byte-identical. */
-			if (typid == NUMERICOID)
+			if (OidIsValid(elem_norm))
+			{
+				/* An array of a not-yet-canonical element type: rebuild it
+				 * with canonical elements so '='-equal arrays (array_eq
+				 * compares element-wise) share ONE identity key, exactly as
+				 * the scalar folds below do for a bare element. */
+				outval = ob_normalize_pk_array(val, elem_norm);
+				have_trimmed = true;
+			}
+			else if (typid == NUMERICOID)
 			{
 				outval = DirectFunctionCall1(numeric_trim_scale, val);
 				have_trimmed = true;
@@ -1711,6 +2160,33 @@ ob_serialize_pk_body(Relation rel, TupleTableSlot *slot, ObPkRelMeta *pm)
 			{
 				if (DatumGetFloat4(val) == 0.0)
 					outval = Float4GetDatum((float4) 0.0);
+			}
+			else if (typid == INTERVALOID)
+			{
+				/* '1 mon' / '30 days' (and '1 day' / '24 hours') are
+				 * '='-equal yet print differently; fold to a canonical
+				 * time span so both spellings share one identity key. */
+				outval = ob_canonicalize_interval(val);
+				have_trimmed = true;
+			}
+			else if (typid == JSONBOID)
+			{
+				/* jsonb_eq compares numbers with numeric_eq, but the number
+				 * keeps the dscale it was written with, so '{"a":1.0}' and
+				 * '{"a":1.00}' are '='-equal yet print differently; rebuild
+				 * with every number scale-trimmed so both share one key. */
+				outval = ob_canonicalize_jsonb(val);
+				have_trimmed = true;
+			}
+			else if (ob_identity_range_needs_fold(typid))
+			{
+				/* A range over a not-yet-canonical subtype (numrange, a
+				 * range over interval): the bounds are '='-compared with
+				 * the subtype's operator but printed with its output fn,
+				 * so fold each finite bound so '='-equal ranges share one
+				 * identity key. */
+				outval = ob_canonicalize_range(val);
+				have_trimmed = true;
 			}
 
 			getTypeOutputInfo(typid, &outfuncoid, &typeIsVarlena);
@@ -1876,10 +2352,32 @@ ob_serialize_tuple_body(Relation rel, TupleTableSlot *slot)
 			Oid			outfuncoid;
 			bool		typeIsVarlena;
 			char	   *valstr;
+			Oid			base_typid;
 			const char *vp;
 
 			getTypeOutputInfo(typid, &outfuncoid, &typeIsVarlena);
 			valstr = OidOutputFunctionCall(outfuncoid, d);
+
+			/*
+			 * json/jsonb (or a domain over them): jsonb_to_record() and
+			 * jsonb_populate_record() splice the JSON value straight into the
+			 * target column instead of running its input function -- see
+			 * populate_scalar() in jsonfuncs.c.  A value baked into a JSON
+			 * *string* would therefore come back as a jsonb string scalar
+			 * ("{\"a\": 1}") rather than the object, silently corrupting the
+			 * row on BranchScan, on apply, and in every delta probe.  Their
+			 * output text is already valid JSON, so emit it verbatim; the
+			 * reader's direct copy then reproduces the value.  Arrays
+			 * (jsonb[]) are NOT affected -- the reader calls array_in() on the
+			 * string form -- so they keep the quoted encoding below.
+			 */
+			base_typid = getBaseType(typid);
+			if (base_typid == JSONOID || base_typid == JSONBOID)
+			{
+				appendStringInfoString(&jsonbuf, valstr);
+				pfree(valstr);
+				continue;
+			}
 
 			resetStringInfo(&scratch);
 			appendStringInfoChar(&scratch, '"');
@@ -2495,6 +2993,219 @@ overlay_get_pk_attnos_list(Relation rel)
 	return result;
 }
 /*
+ * ob_serialize_pk_single_array_body
+ *
+ *	Const-side identity text for a single-column PK whose column type is an
+ *	array of a canonicalizable element type (numeric / float4 / float8 /
+ *	interval, or a range over one; see ob_identity_array_elem_normalizable).
+ *	The literal is coerced onto the real PK array type by the parser (SPI
+ *	CAST resolves any implicit const->PK coercion), then the elements are
+ *	canonicalized in C with
+ *	ob_normalize_pk_array so this output is byte-identical to the WRITE side
+ *	-- dimensionality and lower bounds included.  The JSON wrapper is built
+ *	here with escape_json(), the routine jsonb itself uses to escape strings,
+ *	so it matches the scalar path's to_jsonb(ARRAY[...])::text byte for byte.
+ */
+static char *
+ob_serialize_pk_single_array_body(Oid pk_typid, Form_pg_attribute pkatt,
+								  Datum pk_val, bool pk_isnull,
+								  Oid consttype, Oid elem_norm)
+{
+	StringInfoData arr_sql;
+	int			ret;
+	char	   *result;
+	MemoryContext oldmc;
+
+	initStringInfo(&arr_sql);
+	appendStringInfoString(&arr_sql, "SELECT CAST (");
+
+	if (pk_isnull)
+		appendStringInfoString(&arr_sql, "NULL");
+	else
+	{
+		Oid			lit_outfuncoid;
+		bool		lit_typeIsVarlena;
+		char	   *litstr;
+
+		/* Stringify the literal with ITS OWN type output fn (see the
+		 * coercion note on ob_serialize_pk_single_datum_body). */
+		getTypeOutputInfo(consttype, &lit_outfuncoid, &lit_typeIsVarlena);
+		litstr = OidOutputFunctionCall(lit_outfuncoid, pk_val);
+		appendStringInfoString(&arr_sql, quote_literal_cstr(litstr));
+		pfree(litstr);
+	}
+
+	appendStringInfo(&arr_sql, " AS %s)",
+					 format_type_with_typemod(pk_typid, pkatt->atttypmod));
+
+	ret = ob_spi_one_shot(arr_sql.data, true, 1);
+	pfree(arr_sql.data);
+
+	if (ret != SPI_OK_SELECT || SPI_processed != 1)
+	{
+		ereport(ERROR,
+				(errcode(ERRCODE_INTERNAL_ERROR),
+				 errmsg("overlay_serialize_pk_from_single_datum: SPI array coercion failed (ret=%d rows=%lu)",
+						ret, (unsigned long) SPI_processed)));
+	}
+
+	{
+		bool		spi_isnull;
+		Datum		arrval;
+		StringInfoData json;
+
+		arrval = SPI_getbinval(SPI_tuptable->vals[0],
+							   SPI_tuptable->tupdesc, 1, &spi_isnull);
+
+		initStringInfo(&json);
+		appendStringInfoChar(&json, '[');
+		if (spi_isnull)
+			appendStringInfoString(&json, "null");
+		else
+		{
+			Datum		normval;
+			Oid			outfuncoid;
+			bool		typeIsVarlena;
+			char	   *valstr;
+
+			/* Rebuild + normalize while the SPI tuple is still live: the
+			 * coerced array datum points into SPI's memory context. */
+			normval = ob_normalize_pk_array(arrval, elem_norm);
+			getTypeOutputInfo(getBaseType(pk_typid), &outfuncoid,
+							  &typeIsVarlena);
+			valstr = OidOutputFunctionCall(outfuncoid, normval);
+			escape_json(&json, valstr);
+			pfree(valstr);
+			pfree(DatumGetPointer(normval));
+		}
+		appendStringInfoChar(&json, ']');
+
+		oldmc = MemoryContextSwitchTo(TopMemoryContext);
+		result = pstrdup(json.data);
+		MemoryContextSwitchTo(oldmc);
+		pfree(json.data);
+	}
+
+	SPI_finish();
+	return result;
+}
+
+/*
+ * Which C-level fold ob_serialize_pk_single_fold_body applies to the coerced
+ * PK datum.
+ */
+typedef enum ObPkFoldKind
+{
+	OB_PKFOLD_INTERVAL = 0,
+	OB_PKFOLD_RANGE,
+	OB_PKFOLD_JSONB
+} ObPkFoldKind;
+
+/*
+ * ob_serialize_pk_single_fold_body
+ *
+ *	Const-side identity text for a single-column PK whose column type needs a
+ *	C-level fold its output function cannot do: INTERVAL (interval_out prints
+ *	'='-equal spans differently, see ob_canonicalize_interval), a RANGE over
+ *	a not-yet-canonical subtype (each bound prints through the subtype's
+ *	output fn, see ob_canonicalize_range), and JSONB (jsonb_out preserves each
+ *	number's dscale, see ob_canonicalize_jsonb).  Coerce the literal onto the
+ *	real PK type with SPI, fold the resulting Datum in C and render it here --
+ *	byte-identical to the WRITE side.  The JSON wrapper is built with
+ *	escape_json() so it matches the scalar to_jsonb() path.
+ */
+static char *
+ob_serialize_pk_single_fold_body(Oid pk_typid, Form_pg_attribute pkatt,
+								 Datum pk_val, bool pk_isnull,
+								 Oid consttype, ObPkFoldKind fold_kind)
+{
+	StringInfoData arr_sql;
+	int			ret;
+	char	   *result;
+	MemoryContext oldmc;
+
+	initStringInfo(&arr_sql);
+	appendStringInfoString(&arr_sql, "SELECT CAST (");
+
+	if (pk_isnull)
+		appendStringInfoString(&arr_sql, "NULL");
+	else
+	{
+		Oid			lit_outfuncoid;
+		bool		lit_typeIsVarlena;
+		char	   *litstr;
+
+		/* Stringify the literal with ITS OWN type output fn (see the
+		 * coercion note on ob_serialize_pk_single_datum_body). */
+		getTypeOutputInfo(consttype, &lit_outfuncoid, &lit_typeIsVarlena);
+		litstr = OidOutputFunctionCall(lit_outfuncoid, pk_val);
+		appendStringInfoString(&arr_sql, quote_literal_cstr(litstr));
+		pfree(litstr);
+	}
+
+	appendStringInfo(&arr_sql, " AS %s)",
+					 format_type_with_typemod(pk_typid, pkatt->atttypmod));
+
+	ret = ob_spi_one_shot(arr_sql.data, true, 1);
+	pfree(arr_sql.data);
+
+	if (ret != SPI_OK_SELECT || SPI_processed != 1)
+	{
+		ereport(ERROR,
+				(errcode(ERRCODE_INTERNAL_ERROR),
+				 errmsg("overlay_serialize_pk_from_single_datum: SPI %s coercion failed (ret=%d rows=%lu)",
+						fold_kind == OB_PKFOLD_RANGE ? "range" :
+						(fold_kind == OB_PKFOLD_JSONB ? "jsonb" : "interval"),
+						ret, (unsigned long) SPI_processed)));
+	}
+
+	{
+		bool		spi_isnull;
+		Datum		foldval;
+		StringInfoData json;
+
+		foldval = SPI_getbinval(SPI_tuptable->vals[0],
+								SPI_tuptable->tupdesc, 1, &spi_isnull);
+
+		initStringInfo(&json);
+		appendStringInfoChar(&json, '[');
+		if (spi_isnull)
+			appendStringInfoString(&json, "null");
+		else
+		{
+			Datum		normval;
+			Oid			outfuncoid;
+			bool		typeIsVarlena;
+			char	   *valstr;
+
+			/* Fold while the SPI tuple is still live: the coerced datum
+			 * points into SPI's memory context. */
+			if (fold_kind == OB_PKFOLD_RANGE)
+				normval = ob_canonicalize_range(foldval);
+			else if (fold_kind == OB_PKFOLD_JSONB)
+				normval = ob_canonicalize_jsonb(foldval);
+			else
+				normval = ob_canonicalize_interval(foldval);
+			getTypeOutputInfo(getBaseType(pk_typid), &outfuncoid,
+							  &typeIsVarlena);
+			valstr = OidOutputFunctionCall(outfuncoid, normval);
+			escape_json(&json, valstr);
+			pfree(valstr);
+			pfree(DatumGetPointer(normval));
+		}
+		appendStringInfoChar(&json, ']');
+
+		oldmc = MemoryContextSwitchTo(TopMemoryContext);
+		result = pstrdup(json.data);
+		MemoryContextSwitchTo(oldmc);
+		pfree(json.data);
+	}
+
+	SPI_finish();
+	return result;
+}
+
+/*
  * overlay_serialize_pk_from_single_datum
  *
  *   From a single Datum (single-column PK case) build, like overlay_serialize_pk,
@@ -2535,6 +3246,8 @@ ob_serialize_pk_single_datum_body(Relation rel,
 	TupleDesc	reldesc;
 	Form_pg_attribute pkatt;
 	Oid			pk_typid;
+	Oid			base_typid;
+	Oid			elem_norm;
 	StringInfoData arr_sql;
 	int			ret;
 	char	   *result;
@@ -2544,6 +3257,41 @@ ob_serialize_pk_single_datum_body(Relation rel,
 	reldesc = RelationGetDescr(rel);
 	pkatt = TupleDescAttr(reldesc, pk_attno - 1);
 	pk_typid = pkatt->atttypid;
+
+	/* Peel a domain: a domain over an array carries its own OID but the base
+	 * type's semantics.  pktypname below stays the domain name so the CAST
+	 * still applies the domain's own typmod rounding. */
+	base_typid = getBaseType(pk_typid);
+
+	/* Array of a canonicalizable element type: the plain CAST(...)::text
+	 * path cannot canonicalize elements (there is no scalar fold for an
+	 * array), so take the dedicated rebuild path. */
+	elem_norm = ob_identity_array_elem_normalizable(base_typid);
+	if (OidIsValid(elem_norm))
+		return ob_serialize_pk_single_array_body(pk_typid, pkatt, pk_val,
+												 pk_isnull, consttype,
+												 elem_norm);
+
+	/* INTERVAL: interval_out cannot fold the '='-equal spellings ('1 mon' /
+	 * '30 days'), so coerce then canonicalize the value in C. */
+	if (base_typid == INTERVALOID)
+		return ob_serialize_pk_single_fold_body(pk_typid, pkatt, pk_val,
+												pk_isnull, consttype,
+												OB_PKFOLD_INTERVAL);
+
+	/* JSONB: jsonb_out keeps each number's dscale, so coerce then rebuild
+	 * with the numbers scale-trimmed in C. */
+	if (base_typid == JSONBOID)
+		return ob_serialize_pk_single_fold_body(pk_typid, pkatt, pk_val,
+												pk_isnull, consttype,
+												OB_PKFOLD_JSONB);
+
+	/* RANGE over a not-yet-canonical subtype (numrange, range over
+	 * interval): its bounds need the same fold, one level down. */
+	if (ob_identity_range_needs_fold(base_typid))
+		return ob_serialize_pk_single_fold_body(pk_typid, pkatt, pk_val,
+												pk_isnull, consttype,
+												OB_PKFOLD_RANGE);
 
 	initStringInfo(&arr_sql);
 	appendStringInfoString(&arr_sql, "SELECT to_jsonb(ARRAY[");
@@ -2559,7 +3307,6 @@ ob_serialize_pk_single_datum_body(Relation rel,
 		char	   *litstr;
 		char	   *q;
 		const char *pktypname;
-		Oid			base_typid;
 
 		/* Stage 1: use the CONST'S OWN type to stringify its Datum. */
 		getTypeOutputInfo(consttype, &lit_outfuncoid, &lit_typeIsVarlena);
@@ -2585,12 +3332,6 @@ ob_serialize_pk_single_datum_body(Relation rel,
 		 * r-trimming on both sides preserves PK equality semantics. */
 		q = quote_literal_cstr(litstr);
 		pktypname = format_type_with_typemod(pk_typid, pkatt->atttypmod);
-
-		/* The branch selection below must look through a domain: a domain over
-		 * numeric / float8 carries its own OID but the base type's semantics.
-		 * pktypname stays the domain name so the CAST still applies the
-		 * domain's own typmod rounding before the normalization. */
-		base_typid = getBaseType(pk_typid);
 
 		/* NUMERIC: apply the same scale-invariant normalization the WRITE
 		 * side performs (numeric_trim_scale in overlay_serialize_pk), so a

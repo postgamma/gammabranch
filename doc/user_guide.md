@@ -46,7 +46,7 @@
   - [6.7 DDL RESTRICTED Inside an Active Branch](#67-ddl-restricted-inside-an-active-branch)
   - [6.8 No-PK Tables (Experimental Feature)](#68-no-pk-tables-experimental-feature)
   - [6.9 Delta Size Observability](#69-delta-size-observability)
-  - [6.10 Time, Float, and bytea Keys: Canonical Across Sessions](#610-time-float-and-bytea-keys-canonical-across-sessions)
+  - [6.10 Canonical Keys and Values: Time, Float, bytea, money, jsonb](#610-canonical-keys-and-values-time-float-bytea-money-jsonb)
 
 ---
 
@@ -1341,7 +1341,7 @@ HINT:  Inspect per-relation delta size with SELECT * FROM branch_delta_stats('b_
 
 > For the design, see [internals.md](internals.md) §5.6.
 
-### 6.10 Time, Float, and bytea Keys: Canonical Across Sessions
+### 6.10 Canonical Keys and Values: Time, Float, bytea, money, jsonb
 
 For these types a branch matches on the *value*, not on its text spelling, so it
 behaves exactly like MAIN no matter how the writing session renders the key:
@@ -1349,10 +1349,11 @@ behaves exactly like MAIN no matter how the writing session renders the key:
 value is the same bytes whether spelled in hex or escape form. A stored row value
 is canonical too, so another session reads back exactly what was inserted even
 under its own date/float display settings. That canonical form covers
-`timestamp`, `timestamptz`, `date`, `interval`, `float4`, and `float8`: each of
-these renders through a GUC (`DateStyle`, `IntervalStyle`, `extra_float_digits`)
-without leaving a self-describing marker, so an unpinned payload would be
-re-parsed to a different value by a reader under other settings. In particular a
+`timestamp`, `timestamptz`, `date`, `interval`, `float4`, `float8`, and `money`:
+each of these renders through a GUC (`DateStyle`, `IntervalStyle`,
+`extra_float_digits`, `lc_monetary`) without leaving a self-describing marker, so
+an unpinned payload would be re-parsed to a different value by a reader under
+other settings. In particular a
 `timestamptz` emits a zone offset, but that only fixes the instant's zone —
 `DateStyle` still reorders the date fields, so `2024-06-01 …` written under
 `SQL, DMY` would read back as 6 January under `ISO, MDY`.
@@ -1418,3 +1419,122 @@ INSERT INTO bs_guc_dom VALUES (1.0, 'b');
 ERROR:  duplicate key value violates unique constraint on relation "bs_guc_dom"
 DETAIL:  Key (k)=(1.0) already exists in branch delta (R21 pre-check).
 ```
+
+An **array** key column folds element-by-element the same way: `numeric[]` and
+`float8[]` keys are compared element-wise, so `ARRAY[1.0]` / `ARRAY[1.00]` and
+`ARRAY[-0.0]` / `ARRAY[0.0]` are one value and collide. Arrays that differ in
+shape or lower bound are different values and stay distinct.
+
+```sql
+CREATE TABLE bs_guc_arr(k numeric[] PRIMARY KEY, v text);
+SELECT create_branch('bs_guc_arr');
+SELECT use_branch('bs_guc_arr');
+INSERT INTO bs_guc_arr VALUES (ARRAY[1.0::numeric], 'a');
+INSERT INTO bs_guc_arr VALUES (ARRAY[1.00::numeric], 'b');
+ERROR:  duplicate key value violates unique constraint on relation "bs_guc_arr"
+DETAIL:  Key (k)=({1.00}) already exists in branch delta (R21 pre-check).
+```
+
+An **interval** key folds to a single span: `interval` equality counts a month as
+30 days and a day as 24 hours, so `'1 mon'` / `'30 days'` and `'1 day'` /
+`'24 hours'` are one value and collide. The fold is element-wise for an
+`interval[]` key too.
+
+```sql
+CREATE TABLE bs_guc_iv(k interval PRIMARY KEY, v text);
+SELECT create_branch('bs_guc_iv');
+SELECT use_branch('bs_guc_iv');
+INSERT INTO bs_guc_iv VALUES ('1 mon'::interval, 'a');
+INSERT INTO bs_guc_iv VALUES ('30 days'::interval, 'b');
+ERROR:  duplicate key value violates unique constraint on relation "bs_guc_iv"
+DETAIL:  Key (k)=(30 days) already exists in branch delta (R21 pre-check).
+```
+
+A **range** key folds through its bounds: a range renders each bound with its
+subtype's output function and compares them with the subtype's `=`, so
+`'[1.0,2.0)'` and `'[1,2)'` are one `numrange` value and collide. The fold is
+element-wise for an array of ranges, and a range over a `DateStyle` /
+`TimeZone`-sensitive subtype (`daterange`, `tsrange`, `tstzrange`) renders
+canonically regardless of the session.
+
+```sql
+CREATE TABLE bs_guc_rng(k numrange PRIMARY KEY, v text);
+SELECT create_branch('bs_guc_rng');
+SELECT use_branch('bs_guc_rng');
+INSERT INTO bs_guc_rng VALUES ('[1.0,2.0)'::numrange, 'a');
+INSERT INTO bs_guc_rng VALUES ('[1,2)'::numrange, 'b');
+ERROR:  duplicate key value violates unique constraint on relation "bs_guc_rng"
+DETAIL:  Key (k)=([1,2)) already exists in branch delta (R21 pre-check).
+```
+
+A **`money`** column is canonical too, and it is unique among these types in that
+the branch pins it on *both* the write and the read side. `money` renders through
+`lc_monetary` (`cash_out`), but its input function (`cash_in`) accepts **only the
+currency symbol and separators of the reading session's own locale** — a value
+written under one locale could otherwise fail to re-parse under another. So a
+branch stores the canonical `C` form (`$1,234.56`) and every replay re-parses it
+under that same form, whatever the session's `lc_monetary` is. Two consequences
+are visible to the user: a `money` key matches on its value across locales (a
+`money` written under a foreign locale collides with the canonical one), and a
+`money` payload reads back exactly as written. Set `lc_monetary` back to its own
+locale after leaving branch mode if you rely on it elsewhere.
+
+```sql
+CREATE TABLE bs_guc_mon(k money PRIMARY KEY, v text);
+CREATE TABLE bs_guc_mone(id int PRIMARY KEY, m money);
+SELECT create_branch('bs_guc_mon');
+SELECT use_branch('bs_guc_mon');
+
+-- written under a foreign locale, read back under C
+SET lc_monetary = 'en_GB.utf8';
+INSERT INTO bs_guc_mon VALUES (1234.56::money, 'gb');
+INSERT INTO bs_guc_mone VALUES (1, 9999.99::money);
+SET lc_monetary = 'C';
+-- the same amount collides: identity compares by value, not by rendered symbol
+INSERT INTO bs_guc_mon VALUES (1234.56::money, 'us');
+ERROR:  duplicate key value violates unique constraint on relation "bs_guc_mon"
+DETAIL:  Key (k)=($1,234.56) already exists in branch delta (R21 pre-check).
+-- the stored payload round-trips to the canonical C rendering
+SELECT m FROM bs_guc_mone WHERE id = 1;
+     m
+------------
+ $9,999.99
+RESET lc_monetary;
+```
+
+A **`jsonb`** key folds its numerics the same way: `jsonb` compares numbers by
+value, so `'{"a":1.0}'` and `'{"a":1.00}'` are one value even though a jsonb
+datum keeps the numeric's written scale and would otherwise print them
+differently. A branch folds every number at any depth — object values, array
+elements, and a scalar root — so a duplicate branch INSERT of an `=`-equal jsonb
+key raises `23505` like MAIN.
+
+```sql
+CREATE TABLE bs_guc_jb(k jsonb PRIMARY KEY, v text);
+SELECT create_branch('bs_guc_jb');
+SELECT use_branch('bs_guc_jb');
+INSERT INTO bs_guc_jb VALUES ('{"a":1.0}'::jsonb, 'a');
+INSERT INTO bs_guc_jb VALUES ('{"a":1.00}'::jsonb, 'b');
+ERROR:  duplicate key value violates unique constraint on relation "bs_guc_jb"
+DETAIL:  Key (k)=({"a": 1.00}) already exists in branch delta (R21 pre-check).
+```
+
+A **`json`** / **`jsonb`** column is stored structurally, not as text: a branch
+read returns the object or array itself rather than a string that merely looks
+like one, and `apply_branch` writes the same structure back to MAIN. A `jsonb[]`
+column round-trips element-wise; a JSON-`null` jsonb value reads back as SQL
+`NULL` (the same collapse `row_to_json()` makes).
+
+```sql
+CREATE TABLE bs_guc_jp(id int PRIMARY KEY, j jsonb, jc json, ja jsonb[]);
+SELECT create_branch('bs_guc_jp');
+SELECT use_branch('bs_guc_jp');
+INSERT INTO bs_guc_jp
+    VALUES (1, '{"a":1,"nested":{"b":2}}'::jsonb,
+            '{"c":3}'::json, ARRAY['{"x":1}'::jsonb]);
+SELECT jsonb_typeof(j) AS jt, jc::text AS jc, ja FROM bs_guc_jp WHERE id = 1;
+   jt   |    jc    |       ja
+--------+----------+----------------
+ object | {"c": 3} | {"{\"x\": 1}"}
+```
+

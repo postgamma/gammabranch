@@ -593,6 +593,23 @@ extern TupleTableSlot  *reconstruct_slot_from_delta(Relation rel, bytea *tuple_d
 													MemoryContext result_cxt);
 
 /* ----------
+ * Canonical output GUC pin (delta_store.c)
+ *
+ * Whenever a stored text payload is produced or re-parsed, the reading /
+ * writing session's output-input GUCs (TimeZone, DateStyle, IntervalStyle,
+ * extra_float_digits, bytea_output, lc_monetary) must match the canonical
+ * values the payload was rendered with, or values silently change or fail
+ * to parse.  money is the one type whose round trip needs the READER pinned
+ * as well (cash_in rejects a foreign currency symbol), so the delta probes
+ * and the apply replay pin around their parse when the relation carries a
+ * money column.
+ * ---------- */
+extern int              ob_canonical_guc_pin(void);
+extern void             ob_canonical_guc_unpin(int nestlevel);
+extern bool             ob_type_needs_lc_monetary_pin(Oid typid);
+extern bool             ob_relation_needs_lc_monetary_pin(Relation rel);
+
+/* ----------
  * Slot/fetch helpers (delta_store.c) — used by write_redirect.c
  * to translate junk-slot attnos → clean relation slots via ctid.
  * ----------

@@ -191,34 +191,137 @@ checks fire — otherwise a `numeric` domain re-splits `1.0` / `1.00` and a
 runs after the peel so an array *of* a domain and a domain *over* an array both
 resolve to the element type.
 
+**Array keys fold their elements.** An array PK renders through `array_out`,
+which prints each element with the *element* type's output function and joins
+them; `array_eq` likewise compares element-wise. So the normalizations above are
+an **element-wise** property of an array column, not a whole-array one:
+`ARRAY[1.0]` / `ARRAY[1.00]` on a `numeric[]` key and `ARRAY[-0.0]` /
+`ARRAY[0.0]` on a `float8[]` key are `=`-equal yet print `{1.00}` / `{1.0}` and
+`{-0}` / `{0}`. Left unfolded they split one logical row across two identity
+keys (a duplicate branch INSERT silently succeeds) exactly as the scalar case
+does. The serializer therefore rebuilds such an array with every element
+canonicalized (`numeric_trim_scale`, or the float `-0.0 → +0.0` fold) before
+rendering. The rebuild is structure-preserving — same dimensionality and lower
+bounds — because `array_eq` treats a different shape or bound as a *different*
+value: flattening the array (e.g. through `unnest`) to normalize it would
+instead collapse two genuinely distinct keys and invent a false `23505`. A
+bpchar array needs no fold — `array_out` never r-trims elements, so both
+producers already render the padded element identically.
+
+**Interval keys fold to one span.** `interval` equality is the microsecond span
+`month × 30 days + day × 24 hours + time`, so `'1 mon'` = `'30 days'` and
+`'1 day'` = `'24 hours'` — yet `interval_out` prints each spelling differently
+(`1 mon` / `30 days`, `1 day` / `24:00:00`). Pinning `IntervalStyle` cannot close
+this: the split is in the value, not the rendering. The serializer therefore
+re-expresses the value as a bare span (month = day = 0, time = the folded
+microseconds) before rendering, so every spelling of one equality class shares
+one identity key; the fold is element-wise for an `interval[]` key and applies
+through a domain over `interval` as well.
+
+**Range keys fold through their bounds.** A range renders each bound with its
+subtype's output function, and `range_eq` compares bounds with the subtype's `=`
+operator, so the scalar splits reappear one level down: a `numrange` PK holds
+`'[1.0,2.0)'` and `'[1,2)'` as one `=`-equal value that prints two ways, and a
+range over `interval` inherits the span split. The serializer therefore
+deserializes the range, folds each **finite** bound exactly as the scalar path
+folds a bare value (NUMERIC scale, INTERVAL span, float signed zero) and
+re-serializes it, preserving the bounds' inclusivity and infinities. Discrete
+ranges (`int4range` / `int8range` / `daterange`) are already canonicalized on
+input and fold to themselves; the fold is element-wise for an array of ranges.
+
+**jsonb keys fold their numerics.** `jsonb` equality compares containers
+recursively and compares numbers with `numeric_eq`, so `'{"a":1.0}'` =
+`'{"a":1.00}'` — yet a jsonb datum keeps the numeric dscale it was parsed with,
+and `jsonb_out` renders each spelling back verbatim (`1.0` vs `1.00`), the one
+non-canonical degree of freedom a jsonb value has. Keying the delta on the raw
+`jsonb_out` text would split one logical key across two delta rows and silently
+defeat the duplicate-key check, exactly as the scalar numeric case does. The
+serializer therefore re-parses the value and folds every numeric found at any
+depth — object values, array elements, and a scalar root alike — with
+`numeric_trim_scale` before rendering. Because `jsonb[]` renders through the
+element type's output function, the fold is element-wise for a jsonb array key
+as well.
+
 **GUC-dependent output is pinned.** A few output functions are not pure
 functions of the value: `TimeZone` / `DateStyle` (the date-time family),
-`IntervalStyle` (`interval`), `extra_float_digits` (`float4` / `float8`) and
-`bytea_output` (`bytea`) all read the session. Both serializers — the identity
-key and the delta payload `tuple_data` — render through those functions, so each
-pins the GUCs to one canonical setting (`UTC`, `ISO, MDY`, `postgres`, `1`,
-`hex`) for the duration of the call, inside a `GUC_ACTION_SAVE` nest level that
-PostgreSQL unwinds on any error. Without the pin the SAME instant renders to two
-identity texts under different `TimeZone`s (`…00:00:00+00` vs
-`…08:00:00+08`), splitting one logical row across two delta keys; and the
-payload, re-parsed by the reader's *input* functions, silently changes value (a
-`timestamp` written under `DateStyle='SQL, DMY'` reads back as another date, a
-`float8` written under `extra_float_digits=0` loses precision). The payload pin
-covers the types whose text is not self-describing — `timestamp`, `timestamptz`,
-`date`, `interval`, `float4`, `float8`. `timestamptz` belongs here even though
-it emits a zone offset: the offset fixes the instant's zone, but `DateStyle`
-still reorders the date fields, so `2024-06-01 …` written under `SQL, DMY` as
-`01/06/2024 …` reads back as 6 January under `ISO, MDY`. `timetz` (no date
-field) and `bytea` (two mutually-accepted spellings) do round-trip, so they skip
-the pin. GUC-insensitive types (int, text, uuid, …) skip it too; the pin is paid
-only by a table that actually carries one of the listed columns.
+`IntervalStyle` (`interval`), `extra_float_digits` (`float4` / `float8`),
+`bytea_output` (`bytea`) and `lc_monetary` (`money`) all read the session. Both
+serializers — the identity key and the delta payload `tuple_data` — render
+through those functions, so each pins the GUCs to one canonical setting (`UTC`,
+`ISO, MDY`, `postgres`, `1`, `hex`, `C`) for the duration of the call, inside a
+`GUC_ACTION_SAVE` nest level that PostgreSQL unwinds on any error. Without the
+pin the SAME instant renders to two identity texts under different `TimeZone`s
+(`…00:00:00+00` vs `…08:00:00+08`), splitting one logical row across two delta
+keys; and the payload, re-parsed by the reader's *input* functions, silently
+changes value (a `timestamp` written under `DateStyle='SQL, DMY'` reads back as
+another date, a `float8` written under `extra_float_digits=0` loses precision).
+The payload pin covers the types whose text is not self-describing —
+`timestamp`, `timestamptz`, `date`, `interval`, `float4`, `float8`, `money`.
+`timestamptz` belongs here even though it emits a zone offset: the offset fixes
+the instant's zone, but `DateStyle` still reorders the date fields, so
+`2024-06-01 …` written under `SQL, DMY` as `01/06/2024 …` reads back as 6
+January under `ISO, MDY`. `timetz` (no date field) and `bytea` (two
+mutually-accepted spellings) do round-trip, so they skip the pin. GUC-insensitive
+types (int, text, uuid, …) skip it too; the pin is paid only by a table that
+actually carries one of the listed columns.
+
+**json/jsonb payloads bypass the reader's input function.** The payload
+round-trip otherwise relies on the reader re-parsing each column's rendered text
+through its input function. `jsonb_to_record()` / `jsonb_populate_record()` break
+that assumption for a `json` / `jsonb` target column (or a domain over one):
+`populate_scalar()` in `jsonfuncs.c` splices the JSON value straight into the
+column instead of calling its input function, so a value baked into a JSON
+*string* would come back as a jsonb **string** scalar (`"{\"a\": 1}"`) rather
+than the object — silently corrupting every BranchScan read, delta probe, and
+apply write-back. Because a `json` / `jsonb` output is already valid JSON,
+`ob_serialize_tuple()` emits those columns verbatim (no string escaping), so the
+reader's direct copy reproduces the value. Arrays (`jsonb[]`) are **not**
+affected — the reader calls `array_in()` on the element strings — so they keep
+the quoted encoding. A jsonb JSON-`null` value still folds to SQL `NULL` on the
+way back, matching `row_to_json()`'s own round trip (documented limitation).
+
+**`money` is the one type the reader must pin too.** Every other pinned type is
+a *write-side* concern: the value is rendered canonically on the way in, and the
+input function that re-parses it (driven by `ob_canonical_guc_pin` on the read
+path) accepts the canonical text regardless of the reader's session GUCs.
+`money` is different: `cash_out` reads `lc_monetary`, but so does `cash_in` — and
+`cash_in` accepts **only** the reading session's own currency symbol and
+separators. A payload written under `en_GB.utf8` renders `£1,234.56`; a reader
+whose `lc_monetary` is `C` cannot re-parse it (`invalid input syntax for type
+money`), so the pin must also cover the *re-parse* sites, not just the write. A
+bare numeric string (`'1234.56'`) parses under every locale, but `cash_out`
+always adds the symbol, so the stored payload is always locale-stamped. The
+identity key has the matching hazard: under a foreign locale the key stores
+`["£1,234.56"]` while the canonical reader probes `["$1,234.56"]`, so the text
+key mismatch silently defeats the duplicate-key check (the fix's key is always
+the canonical C form). Because `money` needs pinning in *both* directions it gets
+its own predicates — `ob_type_needs_lc_monetary_pin(typid)` (peels a domain,
+recurses into array elements and range subtypes, then matches `MONEYOID`) and
+`ob_relation_needs_lc_monetary_pin(rel)` — gating four extra pin sites beyond
+the two serializers:
+
+- `reconstruct_slot_from_delta` (BranchScan read-back of a stored payload);
+- the PK/UNIQUE delta conflict probe `ob_unique_target_conflict`;
+- the UPSERT Phase I arbiter probe (pure-delta and MAIN branches alike);
+- the apply replay, both `ob_apply_relation_per_row` and
+  `ob_apply_relation_batch`.
+
+Every one of those wrap the pin/unpin in `PG_TRY` / `PG_FINALLY` so an error
+raised mid-parse can never leave the session stuck on `lc_monetary = C` (the
+`GUC_ACTION_SAVE` nest level unwinds on the error, but only if the unpin runs).
+The gate is false for a relation with no money column, so a non-money table pays
+nothing; and the pin is scoped to the single parse, so a surrounding user
+statement keeps the session's own locale.
 
 Finally, `float4` / `float8` collapse `-0.0` to `+0.0` before rendering: the two
 are `=`-equal (`float8eq`) yet print `-0` and `0`, and must share one identity
-key. Both sensitivity predicates (`ob_identity_type_is_guc_sensitive` and
-`ob_payload_type_roundtrip_unsafe`) peel a domain with `getBaseType()` before
-the type switch, so a domain over a sensitive type — or an array of one — is
-pinned exactly like its base type.
+key. Both sensitivity predicates (`ob_identity_type_is_guc_sensitive` — the
+`timestamptz` / `timestamp` / `date` / `timetz` / `interval` / `float4` /
+`float8` / `bytea` / `money` types — and `ob_payload_type_roundtrip_unsafe`,
+the same set minus `timetz` / `bytea`) peel a domain with `getBaseType()` before
+the type switch, so a domain over a sensitive type — or an array of one, or a
+**range** over one — is pinned exactly like its base type (a `tstzrange` /
+`daterange` bound is a `timestamptz` / `date`).
 
 ### 1.6 Incremental write path
 

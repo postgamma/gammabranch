@@ -959,6 +959,8 @@ ob_unique_target_conflict(Relation rel, TupleTableSlot *slot, int32 bid,
 	int			i;
 	int			ret;
 	bool		hit;
+	bool		needs_lc_pin = false;
+	int			guc_nl = 0;
 
 	nargs = 2 + natts;
 	initStringInfo(&wbuf_delta);
@@ -973,82 +975,107 @@ ob_unique_target_conflict(Relation rel, TupleTableSlot *slot, int32 bid,
 	vals[1] = ObjectIdGetDatum(relid);
 	nulls[1] = ' ';
 
+	/* The delta half of the probe re-parses the STORED payload text via
+	 * jsonb_populate_record(), and a money column additionally needs that
+	 * parse pinned to the canonical locale so cash_in accepts the C-rendered
+	 * currency symbol the payload was written with (the RHS $n text is
+	 * rendered below, under the same pin).  Gate on the probe columns so a
+	 * table without money pays nothing. */
 	for (i = 0; i < natts; i++)
-	{
-		AttrNumber	attno = attnos[i];
-		Form_pg_attribute att = TupleDescAttr(RelationGetDescr(rel), attno - 1);
-		bool		cn = false;
-		char	   *ct = ob_slot_col_text(rel, slot, attno, &cn);
-
-		appendStringInfo(&wbuf_delta,
-						 " AND (jsonb_populate_record(NULL::%s, "
-						 "convert_from(d.tuple_data, 'UTF8')::jsonb)).%s "
-						 "%s $%d::text::%s",
-						 quote_qualified_identifier(
-							 get_namespace_name(RelationGetNamespace(rel)),
-							 RelationGetRelationName(rel)),
-						 quote_identifier(NameStr(att->attname)),
-						 nulls_not_distinct ? "IS NOT DISTINCT FROM" : "=",
-						 i + 3, format_type_be(att->atttypid));
-		appendStringInfo(&wbuf_main, "%sm.%s %s $%d::text::%s",
-						 (i == 0) ? " WHERE " : " AND ",
-						 quote_identifier(NameStr(att->attname)),
-						 nulls_not_distinct ? "IS NOT DISTINCT FROM" : "=",
-						 i + 3, format_type_be(att->atttypid));
-		argtypes[i + 2] = TEXTOID;
-		if (cn)
+		if (ob_type_needs_lc_monetary_pin(
+				TupleDescAttr(RelationGetDescr(rel), attnos[i] - 1)->atttypid))
 		{
-			vals[i + 2] = (Datum) 0;
-			nulls[i + 2] = 'n';
+			needs_lc_pin = true;
+			break;
 		}
-		else
+	if (needs_lc_pin)
+		guc_nl = ob_canonical_guc_pin();
+
+	PG_TRY();
+	{
+		for (i = 0; i < natts; i++)
 		{
-			vals[i + 2] = CStringGetTextDatum(ct);
-			nulls[i + 2] = ' ';
+			AttrNumber	attno = attnos[i];
+			Form_pg_attribute att = TupleDescAttr(RelationGetDescr(rel), attno - 1);
+			bool		cn = false;
+			char	   *ct = ob_slot_col_text(rel, slot, attno, &cn);
+
+			appendStringInfo(&wbuf_delta,
+							 " AND (jsonb_populate_record(NULL::%s, "
+							 "convert_from(d.tuple_data, 'UTF8')::jsonb)).%s "
+							 "%s $%d::text::%s",
+							 quote_qualified_identifier(
+								 get_namespace_name(RelationGetNamespace(rel)),
+								 RelationGetRelationName(rel)),
+							 quote_identifier(NameStr(att->attname)),
+							 nulls_not_distinct ? "IS NOT DISTINCT FROM" : "=",
+							 i + 3, format_type_be(att->atttypid));
+			appendStringInfo(&wbuf_main, "%sm.%s %s $%d::text::%s",
+							 (i == 0) ? " WHERE " : " AND ",
+							 quote_identifier(NameStr(att->attname)),
+							 nulls_not_distinct ? "IS NOT DISTINCT FROM" : "=",
+							 i + 3, format_type_be(att->atttypid));
+			argtypes[i + 2] = TEXTOID;
+			if (cn)
+			{
+				vals[i + 2] = (Datum) 0;
+				nulls[i + 2] = 'n';
+			}
+			else
+			{
+				vals[i + 2] = CStringGetTextDatum(ct);
+				nulls[i + 2] = ' ';
+			}
+			if (ct != NULL)
+				pfree(ct);
 		}
-		if (ct != NULL)
-			pfree(ct);
-	}
 
-	/* Skip the UPDATE source row itself (its pre-existing delta row still
-	 * holds the PRE-image, which would match an unchanged UNIQUE value). */
-	if (exclude_key != NULL)
+		/* Skip the UPDATE source row itself (its pre-existing delta row still
+		 * holds the PRE-image, which would match an unchanged UNIQUE value). */
+		if (exclude_key != NULL)
+		{
+			char	   *qk = quote_literal_cstr(exclude_key);
+
+			appendStringInfo(&wbuf_delta, " AND d.key <> %s", qk);
+			pfree(qk);
+		}
+		/* Skip the UPDATE source row's MAIN anchor (it still holds the OLD
+		 * column values, which would match an unchanged UNIQUE value). */
+		if (exclude_ctid != NULL)
+		{
+			char	   *qc = quote_literal_cstr(exclude_ctid);
+
+			appendStringInfo(&wbuf_main, " AND m.ctid <> %s::tid", qc);
+			pfree(qc);
+		}
+
+		sql = psprintf("SELECT 1 FROM " OBTABLE_DELTA " d WHERE d.branch_id = $1 "
+					   "AND d.relid = $2 AND (d.op = 'I' OR d.op = 'U')%s "
+					   "UNION ALL SELECT 1 FROM %s m%s "
+					   "AND NOT EXISTS (SELECT 1 FROM " OBTABLE_DELTA " d2 "
+					   "WHERE d2.branch_id = $1 AND d2.relid = $2 "
+					   "AND d2.old_version = "
+					   "(replace(translate(m.ctid::text, '()', ''), ',', ':') "
+					   "|| '-x' || m.xmin::text)) LIMIT 1",
+					   wbuf_delta.data,
+					   quote_qualified_identifier(
+						 get_namespace_name(RelationGetNamespace(rel)),
+						 RelationGetRelationName(rel)),
+					   wbuf_main.data);
+
+		overlay_overlay_helper_enter();
+		overlay_write_redirect_exit();
+		ret = ob_spi_exec_params(sql, true, 0, nargs, argtypes, vals, nulls);
+		overlay_write_redirect_enter();
+		overlay_overlay_helper_exit();
+		hit = (ret == SPI_OK_SELECT && SPI_tuptable != NULL && SPI_processed >= 1);
+	}
+	PG_FINALLY();
 	{
-		char	   *qk = quote_literal_cstr(exclude_key);
-
-		appendStringInfo(&wbuf_delta, " AND d.key <> %s", qk);
-		pfree(qk);
+		if (needs_lc_pin)
+			ob_canonical_guc_unpin(guc_nl);
 	}
-	/* Skip the UPDATE source row's MAIN anchor (it still holds the OLD
-	 * column values, which would match an unchanged UNIQUE value). */
-	if (exclude_ctid != NULL)
-	{
-		char	   *qc = quote_literal_cstr(exclude_ctid);
-
-		appendStringInfo(&wbuf_main, " AND m.ctid <> %s::tid", qc);
-		pfree(qc);
-	}
-
-	sql = psprintf("SELECT 1 FROM " OBTABLE_DELTA " d WHERE d.branch_id = $1 "
-				   "AND d.relid = $2 AND (d.op = 'I' OR d.op = 'U')%s "
-				   "UNION ALL SELECT 1 FROM %s m%s "
-				   "AND NOT EXISTS (SELECT 1 FROM " OBTABLE_DELTA " d2 "
-				   "WHERE d2.branch_id = $1 AND d2.relid = $2 "
-				   "AND d2.old_version = "
-				   "(replace(translate(m.ctid::text, '()', ''), ',', ':') "
-				   "|| '-x' || m.xmin::text)) LIMIT 1",
-				   wbuf_delta.data,
-				   quote_qualified_identifier(
-					 get_namespace_name(RelationGetNamespace(rel)),
-					 RelationGetRelationName(rel)),
-				   wbuf_main.data);
-
-	overlay_overlay_helper_enter();
-	overlay_write_redirect_exit();
-	ret = ob_spi_exec_params(sql, true, 0, nargs, argtypes, vals, nulls);
-	overlay_write_redirect_enter();
-	overlay_overlay_helper_exit();
-	hit = (ret == SPI_OK_SELECT && SPI_tuptable != NULL && SPI_processed >= 1);
+	PG_END_TRY();
 	SPI_finish();
 
 	pfree(sql);
@@ -2557,96 +2584,128 @@ overlay_executor_run_intercept(QueryDesc *queryDesc,
 					bool		in_pure_delta = false;
 					MemoryContext oldmc;
 					int			i;
+					bool		needs_lc_pin = false;
+					int			guc_nl = 0;
 
 					oldmc = NULL;
 
+					/* The delta probe below re-parses the STORED payload text,
+					 * and the $n text is rendered from the incoming slot; both
+					 * must run under the canonical locale a money value was
+					 * stored with, so an arbiter column carrying money needs
+					 * lc_monetary pinned (ob_type_needs_lc_monetary_pin).  The
+					 * probe is done once, before the arbiter branch, so the
+					 * PG_FINALLY can span the whole thing including the shared
+					 * SPI call; the PK path (arb_natts == 0) never pins. */
 					if (arb_natts > 0)
-					{
-						/* Keyless UPSERT: probe a delta row's stored image
-						 * on the arbiter columns (the ctid key is not known
-						 * yet) and carry d.key back for the promo=3 reuse.
-						 * A NULL arbiter column must be bound as a real SQL
-						 * NULL ($n IS NULL via the 'n' null-string), not as
-						 * a (Datum) 0 payload with a NULL nulls array — the
-						 * latter makes SPI dereference a bogus text pointer
-						 * and crash. */
-						StringInfoData wbuf;
-
-						initStringInfo(&wbuf);
-						nargs_pure = 2 + arb_natts;
-						argtypes_pure = (Oid *) palloc(sizeof(Oid) * nargs_pure);
-						vals_pure = (Datum *) palloc(sizeof(Datum) * nargs_pure);
-						nulls_pure = (char *) palloc(sizeof(char) * nargs_pure);
-						argtypes_pure[0] = INT4OID;
-						vals_pure[0] = Int32GetDatum(bid);
-						nulls_pure[0] = ' ';
-						argtypes_pure[1] = OIDOID;
-						vals_pure[1] = ObjectIdGetDatum(relid);
-						nulls_pure[1] = ' ';
 						for (i = 0; i < arb_natts; i++)
-						{
-							AttrNumber	attno = arb_attnos[i];
-							Form_pg_attribute att = TupleDescAttr(RelationGetDescr(rel),
-																  attno - 1);
-							bool		cn = false;
-							char	   *ct = ob_slot_col_text(rel, slot, attno, &cn);
+							if (ob_type_needs_lc_monetary_pin(
+									TupleDescAttr(RelationGetDescr(rel),
+												  arb_attnos[i] - 1)->atttypid))
+							{
+								needs_lc_pin = true;
+								break;
+							}
+					if (needs_lc_pin)
+						guc_nl = ob_canonical_guc_pin();
 
-							appendStringInfo(&wbuf,
-											 " AND (jsonb_populate_record(NULL::%s, "
-											 "convert_from(d.tuple_data, 'UTF8')::jsonb)).%s "
-											 "%s $%d::text::%s",
-											 quote_qualified_identifier(
-												 get_namespace_name(RelationGetNamespace(rel)),
-												 RelationGetRelationName(rel)),
-											 quote_identifier(NameStr(att->attname)),
-											 arb_nulls_not_distinct
-												? "IS NOT DISTINCT FROM" : "=",
-											 i + 3,
-											 format_type_be(att->atttypid));
-							argtypes_pure[i + 2] = TEXTOID;
-							if (cn)
-							{
-								vals_pure[i + 2] = (Datum) 0;
-								nulls_pure[i + 2] = 'n';
-							}
-							else
-							{
-								vals_pure[i + 2] = CStringGetTextDatum(ct);
-								nulls_pure[i + 2] = ' ';
-							}
-							if (ct != NULL)
-								pfree(ct);
-						}
-						sql_pure = psprintf(
-							"SELECT d.op, d.old_version, d.tuple_data, d.key FROM "
-							OBTABLE_DELTA " d WHERE d.branch_id = $1 AND d.relid = $2 "
-							"AND (d.op = 'I' OR d.op = 'U')%s LIMIT 1", wbuf.data);
-						pfree(wbuf.data);
-					}
-					else
+					PG_TRY(2);
 					{
-						/* PK path: probe on the serialized PK (unchanged). */
-						nargs_pure = 3;
-						argtypes_pure = (Oid *) palloc(sizeof(Oid) * 3);
-						vals_pure = (Datum *) palloc(sizeof(Datum) * 3);
-						argtypes_pure[0] = INT4OID;
-						argtypes_pure[1] = OIDOID;
-						argtypes_pure[2] = TEXTOID;
-						vals_pure[0] = Int32GetDatum(bid);
-						vals_pure[1] = ObjectIdGetDatum(relid);
-						vals_pure[2] = CStringGetTextDatum(pk);
-						sql_pure = pstrdup(
-							"SELECT d.op, d.old_version, d.tuple_data FROM "
-							OBTABLE_DELTA " d WHERE d.branch_id = $1 AND d.relid = $2 "
-							"AND d.key = $3 LIMIT 1");
-					}
+						if (arb_natts > 0)
+						{
+							/* Keyless UPSERT: probe a delta row's stored image
+							 * on the arbiter columns (the ctid key is not known
+							 * yet) and carry d.key back for the promo=3 reuse.
+							 * A NULL arbiter column must be bound as a real SQL
+							 * NULL ($n IS NULL via the 'n' null-string), not as
+							 * a (Datum) 0 payload with a NULL nulls array — the
+							 * latter makes SPI dereference a bogus text pointer
+							 * and crash. */
+							StringInfoData wbuf;
 
-					overlay_overlay_helper_enter();
-					overlay_write_redirect_exit();
-					ret2 = ob_spi_exec_params(sql_pure, true, 0, nargs_pure,
-											  argtypes_pure, vals_pure, nulls_pure);
-					overlay_write_redirect_enter();
-					overlay_overlay_helper_exit();
+							initStringInfo(&wbuf);
+							nargs_pure = 2 + arb_natts;
+							argtypes_pure = (Oid *) palloc(sizeof(Oid) * nargs_pure);
+							vals_pure = (Datum *) palloc(sizeof(Datum) * nargs_pure);
+							nulls_pure = (char *) palloc(sizeof(char) * nargs_pure);
+							argtypes_pure[0] = INT4OID;
+							vals_pure[0] = Int32GetDatum(bid);
+							nulls_pure[0] = ' ';
+							argtypes_pure[1] = OIDOID;
+							vals_pure[1] = ObjectIdGetDatum(relid);
+							nulls_pure[1] = ' ';
+							for (i = 0; i < arb_natts; i++)
+							{
+								AttrNumber	attno = arb_attnos[i];
+								Form_pg_attribute att = TupleDescAttr(RelationGetDescr(rel),
+																	  attno - 1);
+								bool		cn = false;
+								char	   *ct = ob_slot_col_text(rel, slot, attno, &cn);
+
+								appendStringInfo(&wbuf,
+												 " AND (jsonb_populate_record(NULL::%s, "
+												 "convert_from(d.tuple_data, 'UTF8')::jsonb)).%s "
+												 "%s $%d::text::%s",
+												 quote_qualified_identifier(
+													 get_namespace_name(RelationGetNamespace(rel)),
+													 RelationGetRelationName(rel)),
+												 quote_identifier(NameStr(att->attname)),
+												 arb_nulls_not_distinct
+													? "IS NOT DISTINCT FROM" : "=",
+												 i + 3,
+												 format_type_be(att->atttypid));
+								argtypes_pure[i + 2] = TEXTOID;
+								if (cn)
+								{
+									vals_pure[i + 2] = (Datum) 0;
+									nulls_pure[i + 2] = 'n';
+								}
+								else
+								{
+									vals_pure[i + 2] = CStringGetTextDatum(ct);
+									nulls_pure[i + 2] = ' ';
+								}
+								if (ct != NULL)
+									pfree(ct);
+							}
+							sql_pure = psprintf(
+								"SELECT d.op, d.old_version, d.tuple_data, d.key FROM "
+								OBTABLE_DELTA " d WHERE d.branch_id = $1 AND d.relid = $2 "
+								"AND (d.op = 'I' OR d.op = 'U')%s LIMIT 1", wbuf.data);
+							pfree(wbuf.data);
+						}
+						else
+						{
+							/* PK path: probe on the serialized PK (unchanged). */
+							nargs_pure = 3;
+							argtypes_pure = (Oid *) palloc(sizeof(Oid) * 3);
+							vals_pure = (Datum *) palloc(sizeof(Datum) * 3);
+							argtypes_pure[0] = INT4OID;
+							argtypes_pure[1] = OIDOID;
+							argtypes_pure[2] = TEXTOID;
+							vals_pure[0] = Int32GetDatum(bid);
+							vals_pure[1] = ObjectIdGetDatum(relid);
+							vals_pure[2] = CStringGetTextDatum(pk);
+							sql_pure = pstrdup(
+								"SELECT d.op, d.old_version, d.tuple_data FROM "
+								OBTABLE_DELTA " d WHERE d.branch_id = $1 AND d.relid = $2 "
+								"AND d.key = $3 LIMIT 1");
+						}
+
+						overlay_overlay_helper_enter();
+						overlay_write_redirect_exit();
+						ret2 = ob_spi_exec_params(sql_pure, true, 0, nargs_pure,
+												  argtypes_pure, vals_pure, nulls_pure);
+						overlay_write_redirect_enter();
+						overlay_overlay_helper_exit();
+					}
+					PG_FINALLY(2);
+					{
+						if (needs_lc_pin)
+							ob_canonical_guc_unpin(guc_nl);
+					}
+					PG_END_TRY(2);
+
 					pfree(sql_pure);
 					/* $1/$2 are pass-by-value; only the text payloads (and
 					 * NULL arbiter columns passed as (Datum) 0) remain. */

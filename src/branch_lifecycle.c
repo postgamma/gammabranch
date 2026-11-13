@@ -4102,40 +4102,59 @@ ob_apply_relation_per_row(ObApplyRelInfo *ri, List *deltas,
 						  const char *branch_name)
 {
 	ListCell   *dlc;
+	bool		needs_lc_pin = ob_relation_needs_lc_monetary_pin(ri->rel);
+	int			guc_nl = 0;
 
-	foreach(dlc, deltas)
+	/* Replaying a delta re-parses its stored payload; a money column also
+	 * needs the parse pinned so cash_in accepts the C-rendered currency
+	 * symbol the payload was written with (ob_type_needs_lc_monetary_pin).
+	 * PG_FINALLY restores the GUCs on any error path, so an error swallowed
+	 * by an inner PG_CATCH can never leave the session pinned to locale C. */
+	if (needs_lc_pin)
+		guc_nl = ob_canonical_guc_pin();
+
+	PG_TRY();
 	{
-		DeltaTuple *dt = (DeltaTuple *) lfirst(dlc);
-
-		if (dt->op == DELTA_OP_DELETE)
+		foreach(dlc, deltas)
 		{
-			elog(DEBUG1, "apply[dbg] DELETE pass key=%s", dt->key ? dt->key : "NULL");
-			apply_relation_delete_pass(ri, dt, branch_name);
-			elog(DEBUG1, "apply[dbg] DELETE pass DONE");
+			DeltaTuple *dt = (DeltaTuple *) lfirst(dlc);
+
+			if (dt->op == DELTA_OP_DELETE)
+			{
+				elog(DEBUG1, "apply[dbg] DELETE pass key=%s", dt->key ? dt->key : "NULL");
+				apply_relation_delete_pass(ri, dt, branch_name);
+				elog(DEBUG1, "apply[dbg] DELETE pass DONE");
+			}
+		}
+		foreach(dlc, deltas)
+		{
+			DeltaTuple *dt = (DeltaTuple *) lfirst(dlc);
+
+			if (dt->op == DELTA_OP_UPDATE)
+			{
+				elog(DEBUG1, "apply[dbg] UPDATE pass key=%s", dt->key ? dt->key : "NULL");
+				apply_relation_update_pass(ri, dt, branch_name);
+				elog(DEBUG1, "apply[dbg] UPDATE pass DONE");
+			}
+		}
+		foreach(dlc, deltas)
+		{
+			DeltaTuple *dt = (DeltaTuple *) lfirst(dlc);
+
+			if (dt->op == DELTA_OP_INSERT)
+			{
+				elog(DEBUG1, "apply[dbg] INSERT pass key=%s", dt->key ? dt->key : "NULL");
+				apply_relation_insert_pass(ri, dt, branch_name);
+				elog(DEBUG1, "apply[dbg] INSERT pass DONE");
+			}
 		}
 	}
-	foreach(dlc, deltas)
+	PG_FINALLY();
 	{
-		DeltaTuple *dt = (DeltaTuple *) lfirst(dlc);
-
-		if (dt->op == DELTA_OP_UPDATE)
-		{
-			elog(DEBUG1, "apply[dbg] UPDATE pass key=%s", dt->key ? dt->key : "NULL");
-			apply_relation_update_pass(ri, dt, branch_name);
-			elog(DEBUG1, "apply[dbg] UPDATE pass DONE");
-		}
+		if (needs_lc_pin)
+			ob_canonical_guc_unpin(guc_nl);
 	}
-	foreach(dlc, deltas)
-	{
-		DeltaTuple *dt = (DeltaTuple *) lfirst(dlc);
-
-		if (dt->op == DELTA_OP_INSERT)
-		{
-			elog(DEBUG1, "apply[dbg] INSERT pass key=%s", dt->key ? dt->key : "NULL");
-			apply_relation_insert_pass(ri, dt, branch_name);
-			elog(DEBUG1, "apply[dbg] INSERT pass DONE");
-		}
-	}
+	PG_END_TRY();
 }
 
 /* ob_apply_batch_can_use - can this relation be replayed with batch SQL? */
@@ -4175,62 +4194,79 @@ ob_apply_relation_batch(ObApplyRelInfo *ri, int32 bid, List *deltas,
 	uint64		n_ins = 0;		/* INSERT rows + materialised orphan-U rows */
 	ListCell   *lc;
 	ObBatchConflict c;
+	bool		needs_lc_pin = ob_relation_needs_lc_monetary_pin(ri->rel);
+	int			guc_nl = 0;
 
-	foreach(lc, deltas)
+	/* See ob_apply_relation_per_row: pin the canonical locale around the
+	 * batch replay's stored-payload parse when the relation carries money.
+	 * PG_FINALLY restores the GUCs on any error path. */
+	if (needs_lc_pin)
+		guc_nl = ob_canonical_guc_pin();
+
+	PG_TRY();
 	{
-		DeltaTuple *dt = (DeltaTuple *) lfirst(lc);
+		foreach(lc, deltas)
+		{
+			DeltaTuple *dt = (DeltaTuple *) lfirst(lc);
 
-		if (dt->op == DELTA_OP_DELETE)
-		{
-			if (dt->old_version != NULL)
-				n_del++;
-		}
-		else if (dt->op == DELTA_OP_UPDATE)
-		{
-			if (dt->old_version != NULL)
-				n_upd++;
-			else
+			if (dt->op == DELTA_OP_DELETE)
 			{
-				n_orphan++;
-				n_ins++;
+				if (dt->old_version != NULL)
+					n_del++;
 			}
+			else if (dt->op == DELTA_OP_UPDATE)
+			{
+				if (dt->old_version != NULL)
+					n_upd++;
+				else
+				{
+					n_orphan++;
+					n_ins++;
+				}
+			}
+			else if (dt->op == DELTA_OP_INSERT)
+				n_ins++;
 		}
-		else if (dt->op == DELTA_OP_INSERT)
-			n_ins++;
+
+		elog(DEBUG1, "apply[dbg] batch counts D=" UINT64_FORMAT " U=" UINT64_FORMAT
+			 " orphan=" UINT64_FORMAT " I=" UINT64_FORMAT,
+			 n_del, n_upd, n_orphan, n_ins);
+
+		/* ---- DELETE pass (pure-delta DELETEs are no-ops and need no SQL) ---- */
+		if (n_del > 0)
+		{
+			c = ob_batch_validate(ri, bid, DELTA_OP_DELETE);
+			if (c.found)
+				ob_batch_report_conflict(ri, DELTA_OP_DELETE, &c, branch_name);
+			ob_batch_delete_pass(ri, bid, n_del);
+		}
+
+		/* ---- UPDATE pass ----
+		 * Validate whenever the relation carries any UPDATE delta: an orphan-U
+		 * whose MAIN row exists must report the UPDATE-specific conflict before
+		 * the INSERT pass runs. */
+		if (n_upd + n_orphan > 0)
+		{
+			c = ob_batch_validate(ri, bid, DELTA_OP_UPDATE);
+			if (c.found)
+				ob_batch_report_conflict(ri, DELTA_OP_UPDATE, &c, branch_name);
+			if (n_upd > 0)
+				ob_batch_update_pass(ri, bid, n_upd);
+		}
+
+		/* ---- INSERT pass: new rows plus materialised orphan-U rows ---- */
+		if (n_ins > 0)
+		{
+			c = ob_batch_validate(ri, bid, DELTA_OP_INSERT);
+			if (c.found)
+				ob_batch_report_conflict(ri, DELTA_OP_INSERT, &c, branch_name);
+			ob_batch_insert_pass(ri, bid, n_ins);
+		}
 	}
-
-	elog(DEBUG1, "apply[dbg] batch counts D=" UINT64_FORMAT " U=" UINT64_FORMAT
-		 " orphan=" UINT64_FORMAT " I=" UINT64_FORMAT,
-		 n_del, n_upd, n_orphan, n_ins);
-
-	/* ---- DELETE pass (pure-delta DELETEs are no-ops and need no SQL) ---- */
-	if (n_del > 0)
+	PG_FINALLY();
 	{
-		c = ob_batch_validate(ri, bid, DELTA_OP_DELETE);
-		if (c.found)
-			ob_batch_report_conflict(ri, DELTA_OP_DELETE, &c, branch_name);
-		ob_batch_delete_pass(ri, bid, n_del);
+		if (needs_lc_pin)
+			ob_canonical_guc_unpin(guc_nl);
 	}
-
-	/* ---- UPDATE pass ----
-	 * Validate whenever the relation carries any UPDATE delta: an orphan-U
-	 * whose MAIN row exists must report the UPDATE-specific conflict before
-	 * the INSERT pass runs. */
-	if (n_upd + n_orphan > 0)
-	{
-		c = ob_batch_validate(ri, bid, DELTA_OP_UPDATE);
-		if (c.found)
-			ob_batch_report_conflict(ri, DELTA_OP_UPDATE, &c, branch_name);
-		if (n_upd > 0)
-			ob_batch_update_pass(ri, bid, n_upd);
-	}
-
-	/* ---- INSERT pass: new rows plus materialised orphan-U rows ---- */
-	if (n_ins > 0)
-	{
-		c = ob_batch_validate(ri, bid, DELTA_OP_INSERT);
-		if (c.found)
-			ob_batch_report_conflict(ri, DELTA_OP_INSERT, &c, branch_name);
-		ob_batch_insert_pass(ri, bid, n_ins);
-	}
+	PG_END_TRY();
 }
