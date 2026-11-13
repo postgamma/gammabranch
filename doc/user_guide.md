@@ -658,6 +658,22 @@ The following scenarios are **explicitly rejected** (they do not silently pass t
 | **UPSERT ... DO UPDATE SET pk_col = ...** (change the primary key) | Rejected | `overlay_branch does not support UPSERT ON CONFLICT DO UPDATE that modifies primary key columns` |
 | Insufficient privilege to call use/apply/discard/create | Rejected | `42501 insufficient_privilege` |
 
+Identity columns (`GENERATED ... AS IDENTITY`) are supported — as PK or non-PK
+columns. Apply replays the sequence-assigned value verbatim (a `GENERATED ALWAYS`
+column can never change under a branch UPDATE) and never consumes the sequence:
+
+```sql
+CREATE TABLE t_ident (id int GENERATED ALWAYS AS IDENTITY PRIMARY KEY, v text);
+INSERT INTO t_ident (v) VALUES ('main');
+SELECT create_branch('br_ident');
+SELECT use_branch('br_ident');
+INSERT INTO t_ident (v) VALUES ('branch');   -- id assigned by the sequence
+UPDATE t_ident SET v = 'main!' WHERE id = 1;
+SELECT use_branch(NULL);
+SELECT apply_branch('br_ident');
+SELECT * FROM t_ident ORDER BY id;           -- 1 | main!  /  2 | branch
+```
+
 ### 5.1 UPSERT Implementation Example
 
 `INSERT ... ON CONFLICT DO NOTHING / DO UPDATE` (for PK or UNIQUE-arbiter conflicts) works normally inside a branch:

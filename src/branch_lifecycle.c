@@ -555,6 +555,13 @@ typedef struct ObApplyRelInfo
 	char	  **pk_coltype;			/* per PK col: format_type_with_typemod() */
 	char	   *colnames;			/* "a","b" (quoted identifiers) */
 	char	   *colnames_parens;	/* j."a",j."b" */
+	/* UPDATE replay must NOT assign a GENERATED ALWAYS AS IDENTITY column:
+	 * PostgreSQL rejects "SET id = <expr>" for such a column (only DEFAULT is
+	 * accepted), and a branch UPDATE can never change it anyway.  These lists
+	 * are colnames/colnames_parens minus ATTRIBUTE_IDENTITY_ALWAYS columns;
+	 * when the table has no such column they alias the full lists. */
+	char	   *upd_colnames;
+	char	   *upd_colnames_parens;
 	Oid			bytea_out_func;		/* bytea output function for tuple_data */
 	bool		bytea_out_varlena;
 } ObApplyRelInfo;
@@ -3090,7 +3097,10 @@ ob_apply_rel_info_build(Relation rel)
 	Relation	pk_rel = NULL;
 	StringInfoData colnames;
 	StringInfoData colnames_parens;
+	StringInfoData upd_colnames;
+	StringInfoData upd_colnames_parens;
 	bool		first = true;
+	bool		upd_first = true;
 	int			i;
 	MemoryContext oldmc;
 
@@ -3107,6 +3117,8 @@ ob_apply_rel_info_build(Relation rel)
 
 	initStringInfo(&colnames);
 	initStringInfo(&colnames_parens);
+	initStringInfo(&upd_colnames);
+	initStringInfo(&upd_colnames_parens);
 	for (i = 0; i < reldesc->natts; i++)
 	{
 		Form_pg_attribute att = TupleDescAttr(reldesc, i);
@@ -3123,9 +3135,40 @@ ob_apply_rel_info_build(Relation rel)
 		appendStringInfo(&colnames_parens, "j.%s",
 						 quote_identifier(NameStr(att->attname)));
 		first = false;
+
+		/* GENERATED ALWAYS AS IDENTITY columns are excluded from the UPDATE
+		 * SET list (PostgreSQL rejects any assignment to them but DEFAULT). */
+		if (att->attidentity == ATTRIBUTE_IDENTITY_ALWAYS)
+			continue;
+		if (!upd_first)
+		{
+			appendStringInfoChar(&upd_colnames, ',');
+			appendStringInfoChar(&upd_colnames_parens, ',');
+		}
+		appendStringInfo(&upd_colnames, "%s",
+						 quote_identifier(NameStr(att->attname)));
+		appendStringInfo(&upd_colnames_parens, "j.%s",
+						 quote_identifier(NameStr(att->attname)));
+		upd_first = false;
 	}
 	ri->colnames = colnames.data;
 	ri->colnames_parens = colnames_parens.data;
+	/* Alias the full lists unless an ALWAYS identity column forced the
+	 * updatable set to differ.  A table whose every column is ALWAYS identity
+	 * has no updatable column at all (an UPDATE on it can never yield a net
+	 * change, so no U delta exists); fall back to the full list there. */
+	if (upd_colnames.len > 0)
+	{
+		ri->upd_colnames = upd_colnames.data;
+		ri->upd_colnames_parens = upd_colnames_parens.data;
+	}
+	else
+	{
+		pfree(upd_colnames.data);
+		pfree(upd_colnames_parens.data);
+		ri->upd_colnames = ri->colnames;
+		ri->upd_colnames_parens = ri->colnames_parens;
+	}
 
 	getTypeOutputInfo(BYTEAOID, &ri->bytea_out_func, &ri->bytea_out_varlena);
 
@@ -3196,6 +3239,10 @@ ob_apply_rel_info_free(ObApplyRelInfo *ri)
 		pfree(ri->colnames);
 	if (ri->colnames_parens)
 		pfree(ri->colnames_parens);
+	if (ri->upd_colnames && ri->upd_colnames != ri->colnames)
+		pfree(ri->upd_colnames);
+	if (ri->upd_colnames_parens && ri->upd_colnames_parens != ri->colnames_parens)
+		pfree(ri->upd_colnames_parens);
 	for (i = 0; i < ri->n_pk; i++)
 	{
 		if (ri->pk_colname && ri->pk_colname[i])
@@ -3612,8 +3659,8 @@ apply_relation_update_pass(ObApplyRelInfo *ri, DeltaTuple *dt,
 							 "convert_from(decode(substring(%s from 3), 'hex'), 'UTF8')::jsonb) "
 							 "AS j) "
 							 "WHERE %s",
-							 ri->q_relname, ri->colnames,
-							 ri->colnames_parens, ri->q_relname,
+							 ri->q_relname, ri->upd_colnames,
+							 ri->upd_colnames_parens, ri->q_relname,
 							 ql, where_clause);
 			pfree(ql);
 		}
@@ -3689,7 +3736,7 @@ apply_relation_insert_pass(ObApplyRelInfo *ri, DeltaTuple *dt,
 
 		initStringInfo(&ins_sql);
 		appendStringInfo(&ins_sql,
-						 "INSERT INTO %s (%s) "
+						 "INSERT INTO %s (%s) OVERRIDING SYSTEM VALUE "
 						 "SELECT %s FROM jsonb_populate_record(NULL::%s, "
 						 "convert_from(decode(substring(%s from 3), 'hex'), 'UTF8')::jsonb) "
 						 "AS j",
@@ -4037,7 +4084,7 @@ ob_batch_update_pass(ObApplyRelInfo *ri, int32 bid, uint64 expected)
 					 "FROM %s d WHERE d.branch_id = %d AND d.relid = %u "
 					 "AND d.op = 'U' AND d.old_version IS NOT NULL) s "
 					 "WHERE %s AND s.old_version = %s",
-					 ri->q_relname, ri->colnames, ri->colnames_parens,
+					 ri->q_relname, ri->upd_colnames, ri->upd_colnames_parens,
 					 ri->q_relname, OBTABLE_DELTA, (int) bid,
 					 (unsigned) ri->relid, pkjoin, token);
 	pfree(pkjoin);
@@ -4069,7 +4116,7 @@ ob_batch_insert_pass(ObApplyRelInfo *ri, int32 bid, uint64 expected)
 
 	initStringInfo(&sql);
 	appendStringInfo(&sql,
-					 "INSERT INTO %s (%s) "
+					 "INSERT INTO %s (%s) OVERRIDING SYSTEM VALUE "
 					 "SELECT %s FROM %s d "
 					 "CROSS JOIN LATERAL jsonb_populate_record(NULL::%s, "
 					 "convert_from(d.tuple_data, 'UTF8')::jsonb) AS j "

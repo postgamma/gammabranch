@@ -140,6 +140,16 @@ materialised by Pass 3. **PK type
 constraint**: the chain must use the typmod-aware type name and `rtrim` BPCHAR
 keys on both sides, else `BPCHAR(N)` / `NUMERIC(p,s)` keys mismatch.
 
+**Identity columns.** A `GENERATED ... AS IDENTITY` column replays like any other
+column, but PostgreSQL rejects a non-`DEFAULT` assignment to a `GENERATED ALWAYS`
+column. The INSERT passes therefore append `OVERRIDING SYSTEM VALUE` (a no-op for
+plain and `BY DEFAULT` tables) so the sequence-assigned value the branch stored is
+written verbatim; the UPDATE passes drop every `ATTRIBUTE_IDENTITY_ALWAYS` column
+from their SET list (the `upd_colnames` alias excludes them — `BY DEFAULT` and plain
+columns are unaffected), since such a column can never change under a branch
+UPDATE. The sequence is advanced on the branch's own INSERT at write-redirect time,
+so apply never consumes it.
+
 ### 1.4 Catalog tables
 
 `pg_branch`: `branch_id` (sequence-backed), `branch_name` (unique), `owner`

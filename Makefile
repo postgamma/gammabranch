@@ -27,6 +27,7 @@ REGRESS = \
   overlay_branch_user \
   overlay_branch_scan_pk \
   overlay_branch_scan_type \
+  overlay_branch_identity \
   overlay_branch_puredelta_mix \
   overlay_branch_upsert \
   overlay_branch_upsert_arbiter \

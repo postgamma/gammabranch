@@ -5,7 +5,7 @@ The extension is verified by three layers. Only **L1 + L3** are gates for
 
 | Layer | Harness | Count | Gate? | What it proves |
 |---|---|---|---|---|
-| L3 | `pg_regress` (`test/regress/`) | 21 suites | yes | Functional correctness of the public API, guards, overlay semantics, planner pushdown, error paths |
+| L3 | `pg_regress` (`test/regress/`) | 23 suites | yes | Functional correctness of the public API, guards, overlay semantics, planner pushdown, error paths |
 | L1 | `pg_isolation_regress` (`test/isolation/`) | 15 specs | yes | Concurrency correctness — CAS mutex, applying-freeze, snapshot mode, invalidation kickout, cross-session ReScan, pure-delta, keyless |
 | L2 | `pgbench` (`test/bench/`) | manual | no | High-concurrency stress and reproducible performance baselines |
 
@@ -34,11 +34,13 @@ Each file is standalone-idempotent: it starts with
 | `overlay_branch_view_unify` | Read/write view unification: self-join with two BranchScan instances, same-CSS rescan |
 | `overlay_branch_scan_pk` | BranchScan P0/P1/P2 core paths: PK fast path, RETURNING, non-PK qual pushdown |
 | `overlay_branch_scan_type` | PK type diversity (SMALLINT/BIGINT/NUMERIC/BPCHAR/VARCHAR/TIMESTAMPTZ/TEXT/UUID) and PK edge cases |
+| `overlay_branch_identity` | `GENERATED ... AS IDENTITY` columns across the lifecycle and apply (batch + per-row replay) |
 | `overlay_branch_pushdown` | Non-PK qual pushdown and Pass 2 orphan emission |
 | `overlay_branch_planner_cost` | CustomScan cost model is non-zero and derives from the O(M log M + N log M) merge |
 | `overlay_branch_puredelta` | Pure-delta UPDATE/DELETE MAIN-miss chains (I→U, I→D, apply/discard) |
 | `overlay_branch_puredelta_mix` | Pure-delta mixed DML lifecycle, rebirth chains, BPCHAR/NUMERIC typmod PK |
 | `overlay_branch_upsert` | Pure-delta UPSERT 2-phase conflict detection and the 4-way promotion matrix |
+| `overlay_branch_upsert_arbiter` | UPSERT arbiter selection (named constraint / inference / partial index) |
 | `overlay_branch_acc1` | DML-target BranchScan (ACC-1): overlay pre-image for chained in-branch DML |
 | `overlay_branch_execcontext` | Per-statement branch identity (`BranchExecContext`) A1/A6 |
 | `overlay_branch_plancache` | WR-1a parameterized prepared-plan cache produces identical delta bytes |
