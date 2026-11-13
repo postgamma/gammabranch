@@ -46,6 +46,7 @@
 #include "utils/jsonb.h"
 #include "utils/lsyscache.h"
 #include "utils/memutils.h"
+#include "utils/multirangetypes.h"
 #include "utils/rangetypes.h"
 #include "utils/rel.h"
 #include "utils/snapmgr.h"
@@ -1570,6 +1571,13 @@ ob_identity_type_is_guc_sensitive(Oid typid)
 	if (get_typtype(typid) == TYPTYPE_RANGE)
 		return ob_identity_type_is_guc_sensitive(get_range_subtype(typid));
 
+	/* A multirange renders each element range through its subtype's output
+	 * function, so a tsmultirange / tstzmultirange / datemultirange key
+	 * must pin DateStyle / TimeZone exactly like its member subtype. */
+	if (get_typtype(typid) == TYPTYPE_MULTIRANGE)
+		return ob_identity_type_is_guc_sensitive(
+												get_range_subtype(get_multirange_range(typid)));
+
 	switch (typid)
 	{
 		case TIMESTAMPTZOID:
@@ -1622,6 +1630,13 @@ ob_payload_type_roundtrip_unsafe(Oid typid)
 	if (get_typtype(typid) == TYPTYPE_RANGE)
 		return ob_payload_type_roundtrip_unsafe(get_range_subtype(typid));
 
+	/* A multirange renders through its member ranges' subtypes, so
+	 * tsmultirange / tstzmultirange / datemultirange inherit the same
+	 * dependency — recurse through the member range's subtype. */
+	if (get_typtype(typid) == TYPTYPE_MULTIRANGE)
+		return ob_payload_type_roundtrip_unsafe(
+												get_range_subtype(get_multirange_range(typid)));
+
 	switch (typid)
 	{
 		case TIMESTAMPOID:
@@ -1667,6 +1682,10 @@ ob_type_needs_lc_monetary_pin(Oid typid)
 
 	if (get_typtype(typid) == TYPTYPE_RANGE)
 		return ob_type_needs_lc_monetary_pin(get_range_subtype(typid));
+
+	if (get_typtype(typid) == TYPTYPE_MULTIRANGE)
+		return ob_type_needs_lc_monetary_pin(
+											get_range_subtype(get_multirange_range(typid)));
 
 	return typid == MONEYOID;
 }
@@ -1945,6 +1964,75 @@ ob_canonicalize_range(Datum val)
 }
 
 /*
+ * ob_identity_multirange_needs_fold
+ *
+ *	True when `typid` (any type) is a multirange whose ELEMENT ranges carry
+ *	a subtype that itself needs a value fold, e.g. nummultirange.  A
+ *	multirange renders each element range through range_out, and
+ *	multirange_eq compares element ranges with range_eq (bound-wise, through
+ *	the subtype's '='), so the same split the scalar range path closes one
+ *	level down reappears here: '{[1.0,2.0)}' and '{[1,2)}' are '='-equal yet
+ *	print differently.  A multirange over an already-canonical subtype
+ *	(int4multirange, tsmultirange, …) is left alone.
+ */
+static bool
+ob_identity_multirange_needs_fold(Oid typid)
+{
+	typid = getBaseType(typid);
+	if (get_typtype(typid) != TYPTYPE_MULTIRANGE)
+		return false;
+	return ob_identity_range_needs_fold(get_multirange_range(typid));
+}
+
+/*
+ * ob_canonicalize_multirange
+ *
+ *	Rebuild a multirange from its element ranges, each rebuilt with folded
+ *	bounds by ob_canonicalize_range, so two '='-equal multiranges render to
+ *	one identity text.  The element ranges are already sorted and
+ *	non-overlapping (a multirange is normalized on construction);
+ *	folding scale / span / signed zero preserves their numeric values, so
+ *	the order and adjacency are unchanged and make_multirange stores them
+ *	verbatim.  Always returns a freshly palloc'd multirange (never the
+ *	input), so the caller can pfree it unconditionally.  The caller must
+ *	first confirm the element range actually needs folding
+ *	(ob_identity_multirange_needs_fold).
+ */
+static Datum
+ob_canonicalize_multirange(Datum val)
+{
+	MultirangeType *mr = DatumGetMultirangeTypeP(val);
+	Oid			mrtypid = MultirangeTypeGetOid(mr);
+	Oid			rngtypid = get_multirange_range(mrtypid);
+	TypeCacheEntry *typcache;
+	int32		count;
+	RangeType **ranges;
+	RangeType **newranges;
+	MultirangeType *res;
+	int32		i;
+
+	typcache = lookup_type_cache(rngtypid, TYPECACHE_RANGE_INFO);
+	multirange_deserialize(typcache, mr, &count, &ranges);
+
+	newranges = (RangeType **) palloc(sizeof(RangeType *) * count);
+	for (i = 0; i < count; i++)
+		newranges[i] = DatumGetRangeTypeP(
+			ob_canonicalize_range(RangeTypePGetDatum(ranges[i])));
+
+	res = make_multirange(mrtypid, typcache, count, newranges);
+
+	for (i = 0; i < count; i++)
+	{
+		pfree(newranges[i]);
+		pfree(ranges[i]);
+	}
+	pfree(newranges);
+	pfree(ranges);
+
+	return MultirangeTypePGetDatum(res);
+}
+
+/*
  * ob_identity_array_elem_normalizable
  *
  *	If `typid` (already a base type) is an array whose ELEMENT type needs a
@@ -1958,10 +2046,19 @@ ob_canonicalize_range(Datum val)
  *	numeric_trim_scale / the float signed-zero fold.  The element types that
  *	need it are the scalar ones that are not already canonical (NUMERIC /
  *	FLOAT4 / FLOAT8 / INTERVAL), jsonb (number dscale), and, one level down,
- *	a range over such a subtype (numrange, a range over interval), whose
- *	bounds array_out prints through the subtype's output fn.  bpchar is
- *	excluded because array_out never r-trims elements, so both producers
- *	render the padded element identically already.
+ *	a range over such a subtype (numrange, a range over interval) or a
+ *	multirange over such a range (nummultirange), whose bounds / element
+ *	ranges array_out prints through the subtype's output fn.
+ *
+ *	bpchar is included: array_out renders each element through bpcharout,
+ *	which preserves trailing blanks, so ARRAY['a'] and ARRAY['a '] on an
+ *	UNBOUNDED bpchar[] key are '='-equal (bpchareq ignores trailing blanks)
+ *	yet print "{a}" and "{\"a \"}".  array_out does NOT r-trim elements, so
+ *	the elements must be folded here, exactly as the scalar path r-trims via
+ *	the bpchar->text cast.  (A char(N)[] column pads every element to N, so
+ *	two '='-equal values already share one binary form; the fold is a no-op
+ *	there but must still run so the key stays consistent with the scalar
+ *	path's r-trimmed rendering.)
  */
 static Oid
 ob_identity_array_elem_normalizable(Oid typid)
@@ -1974,13 +2071,39 @@ ob_identity_array_elem_normalizable(Oid typid)
 
 	elem = getBaseType(elem);
 	if (elem == NUMERICOID || elem == FLOAT8OID || elem == FLOAT4OID ||
-		elem == INTERVALOID || elem == JSONBOID)
+		elem == INTERVALOID || elem == JSONBOID || elem == BPCHAROID)
 		return elem;
 
-	/* An array of a not-yet-canonical range: fold each element's bounds. */
-	if (ob_identity_range_needs_fold(elem))
+	/* An array of a not-yet-canonical range or multirange: fold elements. */
+	if (ob_identity_range_needs_fold(elem) ||
+		ob_identity_multirange_needs_fold(elem))
 		return elem;
 	return InvalidOid;
+}
+
+/*
+ * ob_trim_bpchar_elem
+ *
+ *	Return a fresh varlena equal to `d` with trailing blanks stripped.  Used
+ *	to fold a bpchar array element the way the scalar pk path r-trims a bare
+ *	bpchar via the bpchar->text cast.  bpchar shares text's varlena layout,
+ *	so the trimmed bytes are a valid bpchar element datum.
+ */
+static Datum
+ob_trim_bpchar_elem(Datum d)
+{
+	struct varlena *v = PG_DETOAST_DATUM_PACKED(d);
+	char	   *s = VARDATA_ANY(v);
+	int			len = (int) VARSIZE_ANY_EXHDR(v);
+	text	   *t;
+
+	while (len > 0 && s[len - 1] == ' ')
+		len--;
+
+	t = cstring_to_text_with_len(s, len);
+	if ((Pointer) v != DatumGetPointer(d))
+		pfree(v);
+	return PointerGetDatum(t);
 }
 
 /*
@@ -1988,11 +2111,12 @@ ob_identity_array_elem_normalizable(Oid typid)
  *
  *	Rebuild an array value with each element canonicalized the same way the
  *	scalar identity path canonicalizes a bare element (NUMERIC scale fold,
- *	float8/float4 signed-zero collapse, INTERVAL month/day fold).  The
- *	array's dimensionality and lower bounds are preserved: array_eq treats a
- *	different shape or lower bound as a DIFFERENT value, so collapsing them
- *	would invent a false 23505.  `elem_norm` is the base element type
- *	returned by ob_identity_array_elem_normalizable.
+ *	float8/float4 signed-zero collapse, INTERVAL month/day fold, bpchar
+ *	r-trim, RANGE / MULTIRANGE bound fold).  The array's dimensionality and
+ *	lower bounds are preserved: array_eq treats a different shape or lower
+ *	bound as a DIFFERENT value, so collapsing them would invent a false
+ *	23505.  `elem_norm` is the base element type returned by
+ *	ob_identity_array_elem_normalizable.
  */
 static Datum
 ob_normalize_pk_array(Datum arrval, Oid elem_norm)
@@ -2032,8 +2156,12 @@ ob_normalize_pk_array(Datum arrval, Oid elem_norm)
 			newelems[i] = Float4GetDatum((float4) 0.0);
 		else if (elem_norm == JSONBOID)
 			newelems[i] = ob_canonicalize_jsonb(elems[i]);
+		else if (elem_norm == BPCHAROID)
+			newelems[i] = ob_trim_bpchar_elem(elems[i]);
 		else if (ob_identity_range_needs_fold(elem_norm))
 			newelems[i] = ob_canonicalize_range(elems[i]);
+		else if (ob_identity_multirange_needs_fold(elem_norm))
+			newelems[i] = ob_canonicalize_multirange(elems[i]);
 		else
 			newelems[i] = elems[i];
 	}
@@ -2045,10 +2173,12 @@ ob_normalize_pk_array(Datum arrval, Oid elem_norm)
 												elmlen, elmbyval, elmalign));
 
 	/* construct_md_array deep-copies every element, so the freshly
-	 * allocated NUMERIC / INTERVAL / JSONB / RANGE results and all scratch
-	 * can be freed. */
+	 * allocated NUMERIC / INTERVAL / JSONB / BPCHAR / RANGE / MULTIRANGE
+	 * results and all scratch can be freed. */
 	if (elem_norm == NUMERICOID || elem_norm == INTERVALOID ||
-		elem_norm == JSONBOID || ob_identity_range_needs_fold(elem_norm))
+		elem_norm == JSONBOID || elem_norm == BPCHAROID ||
+		ob_identity_range_needs_fold(elem_norm) ||
+		ob_identity_multirange_needs_fold(elem_norm))
 	{
 		for (i = 0; i < nelems; i++)
 		{
@@ -2186,6 +2316,15 @@ ob_serialize_pk_body(Relation rel, TupleTableSlot *slot, ObPkRelMeta *pm)
 				 * so fold each finite bound so '='-equal ranges share one
 				 * identity key. */
 				outval = ob_canonicalize_range(val);
+				have_trimmed = true;
+			}
+			else if (ob_identity_multirange_needs_fold(typid))
+			{
+				/* A multirange over such a subtype (nummultirange): each
+				 * element range renders through the subtype's output fn and
+				 * is '='-compared bound-wise, so fold every element range.
+				 */
+				outval = ob_canonicalize_multirange(val);
 				have_trimmed = true;
 			}
 
@@ -3098,6 +3237,7 @@ typedef enum ObPkFoldKind
 {
 	OB_PKFOLD_INTERVAL = 0,
 	OB_PKFOLD_RANGE,
+	OB_PKFOLD_MULTIRANGE,
 	OB_PKFOLD_JSONB
 } ObPkFoldKind;
 
@@ -3108,9 +3248,11 @@ typedef enum ObPkFoldKind
  *	C-level fold its output function cannot do: INTERVAL (interval_out prints
  *	'='-equal spans differently, see ob_canonicalize_interval), a RANGE over
  *	a not-yet-canonical subtype (each bound prints through the subtype's
- *	output fn, see ob_canonicalize_range), and JSONB (jsonb_out preserves each
- *	number's dscale, see ob_canonicalize_jsonb).  Coerce the literal onto the
- *	real PK type with SPI, fold the resulting Datum in C and render it here --
+ *	output fn, see ob_canonicalize_range), a MULTIRANGE over such a range
+ *	(each element range prints through range_out, see
+ *	ob_canonicalize_multirange), and JSONB (jsonb_out preserves each number's
+ *	dscale, see ob_canonicalize_jsonb).  Coerce the literal onto the real PK
+ *	type with SPI, fold the resulting Datum in C and render it here --
  *	byte-identical to the WRITE side.  The JSON wrapper is built with
  *	escape_json() so it matches the scalar to_jsonb() path.
  */
@@ -3155,7 +3297,8 @@ ob_serialize_pk_single_fold_body(Oid pk_typid, Form_pg_attribute pkatt,
 				(errcode(ERRCODE_INTERNAL_ERROR),
 				 errmsg("overlay_serialize_pk_from_single_datum: SPI %s coercion failed (ret=%d rows=%lu)",
 						fold_kind == OB_PKFOLD_RANGE ? "range" :
-						(fold_kind == OB_PKFOLD_JSONB ? "jsonb" : "interval"),
+						(fold_kind == OB_PKFOLD_MULTIRANGE ? "multirange" :
+						 (fold_kind == OB_PKFOLD_JSONB ? "jsonb" : "interval")),
 						ret, (unsigned long) SPI_processed)));
 	}
 
@@ -3182,6 +3325,8 @@ ob_serialize_pk_single_fold_body(Oid pk_typid, Form_pg_attribute pkatt,
 			 * points into SPI's memory context. */
 			if (fold_kind == OB_PKFOLD_RANGE)
 				normval = ob_canonicalize_range(foldval);
+			else if (fold_kind == OB_PKFOLD_MULTIRANGE)
+				normval = ob_canonicalize_multirange(foldval);
 			else if (fold_kind == OB_PKFOLD_JSONB)
 				normval = ob_canonicalize_jsonb(foldval);
 			else
@@ -3292,6 +3437,13 @@ ob_serialize_pk_single_datum_body(Relation rel,
 		return ob_serialize_pk_single_fold_body(pk_typid, pkatt, pk_val,
 												pk_isnull, consttype,
 												OB_PKFOLD_RANGE);
+
+	/* MULTIRANGE over such a subtype (nummultirange): every element range
+	 * needs the same fold. */
+	if (ob_identity_multirange_needs_fold(base_typid))
+		return ob_serialize_pk_single_fold_body(pk_typid, pkatt, pk_val,
+												pk_isnull, consttype,
+												OB_PKFOLD_MULTIRANGE);
 
 	initStringInfo(&arr_sql);
 	appendStringInfoString(&arr_sql, "SELECT to_jsonb(ARRAY[");

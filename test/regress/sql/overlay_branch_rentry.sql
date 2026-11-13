@@ -2578,12 +2578,13 @@ RESET client_min_messages;
 -- Section R28 : ARRAY PKs of a canonicalizable element type.
 --
 --   array_eq compares element-wise, so ARRAY[1.0] and ARRAY[1.00] on a
---   NUMERIC[] key (and ARRAY[-0.0] / ARRAY[0.0] on a FLOAT8[] key) are
---   '='-equal, yet array_out prints "{1.00}"/"{1.0}" and "{-0}"/"{0}".  The
---   scalar identity path folds numeric scale and float signed-zero; the
---   array path must apply the SAME fold element-wise, or the two spellings
---   land on two identity keys and a duplicate branch INSERT silently
---   succeeds.  The rebuild keeps dimensionality and lower bounds:
+--   NUMERIC[] key (ARRAY[-0.0] / ARRAY[0.0] on a FLOAT8[] key, and
+--   ARRAY['a'] / ARRAY['a '] on a BPCHAR[] key) are '='-equal, yet array_out
+--   prints "{1.00}"/"{1.0}", "{-}"/"{0}", and "{a}"/"{"a "}".  The scalar
+--   identity path folds numeric scale, float signed-zero, and bpchar trailing
+--   blanks; the array path must apply the SAME fold element-wise, or the two
+--   spellings land on two identity keys and a duplicate branch INSERT
+--   silently succeeds.  The rebuild keeps dimensionality and lower bounds:
 --   array_eq treats a different shape/bound as a DIFFERENT value, so
 --   flattening them would instead invent a false 23505.
 --
@@ -2593,10 +2594,12 @@ RESET client_min_messages;
 --   R28_C : different shape / lower bound -> distinct; exact dup  -> 23505
 --   R28_D : const probe ARRAY[1.0] matches the normalized stored key
 --   R28_E : MAIN pristine; apply materializes the canonical rows
+--   R28_F : bpchar[] PK, ARRAY['a'] vs ARRAY['a ']                -> 23505
 -- =====================================================================
 SET client_min_messages = WARNING;
 CREATE TABLE public.t_r28a (k float8[] PRIMARY KEY, v text);
 CREATE TABLE public.t_r28b (k numeric[] PRIMARY KEY, v text);
+CREATE TABLE public.t_r28c (k bpchar[] PRIMARY KEY, v text);
 SELECT overlay_branch.create_branch('br_r28');
 SELECT overlay_branch.use_branch('br_r28');
 
@@ -2665,6 +2668,33 @@ SELECT CASE WHEN count(*) = 1 AND min(v) = 'z'
             ELSE 'FAIL:R28_D rows=' || count(*) || ' v=' || min(v) END AS r28_d
   FROM public.t_r28b WHERE k = ARRAY[1.00::numeric];
 
+-- R28_F: bpchar[] PK — array_eq ignores each element's trailing blanks while
+--        array_out keeps them, so ARRAY['a'] and ARRAY['a '] are '='-equal
+--        -> one key.  A genuinely different value stays distinct, and a const
+--        probe with a differently-padded array matches the normalized key.
+INSERT INTO public.t_r28c VALUES (ARRAY['a'::bpchar], 'p');
+DO $$
+BEGIN
+    BEGIN
+        INSERT INTO public.t_r28c VALUES (ARRAY['a '::bpchar], 'p2');
+        RAISE EXCEPTION 'FAIL_R28_F_NO_ERROR';
+    EXCEPTION WHEN OTHERS THEN
+        IF SQLSTATE <> '23505' THEN
+            RAISE EXCEPTION 'FAIL_R28_F: expected 23505 got %: %', SQLSTATE, SQLERRM;
+        END IF;
+    END;
+END $$;
+INSERT INTO public.t_r28c VALUES (ARRAY['aa'::bpchar], 'q');
+UPDATE public.t_r28c SET v = 'z' WHERE k = ARRAY['a '::bpchar];
+SELECT CASE WHEN count(*) = 2
+            THEN 'PASS:R28_F_BPCHAR_ARRAY_RTRIM_23505'
+            ELSE 'FAIL:R28_F rows=' || count(*) END AS r28_f
+  FROM public.t_r28c;
+SELECT CASE WHEN count(*) = 1 AND min(v) = 'z'
+            THEN 'PASS:R28_F_BPCHAR_CONST_PROBE_MATCHES'
+            ELSE 'FAIL:R28_F_PROBE rows=' || count(*) || ' v=' || min(v) END AS r28_f2
+  FROM public.t_r28c WHERE k = ARRAY['a '::bpchar];
+
 -- R28_E: MAIN pristine until apply; apply materializes the canonical rows.
 SELECT overlay_branch.use_branch(NULL);
 RESET overlay_branch.current;
@@ -2672,15 +2702,23 @@ SET overlay_branch.current = '';
 SELECT CASE WHEN count(*) = 0 THEN 'PASS:R28_E_MAIN_PRISTINE'
             ELSE 'FAIL:R28_E rows=' || count(*) END AS r28_e
   FROM public.t_r28a;
+SELECT CASE WHEN count(*) = 0 THEN 'PASS:R28_E_BPCHAR_MAIN_PRISTINE'
+            ELSE 'FAIL:R28_E_BPCHAR rows=' || count(*) END AS r28_e3
+  FROM public.t_r28c;
 SELECT overlay_branch.apply_branch('br_r28');
 SELECT CASE WHEN count(*) = 1 AND min(v) = 'neg'
             THEN 'PASS:R28_E_APPLY_MATERIALIZED'
             ELSE 'FAIL:R28_E rows=' || count(*) END AS r28_e2
   FROM public.t_r28a;
+SELECT CASE WHEN count(*) = 2 AND min(v) = 'q'
+            THEN 'PASS:R28_E_BPCHAR_APPLY_MATERIALIZED'
+            ELSE 'FAIL:R28_E_BPCHAR rows=' || count(*) || ' v=' || min(v) END AS r28_e4
+  FROM public.t_r28c;
 
 -- R28 teardown (branch left in the terminal 'applied' state).
 DROP TABLE public.t_r28a;
 DROP TABLE public.t_r28b;
+DROP TABLE public.t_r28c;
 RESET client_min_messages;
 
 -- =====================================================================
@@ -2832,6 +2870,10 @@ RESET client_min_messages;
 --   R30_D : numrange[] PK element fold -> 23505; a distinct value stays
 --   R30_E : tsrange (DateStyle) / tstzrange (TimeZone) / daterange
 --           (DateStyle) -- same value under another GUC -> 23505
+--   R30_G : nummultirange PK fold -> 23505; a distinct value stays; const
+--           probe with the folded spelling reaches the stored key
+--   R30_H : nummultirange[] PK element fold -> 23505
+--   R30_I : tsmultirange (DateStyle) -- same value under another GUC -> 23505
 --   R30_F : MAIN pristine; apply materializes the folded rows
 -- =====================================================================
 SET client_min_messages = WARNING;
@@ -2840,6 +2882,9 @@ CREATE TABLE public.t_r30b (k numrange[] PRIMARY KEY, v text);
 CREATE TABLE public.t_r30t (k tsrange PRIMARY KEY, v text);
 CREATE TABLE public.t_r30z (k tstzrange PRIMARY KEY, v text);
 CREATE TABLE public.t_r30d (k daterange PRIMARY KEY, v text);
+CREATE TABLE public.t_r30m (k nummultirange PRIMARY KEY, v text);
+CREATE TABLE public.t_r30mb (k nummultirange[] PRIMARY KEY, v text);
+CREATE TABLE public.t_r30tm (k tsmultirange PRIMARY KEY, v text);
 SELECT overlay_branch.create_branch('br_r30');
 SELECT overlay_branch.use_branch('br_r30');
 
@@ -2953,6 +2998,71 @@ SELECT CASE WHEN count(*) = 1 THEN 'PASS:R30_E_DATERANGE_DATESTYLE_23505'
             ELSE 'FAIL:R30_E_DR rows=' || count(*) END AS r30_e3
   FROM public.t_r30d;
 
+-- R30_G: a multirange renders each element range through range_out, and
+--        multirange_eq compares element ranges bound-wise, so '{[1.0,2.0)}'
+--        and '{[1,2)}' are '='-equal yet print differently.  A distinct value
+--        must stay distinct and a folded-spelling const probe must match.
+INSERT INTO public.t_r30m VALUES ('{[1.0,2.0)}'::nummultirange, 'a');
+DO $$
+BEGIN
+    BEGIN
+        INSERT INTO public.t_r30m VALUES ('{[1,2)}'::nummultirange, 'b');
+        RAISE EXCEPTION 'FAIL_R30_G_NO_ERROR';
+    EXCEPTION WHEN OTHERS THEN
+        IF SQLSTATE <> '23505' THEN
+            RAISE EXCEPTION 'FAIL_R30_G: expected 23505 got %: %', SQLSTATE, SQLERRM;
+        END IF;
+    END;
+END $$;
+INSERT INTO public.t_r30m VALUES ('{[5,6)}'::nummultirange, 'c');
+UPDATE public.t_r30m SET v = 'z' WHERE k = '{[1,2)}'::nummultirange;
+SELECT CASE WHEN count(*) = 2 THEN 'PASS:R30_G_NUMMULTIRANGE_IDENTITY_23505'
+            ELSE 'FAIL:R30_G rows=' || count(*) END AS r30_g
+  FROM public.t_r30m;
+SELECT CASE WHEN count(*) = 1 AND min(v) = 'z'
+            THEN 'PASS:R30_G_CONST_PROBE_MATCHES'
+            ELSE 'FAIL:R30_G_PROBE rows=' || count(*) || ' v=' || min(v) END AS r30_g2
+  FROM public.t_r30m WHERE k = '{[1.0,2.0)}'::nummultirange;
+
+-- R30_H: nummultirange[] PK folds element-wise; a distinct value stays distinct.
+INSERT INTO public.t_r30mb VALUES (ARRAY['{[1.0,2.0)}'::nummultirange], 'a');
+DO $$
+BEGIN
+    BEGIN
+        INSERT INTO public.t_r30mb VALUES (ARRAY['{[1,2)}'::nummultirange], 'b');
+        RAISE EXCEPTION 'FAIL_R30_H_NO_ERROR';
+    EXCEPTION WHEN OTHERS THEN
+        IF SQLSTATE <> '23505' THEN
+            RAISE EXCEPTION 'FAIL_R30_H: expected 23505 got %: %', SQLSTATE, SQLERRM;
+        END IF;
+    END;
+END $$;
+INSERT INTO public.t_r30mb VALUES (ARRAY['{[5,6)}'::nummultirange], 'c');
+SELECT CASE WHEN count(*) = 2 THEN 'PASS:R30_H_ARRAY_FOLD_DISTINCT'
+            ELSE 'FAIL:R30_H rows=' || count(*) END AS r30_h
+  FROM public.t_r30mb;
+
+-- R30_I: a multirange over a GUC-sensitive subtype must serialize canonically,
+--        so the SAME value written under another DateStyle collides.
+SET DateStyle = 'ISO, MDY';
+INSERT INTO public.t_r30tm VALUES ('{[2020-01-01 00:00:00,2020-01-02 00:00:00)}'::tsmultirange, 'iso');
+SET DateStyle = 'SQL, DMY';
+DO $$
+BEGIN
+    BEGIN
+        INSERT INTO public.t_r30tm VALUES ('{[2020-01-01 00:00:00,2020-01-02 00:00:00)}'::tsmultirange, 'sql');
+        RAISE EXCEPTION 'FAIL_R30_I_NO_ERROR';
+    EXCEPTION WHEN OTHERS THEN
+        IF SQLSTATE <> '23505' THEN
+            RAISE EXCEPTION 'FAIL_R30_I: expected 23505 got %: %', SQLSTATE, SQLERRM;
+        END IF;
+    END;
+END $$;
+RESET DateStyle;
+SELECT CASE WHEN count(*) = 1 THEN 'PASS:R30_I_TSMULTIRANGE_DATESTYLE_23505'
+            ELSE 'FAIL:R30_I rows=' || count(*) END AS r30_i
+  FROM public.t_r30tm;
+
 -- R30_F: MAIN pristine until apply; apply materializes the folded rows.
 SELECT overlay_branch.use_branch(NULL);
 RESET overlay_branch.current;
@@ -2960,10 +3070,20 @@ SET overlay_branch.current = '';
 SELECT CASE WHEN count(*) = 0 THEN 'PASS:R30_F_MAIN_PRISTINE'
             ELSE 'FAIL:R30_F rows=' || count(*) END AS r30_f
   FROM public.t_r30a;
+SELECT CASE WHEN count(*) = 0 THEN 'PASS:R30_F_MULTIRANGE_MAIN_PRISTINE'
+            ELSE 'FAIL:R30_F_MR rows=' || count(*) END AS r30_f3
+  FROM public.t_r30m;
 SELECT overlay_branch.apply_branch('br_r30');
 SELECT CASE WHEN count(*) = 4 THEN 'PASS:R30_F_APPLY_MATERIALIZED'
             ELSE 'FAIL:R30_F rows=' || count(*) END AS r30_f2
   FROM public.t_r30a;
+SELECT CASE WHEN count(*) = 2 THEN 'PASS:R30_F_MULTIRANGE_APPLY_MATERIALIZED'
+            ELSE 'FAIL:R30_F_MR rows=' || count(*) END AS r30_f4
+  FROM public.t_r30m;
+SELECT CASE WHEN count(*) = 1 AND min(v) = 'z'
+            THEN 'PASS:R30_F_MULTIRANGE_APPLY_UPDATED'
+            ELSE 'FAIL:R30_F_MR_UPD rows=' || count(*) || ' v=' || min(v) END AS r30_f5
+  FROM public.t_r30m WHERE k = '{[1,2)}'::nummultirange;
 
 -- R30 teardown (branch left in the terminal 'applied' state).
 DROP TABLE public.t_r30a;
@@ -2971,6 +3091,9 @@ DROP TABLE public.t_r30b;
 DROP TABLE public.t_r30t;
 DROP TABLE public.t_r30z;
 DROP TABLE public.t_r30d;
+DROP TABLE public.t_r30m;
+DROP TABLE public.t_r30mb;
+DROP TABLE public.t_r30tm;
 RESET client_min_messages;
 
 -- =====================================================================

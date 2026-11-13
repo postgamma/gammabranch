@@ -1442,8 +1442,10 @@ DETAIL:  Key (k)=(1.0) already exists in branch delta (R21 pre-check).
 
 An **array** key column folds element-by-element the same way: `numeric[]` and
 `float8[]` keys are compared element-wise, so `ARRAY[1.0]` / `ARRAY[1.00]` and
-`ARRAY[-0.0]` / `ARRAY[0.0]` are one value and collide. Arrays that differ in
-shape or lower bound are different values and stay distinct.
+`ARRAY[-0.0]` / `ARRAY[0.0]` are one value and collide. A `bpchar[]` key folds
+too — `array_eq` ignores each element's trailing blanks while `array_out` keeps
+them, so `ARRAY['a']` / `ARRAY['a ']` are one value and collide. Arrays that
+differ in shape or lower bound are different values and stay distinct.
 
 ```sql
 CREATE TABLE bs_guc_arr(k numeric[] PRIMARY KEY, v text);
@@ -1485,6 +1487,23 @@ INSERT INTO bs_guc_rng VALUES ('[1.0,2.0)'::numrange, 'a');
 INSERT INTO bs_guc_rng VALUES ('[1,2)'::numrange, 'b');
 ERROR:  duplicate key value violates unique constraint on relation "bs_guc_rng"
 DETAIL:  Key (k)=([1,2)) already exists in branch delta (R21 pre-check).
+```
+
+A **multirange** key folds through its element ranges the same way: a multirange
+renders each element range through `range_out` and compares them bound-wise, so
+`'{[1.0,2.0)}'` and `'{[1,2)}'` are one `nummultirange` value and collide. The
+fold is element-wise for an array of multiranges, and a multirange over a
+`DateStyle` / `TimeZone`-sensitive subtype (`datemultirange`, `tsmultirange`,
+`tstzmultirange`) renders canonically regardless of the session.
+
+```sql
+CREATE TABLE bs_guc_mrng(k nummultirange PRIMARY KEY, v text);
+SELECT create_branch('bs_guc_mrng');
+SELECT use_branch('bs_guc_mrng');
+INSERT INTO bs_guc_mrng VALUES ('{[1.0,2.0)}'::nummultirange, 'a');
+INSERT INTO bs_guc_mrng VALUES ('{[1,2)}'::nummultirange, 'b');
+ERROR:  duplicate key value violates unique constraint on relation "bs_guc_mrng"
+DETAIL:  Key (k)=({[1,2)}) already exists in branch delta (R21 pre-check).
 ```
 
 A **`money`** column is canonical too, and it is unique among these types in that

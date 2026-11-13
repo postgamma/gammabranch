@@ -243,8 +243,13 @@ rendering. The rebuild is structure-preserving — same dimensionality and lower
 bounds — because `array_eq` treats a different shape or bound as a *different*
 value: flattening the array (e.g. through `unnest`) to normalize it would
 instead collapse two genuinely distinct keys and invent a false `23505`. A
-bpchar array needs no fold — `array_out` never r-trims elements, so both
-producers already render the padded element identically.
+`bpchar[]` key folds too: `array_eq` compares elements with `bpchareq`, which
+ignores trailing blanks, while `array_out` renders each element through
+`bpcharout`, which preserves them — so `ARRAY['a']` and `ARRAY['a ']` on an
+unbounded `bpchar[]` are `=`-equal yet print `{a}` and `{"a "}`. Each element is
+r-trimmed exactly as the scalar path r-trims a bare `bpchar` through its
+`->text` cast. (A `char(N)[]` column pads every element to `N`, so the fold is a
+no-op there, but it still runs so the key stays identical to the scalar path's.)
 
 **Interval keys fold to one span.** `interval` equality is the microsecond span
 `month × 30 days + day × 24 hours + time`, so `'1 mon'` = `'30 days'` and
@@ -266,6 +271,19 @@ folds a bare value (NUMERIC scale, INTERVAL span, float signed zero) and
 re-serializes it, preserving the bounds' inclusivity and infinities. Discrete
 ranges (`int4range` / `int8range` / `daterange`) are already canonicalized on
 input and fold to themselves; the fold is element-wise for an array of ranges.
+
+**Multirange keys fold their element ranges.** A multirange renders each element
+range through `range_out` and `multirange_eq` compares element ranges with
+`range_eq` (bound-wise, through the subtype's `=`), so the range split reappears
+one level down: a `nummultirange` PK holds `'{[1.0,2.0)}'` and `'{[1,2)}'` as one
+`=`-equal value that prints two ways. The serializer deserializes the multirange,
+rebuilds every element range through the range fold above and re-serializes it;
+the elements are already sorted and non-overlapping, and folding scale / span /
+signed zero preserves their numeric values, so the order and adjacency are
+unchanged. Discrete multiranges (`int4multirange`) and the non-numeric ones fold
+to themselves; the fold is element-wise for an array of multiranges, and the
+GUC-sensitivity / payload-round-trip / `lc_monetary` recursions below all descend
+through a multirange into its member subtype exactly as they do through a range.
 
 **jsonb keys fold their numerics.** `jsonb` equality compares containers
 recursively and compares numbers with `numeric_eq`, so `'{"a":1.0}'` =
@@ -299,7 +317,10 @@ The payload pin covers the types whose text is not self-describing —
 the instant's zone, but `DateStyle` still reorders the date fields, so
 `2024-06-01 …` written under `SQL, DMY` as `01/06/2024 …` reads back as 6
 January under `ISO, MDY`. `timetz` (no date field) and `bytea` (two
-mutually-accepted spellings) do round-trip, so they skip the pin. GUC-insensitive
+mutually-accepted spellings) do round-trip, so they skip the pin. A range or
+multirange over one of these subtypes inherits its dependency: the recursion
+descends through the range / multirange into the member subtype, so a `tsrange` /
+`tsmultirange` key is pinned exactly like a bare `timestamp`. GUC-insensitive
 types (int, text, uuid, …) skip it too; the pin is paid only by a table that
 actually carries one of the listed columns.
 
