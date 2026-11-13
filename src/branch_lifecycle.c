@@ -159,14 +159,22 @@ ob_acl_check_lifecycle(ObLifecycleOp op, const char *branch_name)
  * G01 Branch-scope pre-flight (support matrix fail-fast gate).
  *
  * Implementation notes:
- *   - NO WITH-CTEs in SPI queries (we debugged WITH CTE + SPI_execute
- *     readonly=false combinations failing silently — use flat scalar
- *     subqueries against pg_extension/pg_namespace/pg_depend instead).
+ *   - Prefer flat scalar subqueries against pg_extension/pg_namespace/
+ *     pg_depend.  Category 9 uses a WITH RECURSIVE, but it is deliberately
+ *     local (inside an IN() subquery) and uncorrelated -- a correlated or
+ *     top-level WITH CTE combined with SPI_execute(readonly=false) was seen
+ *     failing silently, so keep CTEs self-contained.  Category 9's
+ *     recursive set walks BOTH edges out of citext -- domain over
+ *     (typbasetype) and array-of (typelem, typlen = -1) -- so that
+ *     citext[], a domain over citext, a domain over citext[], and an
+ *     array of such a domain are all caught.  A single recursive term
+ *     with an OR-join (not stacked UNION ALL branches, which PostgreSQL
+ *     rejects as "recursive reference ... in its non-recursive term").
  *   - Extension-owned objects are filtered out using pg_depend
  *     (deptype = 'e', refobjid = overlay_branch.oid), regardless of which
  *     namespace they live in.  This is critical because public.pg_branch
  *     VIEW and 12 public.* synonyms live in schema public.
- *   - 7 categories are ordered by "most user-harmful first" for fail-fast
+ *   - 9 categories are ordered by "most user-harmful first" for fail-fast
  *     first-hit reporting.
  * ================================================================ */
 void
@@ -286,6 +294,54 @@ ob_check_branch_scope(void)
 "                      AND d.deptype = 'e' "
 "                      AND d.classid = 'pg_class'::regclass "
 "                      AND d.objid = c.oid) "
+"  UNION ALL "
+"  SELECT 8, "
+"    'NONDET PK COLLATION: ' || n.nspname || '.' || c.relname || '.' || a.attname "
+"  FROM pg_index i "
+"  JOIN pg_class c ON c.oid = i.indrelid "
+"  JOIN pg_namespace n ON n.oid = c.relnamespace "
+"  JOIN pg_attribute a ON a.attrelid = c.oid AND a.attnum = ANY(i.indkey) "
+"  JOIN pg_collation co ON co.oid = a.attcollation "
+"  WHERE i.indisprimary "
+"    AND NOT co.collisdeterministic "
+"    AND c.relkind = 'r' "
+"    AND a.attnum > 0 "
+"    AND NOT a.attisdropped "
+"    AND n.nspname NOT IN ('pg_catalog','information_schema','pg_toast') "
+"    AND n.oid <> (SELECT n.oid FROM pg_extension e JOIN pg_namespace n ON n.oid = e.extnamespace WHERE e.extname = 'overlay_branch') "
+"    AND NOT EXISTS (SELECT 1 FROM pg_depend d "
+"                    WHERE d.refclassid = 'pg_extension'::regclass "
+"                      AND d.refobjid = (SELECT oid FROM pg_extension WHERE extname='overlay_branch') "
+"                      AND d.deptype = 'e' "
+"                      AND d.classid = 'pg_class'::regclass "
+"                      AND d.objid = c.oid) "
+"  UNION ALL "
+"  SELECT 9, "
+"    'CITEXT PK: ' || n.nspname || '.' || c.relname || '.' || a.attname "
+"  FROM pg_index i "
+"  JOIN pg_class c ON c.oid = i.indrelid "
+"  JOIN pg_namespace n ON n.oid = c.relnamespace "
+"  JOIN pg_attribute a ON a.attrelid = c.oid AND a.attnum = ANY(i.indkey) "
+"  WHERE i.indisprimary "
+"    AND c.relkind = 'r' "
+"    AND a.attnum > 0 "
+"    AND NOT a.attisdropped "
+"    AND a.atttypid IN ( "
+"      WITH RECURSIVE cit(oid) AS ( "
+"        SELECT t.oid FROM pg_type t JOIN pg_extension e ON e.extnamespace = t.typnamespace AND e.extname = 'citext' WHERE t.typname = 'citext' "
+"        UNION ALL "
+"        SELECT ch.oid FROM cit cs JOIN pg_type ch "
+"          ON ch.typbasetype = cs.oid "
+"          OR (ch.typelem = cs.oid AND ch.typlen = -1)) "
+"      SELECT oid FROM cit) "
+"    AND n.nspname NOT IN ('pg_catalog','information_schema','pg_toast') "
+"    AND n.oid <> (SELECT n.oid FROM pg_extension e JOIN pg_namespace n ON n.oid = e.extnamespace WHERE e.extname = 'overlay_branch') "
+"    AND NOT EXISTS (SELECT 1 FROM pg_depend d "
+"                    WHERE d.refclassid = 'pg_extension'::regclass "
+"                      AND d.refobjid = (SELECT oid FROM pg_extension WHERE extname='overlay_branch') "
+"                      AND d.deptype = 'e' "
+"                      AND d.classid = 'pg_class'::regclass "
+"                      AND d.objid = c.oid) "
 "  ORDER BY ord LIMIT 1 "
 ") cat;");
 
@@ -324,7 +380,7 @@ ob_check_branch_scope(void)
 				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
 				 errmsg("overlay branch cannot be created because this database contains at least one table in an unsupported category (G01 support matrix)"),
 				 errdetail("First unsupported relation: %s", detail),
-				 errhint("Remove or rename the relation, or exclude its schema from the overlay scope.  RESTRICTED categories: FKs, user triggers, partitions, table inheritance, UNLOGGED tables, GENERATED STORED columns, VIEWs/MATVIEWs/FDW tables, or any relkind other than ordinary table ('r'), sequence ('S'), or btree index ('i').")));
+				 errhint("Remove or rename the relation, or exclude its schema from the overlay scope.  RESTRICTED categories: FKs, user triggers, partitions, table inheritance, UNLOGGED tables, GENERATED STORED columns, VIEWs/MATVIEWs/FDW tables, any relkind other than ordinary table ('r'), sequence ('S'), or btree index ('i'), and a PRIMARY KEY column whose '=' operator is coarser than its output text -- a non-deterministic (e.g. ICU case-insensitive) collation or a citext (case-insensitive text) column; such equality classes cannot be represented by a text key.")));
 	}
 	pfree(sql.data);
 }

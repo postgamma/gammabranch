@@ -344,7 +344,7 @@ extern void			ob_acl_check_lifecycle(ObLifecycleOp op,
  * pg_catalog, information_schema and the extension schema) and
  * raises 0A000 at the FIRST offending relation.  Supported relkinds
  * are only permanent tables ('r') plus their plain indexes
- * ('i') and sequences ('S'); all else plus 7 categories below are
+ * ('i') and sequences ('S'); all else plus 9 categories below are
  * RESTRICTED.  This avoids silent data corruption when apply-time
  * semantics do not match MAIN-side behaviour (e.g. FKs fire MAIN
  * only, triggers are MAIN-only, partition promotion mixes relids
@@ -358,6 +358,13 @@ extern void			ob_acl_check_lifecycle(ObLifecycleOp op,
  *   (E) Unlogged tables (relpersistence = 'u').
  *   (F) GENERATED STORED columns.
  *   (G) FDW tables / views / matviews / anything not in {'r','S','i'}.
+ *   (H) Non-deterministic (ICU) collation on a PRIMARY KEY column.
+ *   (I) citext on a PRIMARY KEY column (reached through any chain of
+ *       domain (typbasetype) and array-of (typelem) wrappers, e.g.
+ *       citext[], a domain over citext, or an array of such a domain).
+ *
+ * (H)/(I) exist because a text delta key cannot represent an '='
+ * equality class whose members render to different text.
  * ----------
  */
 extern void			ob_check_branch_scope(void);

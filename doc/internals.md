@@ -201,6 +201,34 @@ checks fire — otherwise a `numeric` domain re-splits `1.0` / `1.00` and a
 runs after the peel so an array *of* a domain and a domain *over* an array both
 resolve to the element type.
 
+**A non-deterministic collation is refused on a PK column.** The scheme above
+rests on the *default* deterministic comparison: an `=`-equal pair of values
+renders to one text. A non-deterministic collation — only an ICU provider can
+create one — instead collapses distinct byte strings into one equality class
+(`'foo' = 'FOO'` under a case-insensitive collation), while each spelling still
+renders to its own text. No stable text key can represent such a class, so a PK
+column carrying one would split one logical row across two delta keys, let an
+`=`-equal branch INSERT bypass the native `23505`, and make `apply_branch` fail
+on a duplicate PK. `create_branch` therefore refuses it up front (G01 category
+8, §1.8), before any delta is written. The same collation on a **non-PK** column
+is not an identity column and stays legal.
+
+**`citext` is refused on a PK column for the same reason.** `citext` implements
+case-insensitive equality through its *type operators*, not through a
+non-deterministic collation, so the collation probe above cannot see it — but
+the identity model still breaks: `'foo' = 'FOO'` while `citext_out` prints the
+two spellings differently, so the text delta key splits one logical row and
+`apply_branch` fails on a duplicate PK. `create_branch` refuses it up front (G01
+category 9, §1.8). The guard computes the full set of `citext`-descended type
+OIDs with a recursive fixpoint that walks **both** edges out of `citext`: the
+domain edge (`pg_type.typbasetype`) and the array edge (`pg_type.typelem` with
+`typlen = -1`). A PK on a domain *or nested chain of domains*, on `citext[]`,
+on a domain over `citext[]`, or on an array of a domain over `citext` is
+therefore all refused. The array case matters because `array_eq` compares
+elements with citext's case-insensitive `=`, while `array_out` prints `{foo}`
+and `{FOO}` differently — the same identity split. As above, a **non-PK**
+`citext` column (scalar or array) is not an identity column and stays legal.
+
 **Array keys fold their elements.** An array PK renders through `array_out`,
 which prints each element with the *element* type's output function and joins
 them; `array_eq` likewise compares element-wise. So the normalizations above are
@@ -590,8 +618,17 @@ BPCHAR / NUMERIC / TIMESTAMPTZ stay correct (§2).
 
 ### 1.8 Scope & gating + ACL double-defense
 
-Unsupported objects are rejected at `create_branch` time (0A000/55000):
-partitioned / foreign tables, views, matviews, foreign keys. The
+Unsupported objects are rejected at `create_branch` time (0A000/55000). The G01
+support matrix has nine categories, ordered "most user-harmful first" so the
+first hit is reported: foreign keys; user triggers; partitioned / inherited
+tables; UNLOGGED tables; GENERATED STORED columns; any relkind other than
+ordinary table (`r`) / sequence (`S`) / btree index (`i`) (foreign tables,
+views, matviews, …); a non-deterministic (ICU) collation on a PRIMARY KEY
+column; and a `citext` PRIMARY KEY column (reached through any chain of domain
+(`typbasetype`) and array (`typelem`) wrappers — e.g. `citext[]`, a domain over
+`citext`, a domain over `citext[]`, or an array of such a domain) — both of the
+last two because their equality classes cannot be
+represented by a text delta key (§1.5). The
 guard checks cheapest-first (relkind, `relispartition`, user
 triggers, foreign keys, then no-PK). The per-DML executor guard validates only
 the statement's DML **target** relations (the `ModifyTable` result relations):

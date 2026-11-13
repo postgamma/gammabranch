@@ -24,8 +24,8 @@ jobs:
             | sudo tee /etc/apt/sources.list.d/pgdg.list
           sudo apt-get update
 
-      - name: Install PostgreSQL 17 and server dev headers
-        run: sudo apt-get install -y postgresql-17 postgresql-server-dev-17
+      - name: Install PostgreSQL 17, server dev headers, contrib (citext)
+        run: sudo apt-get install -y postgresql-17 postgresql-server-dev-17 postgresql-contrib-17
 
       - name: Build (PGXS, out-of-tree)
         run: make -j"$(nproc)" USE_PGXS=1 PG_CONFIG=/usr/lib/postgresql/17/bin/pg_config

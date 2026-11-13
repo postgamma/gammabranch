@@ -995,7 +995,7 @@ DROP ROLE IF EXISTS regress_g02_bob;
 /* =====================================================================
  * Section G01: create_branch scope pre-flight guard (FAIL FAST)
  *
- * Overview (10 sub-cases, PASS labels prefix PASS:G01_SCOPE_*):
+ * Overview (16 sub-cases, PASS labels prefix PASS:G01_SCOPE_*):
  *   G01_A clean-schema create OK after cleanup
  *   G01_B FK-pk-side table rejects
  *   G01_C FK-fk-side table rejects
@@ -1006,6 +1006,12 @@ DROP ROLE IF EXISTS regress_g02_bob;
  *   G01_G UNLOGGED permanent table rejects
  *   G01_H GENERATED STORED column rejects
  *   G01_I VIEW / FDW-table (unsupported relkind) rejects
+ *   G01_J non-deterministic (ICU) collation on a PK column rejects,
+ *          while the same collation on a non-PK column stays legal
+ *   G01_K citext (case-insensitive) PK column rejects -- including a
+ *          nested domain chain, a citext[] array, a domain over citext[],
+ *          and an array of a domain over citext -- while a plain citext
+ *          non-PK column (and a citext[] non-PK column) stays legal
  *
  * NOTE: Each sub-case uses DROP ... IF EXISTS / CREATE ... inside its
  * own block, and after assert it DROPs the offending object so the
@@ -1144,6 +1150,116 @@ SELECT 'PASS:G01_SCOPE_I_VIEW_RELKIND_REJECTED' AS g01_i_label
  WHERE NOT EXISTS (SELECT 1 FROM public.pg_branch WHERE branch_name='br_g01_should_fail_i');
 DROP VIEW public.v_g01;
 DROP TABLE public.mvbase_g01;
+
+/* ---- G01_J: non-deterministic (ICU) collation on a PK column reject.
+ *      A non-deterministic collation defines equality classes a text delta
+ *      key cannot represent: 'foo' = 'FOO' yet each spelling renders to a
+ *      different key, so one logical row would split into two delta rows and
+ *      apply_branch would hit a duplicate-key error.  A PK carrying one is
+ *      therefore refused at create_branch.  The same collation on a non-PK
+ *      column is not an identity column and stays legal.  The CREATE
+ *      COLLATION needs ICU, like the suite's other locale prerequisites.
+ * ---- */
+DROP TABLE IF EXISTS public.nondet_g01;
+DROP COLLATION IF EXISTS public.g01_ci;
+CREATE COLLATION public.g01_ci (provider=icu, locale='und-u-ks-level2', deterministic=false);
+CREATE TABLE public.nondet_g01 (k text COLLATE public.g01_ci PRIMARY KEY, v text);
+DO $$ BEGIN
+  PERFORM public.create_branch('br_g01_should_fail_j');
+  RAISE EXCEPTION 'FAIL:G01_J not blocked';
+EXCEPTION WHEN feature_not_supported THEN NULL; END $$;
+SELECT 'PASS:G01_SCOPE_J_NONDET_PK_REJECTED' AS g01_j_label
+ WHERE NOT EXISTS (SELECT 1 FROM public.pg_branch WHERE branch_name='br_g01_should_fail_j');
+DROP TABLE public.nondet_g01;
+CREATE TABLE public.nondet_ok_g01 (id int PRIMARY KEY, tag text COLLATE public.g01_ci, v text);
+SELECT CASE WHEN (SELECT create_branch('br_g01_nondet_nonpk_ok') IS NOT NULL)
+            THEN 'PASS:G01_SCOPE_J_NONDET_NONPK_ALLOWED'
+            ELSE 'FAIL:G01_J_NONPK' END AS g01_j_nonpk;
+SELECT discard_branch('br_g01_nondet_nonpk_ok');
+DROP TABLE public.nondet_ok_g01;
+DROP COLLATION public.g01_ci;
+
+/* ---- G01_K: citext (case-insensitive text) PK column reject.
+ *      citext makes '=' case-insensitive through its TYPE operators, not
+ *      through a non-deterministic collation, so the G01_J collation probe
+ *      cannot see it.  The effect is the same: 'foo' = 'FOO' yet the two
+ *      spellings render to different text delta keys, so one logical row
+ *      would split into two delta rows and apply_branch would raise a
+ *      duplicate-key error.  A PK on citext -- or on any domain chain that
+ *      bottoms out at citext -- is refused at create_branch, while a plain
+ *      citext non-PK column stays legal.  Needs the citext extension
+ *      (postgresql-contrib), an external prerequisite like ICU above.
+ * ---- */
+DO $$
+BEGIN
+  IF NOT EXISTS (SELECT 1 FROM pg_available_extensions WHERE name = 'citext') THEN
+    RAISE EXCEPTION 'G01_K requires the citext extension (postgresql-contrib).';
+  END IF;
+END $$;
+CREATE EXTENSION IF NOT EXISTS citext;
+DROP TABLE IF EXISTS public.citext_g01;
+CREATE TABLE public.citext_g01 (k citext PRIMARY KEY, v text);
+DO $$ BEGIN
+  PERFORM public.create_branch('br_g01_should_fail_k');
+  RAISE EXCEPTION 'FAIL:G01_K not blocked';
+EXCEPTION WHEN feature_not_supported THEN NULL; END $$;
+SELECT 'PASS:G01_SCOPE_K_CITEXT_PK_REJECTED' AS g01_k_label
+ WHERE NOT EXISTS (SELECT 1 FROM public.pg_branch WHERE branch_name='br_g01_should_fail_k');
+DROP TABLE public.citext_g01;
+/*      Nested-domain chain over citext must also be caught (the guard
+ *      resolves the whole chain, not just one typbasetype hop). */
+CREATE DOMAIN public.ci_dom AS citext;
+CREATE DOMAIN public.ci_dom2 AS public.ci_dom;
+CREATE TABLE public.citext_g01 (k public.ci_dom2 PRIMARY KEY, v text);
+DO $$ BEGIN
+  PERFORM public.create_branch('br_g01_should_fail_k2');
+  RAISE EXCEPTION 'FAIL:G01_K_DOMAIN not blocked';
+EXCEPTION WHEN feature_not_supported THEN NULL; END $$;
+SELECT 'PASS:G01_SCOPE_K_CITEXT_DOMAIN_PK_REJECTED' AS g01_k_dom_label
+ WHERE NOT EXISTS (SELECT 1 FROM public.pg_branch WHERE branch_name='br_g01_should_fail_k2');
+DROP TABLE public.citext_g01;
+DROP DOMAIN public.ci_dom2;
+DROP DOMAIN public.ci_dom;
+/*      Array wrappers must be caught as well: array_eq compares citext
+ *      elements case-insensitively while array_out renders '{foo}' vs
+ *      '{FOO}' differently, so a citext[] PK splits the same way.  The
+ *      guard walks the typelem edge in addition to the domain chain. */
+CREATE TABLE public.citext_g01 (k citext[] PRIMARY KEY, v text);
+DO $$ BEGIN
+  PERFORM public.create_branch('br_g01_should_fail_k3');
+  RAISE EXCEPTION 'FAIL:G01_K_ARRAY not blocked';
+EXCEPTION WHEN feature_not_supported THEN NULL; END $$;
+SELECT 'PASS:G01_SCOPE_K_CITEXT_ARRAY_PK_REJECTED' AS g01_k_arr_label
+ WHERE NOT EXISTS (SELECT 1 FROM public.pg_branch WHERE branch_name='br_g01_should_fail_k3');
+DROP TABLE public.citext_g01;
+/*      domain-over-citext[] and array-of-domain-over-citext must both be
+ *      caught by the same fixpoint walk. */
+CREATE DOMAIN public.ci_dom AS citext;
+CREATE DOMAIN public.ci_arr AS citext[];
+CREATE TABLE public.citext_g01 (k public.ci_arr PRIMARY KEY, v text);
+DO $$ BEGIN
+  PERFORM public.create_branch('br_g01_should_fail_k4');
+  RAISE EXCEPTION 'FAIL:G01_K_DOMAIN_ARRAY not blocked';
+EXCEPTION WHEN feature_not_supported THEN NULL; END $$;
+SELECT 'PASS:G01_SCOPE_K_CITEXT_DOMAIN_ARRAY_PK_REJECTED' AS g01_k_domarr_label
+ WHERE NOT EXISTS (SELECT 1 FROM public.pg_branch WHERE branch_name='br_g01_should_fail_k4');
+DROP TABLE public.citext_g01;
+CREATE TABLE public.citext_g01 (k public.ci_dom[] PRIMARY KEY, v text);
+DO $$ BEGIN
+  PERFORM public.create_branch('br_g01_should_fail_k5');
+  RAISE EXCEPTION 'FAIL:G01_K_ARRAY_DOMAIN not blocked';
+EXCEPTION WHEN feature_not_supported THEN NULL; END $$;
+SELECT 'PASS:G01_SCOPE_K_CITEXT_ARRAY_DOMAIN_PK_REJECTED' AS g01_k_arrdom_label
+ WHERE NOT EXISTS (SELECT 1 FROM public.pg_branch WHERE branch_name='br_g01_should_fail_k5');
+DROP TABLE public.citext_g01;
+DROP DOMAIN public.ci_arr;
+DROP DOMAIN public.ci_dom;
+CREATE TABLE public.citext_ok_g01 (id int PRIMARY KEY, tag citext, tags citext[], v text);
+SELECT CASE WHEN (SELECT create_branch('br_g01_citext_nonpk_ok') IS NOT NULL)
+            THEN 'PASS:G01_SCOPE_K_CITEXT_NONPK_ALLOWED'
+            ELSE 'FAIL:G01_K_NONPK' END AS g01_k_nonpk;
+SELECT discard_branch('br_g01_citext_nonpk_ok');
+DROP TABLE public.citext_ok_g01;
 
 /* ---- G01_Z: FINAL clean-schema create OK AFTER all G01 blocks DROPPED.
  *      Sanity guard — ensures every sub-case above actually dropped

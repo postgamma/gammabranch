@@ -847,6 +847,8 @@ Alternative: use top-level DML with `RETURNING` directly (see §6.2).
 | Reading `xmin` / `xmax` / `cmin` / `cmax` system columns | ❌ Rejected (a branch row owns no storage tuple; only `ctid` and `tableoid` are meaningful) |
 | UPDATE SET pk_col | ❌ Rejected (use DELETE + INSERT instead) |
 | DML on a no-PK table | ❌ Rejected by default; ✅ when `overlay_branch.keyless_tables=on` (experimental, see §6.8) |
+| Non-deterministic (ICU) collation on a PK column | ❌ Rejected at `create_branch` — a text delta key cannot represent its equality classes (e.g. `'foo' = 'FOO'`); the same collation on a non-PK column is fine |
+| `citext` on a PK column (through any chain of domain / array wrappers, e.g. `citext[]`, a domain over `citext`, a domain over `citext[]`, or an array of such a domain) | ❌ Rejected at `create_branch` — case-insensitive equality cannot be represented by a text delta key (e.g. `'foo' = 'FOO'`); a `citext` non-PK column (scalar or array) is fine |
 
 Handling suggestions for RESTRICTED items:
 
@@ -859,6 +861,8 @@ Handling suggestions for RESTRICTED items:
 | SELECT … FOR UPDATE/SHARE | Run it in Main (after `use_branch(NULL)`); a branch's writes never lock Main rows |
 | Reading xmin/xmax/cmin/cmax | Read them in Main (after `use_branch(NULL)`); a branch row has no storage tuple to expose them |
 | UPDATE pk | Change to `DELETE WHERE pk=old` + `INSERT VALUES (new_pk, ...)` |
+| Non-deterministic collation on a PK column | Use a deterministic collation for the PK column (a non-deterministic one remains fine on a non-PK column) |
+| `citext` on a PK column | Use a case-sensitive type (`text` / `varchar`) for the PK column (`citext` remains fine on a non-PK column) |
 | FK cascade write | In the application layer, explicitly write the child table before the parent table |
 
 ---
