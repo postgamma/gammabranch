@@ -1303,7 +1303,14 @@ ob_pk_rel_meta(Relation rel)
 	if (OidIsValid(pk_index_oid) && pk_rel != NULL)
 	{
 		TupleDesc	reldesc = RelationGetDescr(rel);
-		int			n = pk_rel->rd_index->indnatts;
+
+		/* The identity is the PK's KEY columns only.  indnatts counts the
+		 * INCLUDE (non-key) columns too -- `PRIMARY KEY (a) INCLUDE (b)` has
+		 * indnatts = 2 but indnkeyatts = 1 -- and unique enforcement never
+		 * covers them.  Folding an INCLUDE column into the key would make an
+		 * in-branch UPDATE of that column look like a PK mutation (rejected
+		 * 0A000) and would widen the delta identity needlessly. */
+		int			n = pk_rel->rd_index->indnkeyatts;
 		int			i;
 
 		if (n > OB_MAX_PK_COLS)
@@ -3124,7 +3131,7 @@ overlay_debug_delta_delete_all(PG_FUNCTION_ARGS)
  * overlay_get_pk_single_attno
  *
  *   Fast return (attno + column name of the single-column PRIMARY KEY.
- *   Composite PK (indnatts>1) returns false and the Planner takes the full path.
+ *   Composite PK (indnkeyatts>1) returns false and the Planner takes the full path.
  *   out_pk_attno is the 1-based real attno (matching rd_index->indkey.values[i]);
  *   out_pk_colname points to NameData inside the relcache (caller must not pfree).
  */

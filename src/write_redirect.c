@@ -180,7 +180,13 @@ ob_resolve_upsert_arbiter(ResultRelInfo *rri, AttrNumber **attnos_out,
 	idxoid = linitial_oid(arbiters);
 	idxrel = index_open(idxoid, AccessShareLock);
 	ii = BuildIndexInfo(idxrel);
-	n = ii->ii_NumIndexAttrs;
+
+	/* KEY columns only: an index's INCLUDE (non-key) columns take no part
+	 * in its uniqueness, so `ON CONFLICT (u)` on `UNIQUE (u) INCLUDE (w)`
+	 * must resolve to (u) alone (ii_NumIndexAttrs would add w and then the
+	 * arbiter probe could never match, silently turning the upsert into a
+	 * plain INSERT). */
+	n = ii->ii_NumIndexKeyAttrs;
 
 	if (n <= 0)
 	{
@@ -1210,11 +1216,16 @@ ob_other_unique_conflict(Relation rel, TupleTableSlot *slot, int32 bid,
 			continue;
 		}
 		ii = BuildIndexInfo(idxrel);
-		n = ii->ii_NumIndexAttrs;
+		/* KEY columns only (see ob_resolve_upsert_arbiter), and ready for
+		 * inserts only: a not-ready index (e.g. left invalid by an aborted
+		 * CREATE INDEX CONCURRENTLY) is not enforced by native
+		 * ExecInsertIndexTuples (it skips !ii_ReadyForInserts), so the eager
+		 * probe must skip it too or it would raise a spurious 23505. */
+		n = ii->ii_NumIndexKeyAttrs;
 		nnd = ii->ii_NullsNotDistinct;
 
-		if (!ii->ii_Unique || n <= 0 || n > INDEX_MAX_KEYS ||
-			ii->ii_Predicate != NIL)
+		if (!ii->ii_Unique || !ii->ii_ReadyForInserts ||
+			n <= 0 || n > INDEX_MAX_KEYS || ii->ii_Predicate != NIL)
 			ok = false;
 		for (i = 0; ok && i < n; i++)
 		{
@@ -1279,10 +1290,14 @@ ob_relation_has_resolvable_unique(Relation rel)
 			continue;
 		}
 		ii = BuildIndexInfo(idxrel);
-		ok = (ii->ii_Unique && ii->ii_NumIndexAttrs > 0 &&
-			  ii->ii_NumIndexAttrs <= INDEX_MAX_KEYS &&
+		/* KEY columns only, ready for inserts only (see
+		 * ob_other_unique_conflict): a not-ready index is not enforced
+		 * natively, so it needs no same-claim tracking either. */
+		ok = (ii->ii_Unique && ii->ii_ReadyForInserts &&
+			  ii->ii_NumIndexKeyAttrs > 0 &&
+			  ii->ii_NumIndexKeyAttrs <= INDEX_MAX_KEYS &&
 			  ii->ii_Predicate == NIL);
-		for (i = 0; ok && i < ii->ii_NumIndexAttrs; i++)
+		for (i = 0; ok && i < ii->ii_NumIndexKeyAttrs; i++)
 			if (ii->ii_IndexAttrNumbers[i] <= 0)
 				ok = false;
 		index_close(idxrel, AccessShareLock);
@@ -1342,10 +1357,12 @@ ob_unique_claims_apply(Relation rel, TupleTableSlot *slot, HTAB *claimed,
 			continue;
 		}
 		ii = BuildIndexInfo(idxrel);
-		n = ii->ii_NumIndexAttrs;
+		/* KEY columns only, ready for inserts only (see
+		 * ob_other_unique_conflict). */
+		n = ii->ii_NumIndexKeyAttrs;
 		nnd = ii->ii_NullsNotDistinct;
-		if (!ii->ii_Unique || n <= 0 || n > INDEX_MAX_KEYS ||
-			ii->ii_Predicate != NIL)
+		if (!ii->ii_Unique || !ii->ii_ReadyForInserts ||
+			n <= 0 || n > INDEX_MAX_KEYS || ii->ii_Predicate != NIL)
 			ok = false;
 		for (i = 0; ok && i < n; i++)
 		{

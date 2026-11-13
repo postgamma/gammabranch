@@ -846,6 +846,7 @@ Alternative: use top-level DML with `RETURNING` directly (see §6.2).
 | Duplicate-key INSERT (single- or multi-column PK, or any plain-column non-partial `UNIQUE` index) | ❌ Rejected eagerly with `23505`, same as Main — nothing is written to the delta |
 | INSERT … ON CONFLICT (UPSERT) | ✅ Supported (arbitrates on the PK, or on the single non-partial plain-column `UNIQUE` index named in the statement — see §5.1.1); partial / expression arbiters are rejected with `0A000`; any *other* `UNIQUE` index (and the PK) is still enforced eagerly, and the `DO UPDATE` post-image is re-checked (`23505`) |
 | UPSERT on a composite (multi-column) PK | ✅ Supported — the same conflict detection runs on every PK column, so `DO UPDATE` / `DO NOTHING` behave as in Main |
+| `INCLUDE` (non-key) columns on a PK or `UNIQUE` index | ✅ Supported — INCLUDE columns are index payload, not key columns: they are never part of the identity, so a PK's INCLUDE column may be updated in-branch and an `ON CONFLICT (u)` on `UNIQUE (u) INCLUDE (w)` arbitrates on `u` alone |
 | UPDATE/DELETE … RETURNING | ✅ Supported |
 | PK predicates (`pk = c` / `pk IN (…)` / `pk BETWEEN …` / `pk > c` / their `AND`/`OR` combinations) | ✅ Recommended path (goes through the PK index) |
 | Non-PK predicates (arbitrary filter / Seq scan) | ✅ Supported |

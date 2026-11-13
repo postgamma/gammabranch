@@ -3447,3 +3447,169 @@ DROP TABLE public.t_r33p;
 DROP TABLE public.t_r33u;
 DROP DOMAIN public.jb_r33;
 RESET client_min_messages;
+
+-- =====================================================================
+-- ===== R34: INCLUDE (non-key) index columns are not key columns ======
+-- ---------------------------------------------------------------------
+--   An index's INCLUDE (non-key) columns are carried as payload and take
+--   no part in its uniqueness: `PRIMARY KEY (a) INCLUDE (b)` has
+--   indnatts = 2 but indnkeyatts = 1, and `UNIQUE (u) INCLUDE (w)` only
+--   forbids duplicate u.  Several redirect paths read the *whole*
+--   attribute list (indnatts / ii_NumIndexAttrs) instead of the key
+--   prefix, silently folding the INCLUDE columns into the identity /
+--   uniqueness key and causing four divergences: (a) an in-branch UPDATE
+--   of a PK's INCLUDE column was rejected 0A000 as a "PK mutation"
+--   although native permits it; (b) a key-only conflict under a UNIQUE
+--   INCLUDE index was accepted into the delta and surfaced its 23505 only
+--   at apply; (c) `ON CONFLICT (u)` on `UNIQUE (u) INCLUDE (w)` resolved
+--   to (u,w), so the arbiter probe never matched and the upsert degraded
+--   to a plain INSERT; (d) the G01 category-9 citext probe rejected a
+--   table whose citext value was merely an INCLUDE column of the PK.  All
+--   key-column probes now use indnkeyatts / ii_NumIndexKeyAttrs.
+--
+-- COVERAGE:
+--   R34_A : a PK INCLUDE column may be updated in-branch while the key
+--           column stays protected (0A000)
+--   R34_B : a key-only conflict under a UNIQUE INCLUDE index raises 23505
+--           eagerly inside the branch
+--   R34_C : the same conflict from two rows of ONE statement still 23505
+--   R34_D : ON CONFLICT (u) on UNIQUE (u) INCLUDE (w) matches the existing
+--           row (updates it) instead of inserting a second row
+--   R34_E : apply writes the branch result back to MAIN intact
+--   R34_F : a citext value carried as an INCLUDE (non-key) PK column does
+--           NOT trip the G01 category-9 citext probe (it reads only
+--           indkey[0:indnkeyatts-1]), so create_branch succeeds
+-- =====================================================================
+SET client_min_messages = WARNING;
+CREATE TABLE public.t_r34pk (id int, inc int, PRIMARY KEY (id) INCLUDE (inc));
+CREATE TABLE public.t_r34u (id int PRIMARY KEY, u int, w text, UNIQUE (u) INCLUDE (w));
+INSERT INTO public.t_r34pk VALUES (1, 5);
+INSERT INTO public.t_r34u VALUES (1, 10, 'x');
+SELECT overlay_branch.create_branch('br_r34');
+SELECT overlay_branch.use_branch('br_r34');
+
+-- R34_A: updating the PK's INCLUDE column is legal in-branch (native allows
+--        it); updating the key column itself is still refused 0A000.
+UPDATE public.t_r34pk SET inc = 99 WHERE id = 1;
+SELECT CASE WHEN inc = 99 THEN 'PASS:R34_A_PK_INCLUDE_UPDATE_ALLOWED'
+            ELSE 'FAIL:R34_A inc=' || inc END AS r34_a
+  FROM public.t_r34pk WHERE id = 1;
+DO $$
+BEGIN
+    BEGIN
+        UPDATE public.t_r34pk SET id = 2 WHERE id = 1;
+        RAISE EXCEPTION 'FAIL_R34_A_NO_ERROR';
+    EXCEPTION WHEN feature_not_supported THEN NULL;
+    END;
+END $$;
+SELECT 'PASS:R34_A_PK_KEY_COLUMN_STILL_PROTECTED' AS r34_a2;
+
+-- R34_B: a key-only conflict under UNIQUE (u) INCLUDE (w) -- same u, a
+--        different w -- must raise 23505 eagerly, not silently land.
+DO $$
+BEGIN
+    BEGIN
+        INSERT INTO public.t_r34u VALUES (2, 10, 'different');
+        RAISE EXCEPTION 'FAIL_R34_B_NO_ERROR';
+    EXCEPTION WHEN unique_violation THEN NULL;
+    END;
+END $$;
+SELECT 'PASS:R34_B_UNIQUE_INCLUDE_EAGER_23505' AS r34_b;
+
+-- R34_C: the same key-only conflict from two rows of a single statement.
+DO $$
+BEGIN
+    BEGIN
+        INSERT INTO public.t_r34u VALUES (3, 20, 'p'), (4, 20, 'q');
+        RAISE EXCEPTION 'FAIL_R34_C_NO_ERROR';
+    EXCEPTION WHEN unique_violation THEN NULL;
+    END;
+END $$;
+SELECT 'PASS:R34_C_UNIQUE_INCLUDE_SAME_COMMAND_23505' AS r34_c;
+
+-- R34_D: ON CONFLICT (u) on UNIQUE (u) INCLUDE (w) must resolve to (u) and
+--        update the existing row -- exactly one row with u = 10 afterwards.
+INSERT INTO public.t_r34u VALUES (9, 10, 'z')
+    ON CONFLICT (u) DO UPDATE SET w = EXCLUDED.w;
+SELECT CASE WHEN count(*) = 1 AND min(w) = 'z'
+            THEN 'PASS:R34_D_UPSERT_ARBITER_INCLUDE_RESOLVED'
+            ELSE 'FAIL:R34_D rows=' || count(*) || ' w=' || min(w) END AS r34_d
+  FROM public.t_r34u WHERE u = 10;
+
+-- R34_E: MAIN pristine until apply; apply writes the branch result back.
+SELECT overlay_branch.use_branch(NULL);
+RESET overlay_branch.current;
+SET overlay_branch.current = '';
+SELECT CASE WHEN count(*) = 1 AND min(inc) = 5
+            THEN 'PASS:R34_E_MAIN_PRISTINE'
+            ELSE 'FAIL:R34_E rows=' || count(*) END AS r34_e
+  FROM public.t_r34pk;
+SELECT overlay_branch.apply_branch('br_r34');
+SELECT CASE WHEN inc = 99 THEN 'PASS:R34_E_APPLY_PK_INCLUDE'
+            ELSE 'FAIL:R34_E inc=' || inc END AS r34_e2
+  FROM public.t_r34pk WHERE id = 1;
+SELECT CASE WHEN count(*) = 1 AND min(w) = 'z'
+            THEN 'PASS:R34_E_APPLY_UNIQUE_INCLUDE'
+            ELSE 'FAIL:R34_E rows=' || count(*) END AS r34_e3
+  FROM public.t_r34u WHERE u = 10;
+
+-- R34_F: a citext value carried as an INCLUDE (non-key) PK column is NOT
+--        part of the identity, so the G01 category-9 citext probe -- which
+--        must read only indkey[0:indnkeyatts-1] -- lets the table through:
+--        create_branch succeeds and the branch opens/discards normally.
+CREATE TABLE public.t_r34inc (a int, c citext, PRIMARY KEY (a) INCLUDE (c));
+SELECT CASE WHEN (SELECT overlay_branch.create_branch('br_r34inc') IS NOT NULL)
+            THEN 'PASS:R34_F_PK_INCLUDE_CITEXT_ALLOWED'
+            ELSE 'FAIL:R34_F' END AS r34_f;
+SELECT overlay_branch.discard_branch('br_r34inc');
+DROP TABLE public.t_r34inc;
+
+-- R34 teardown (branch left in the terminal 'applied' state).
+DROP TABLE public.t_r34pk;
+DROP TABLE public.t_r34u;
+RESET client_min_messages;
+
+-- =====================================================================
+-- ===== R35: a not-ready UNIQUE index is not eagerly enforced =========
+-- ---------------------------------------------------------------------
+--   Native ExecInsertIndexTuples skips every index whose
+--   IndexInfo.ii_ReadyForInserts is false (pg_index.indisready = false),
+--   so a UNIQUE index left behind by an ABORTED CREATE INDEX CONCURRENTLY
+--   (duplicate data) enforces nothing.  The branch's eager UNIQUE probe
+--   enumerates indexes with RelationGetIndexList, which returns such a
+--   not-ready index, so it must apply the same gate -- otherwise it raises
+--   a spurious 23505 for a write native accepts.
+--
+-- COVERAGE:
+--   R35_A : a not-ready UNIQUE index does not block an in-branch INSERT
+--           that native also accepts, and the row still reaches MAIN
+-- =====================================================================
+SET client_min_messages = WARNING;
+CREATE TABLE public.t_r35 (a int PRIMARY KEY, u int, v text);
+INSERT INTO public.t_r35 VALUES (1, 1, 'x'), (2, 1, 'y');
+/* Abort a concurrent UNIQUE build on duplicate data: the index is left
+ * with indisvalid = false AND indisready = false. */
+CREATE UNIQUE INDEX CONCURRENTLY u_t_r35 ON public.t_r35 (u);
+SELECT c.relname, i.indisunique, i.indisvalid, i.indisready
+  FROM pg_index i JOIN pg_class c ON c.oid = i.indexrelid
+ WHERE i.indrelid = 'public.t_r35'::regclass ORDER BY c.relname;
+SELECT overlay_branch.create_branch('br_r35');
+SELECT overlay_branch.use_branch('br_r35');
+
+-- R35_A: the not-ready index must not fire; this insert is legal natively.
+INSERT INTO public.t_r35 VALUES (3, 1, 'z');
+SELECT CASE WHEN count(*) = 1 THEN 'PASS:R35_A_NOTREADY_UNIQUE_NOT_ENFORCED'
+            ELSE 'FAIL:R35_A rows=' || count(*) END AS r35_a
+  FROM public.t_r35 WHERE a = 3;
+
+SELECT overlay_branch.use_branch(NULL);
+RESET overlay_branch.current;
+SET overlay_branch.current = '';
+SELECT overlay_branch.apply_branch('br_r35');
+SELECT CASE WHEN count(*) = 1 THEN 'PASS:R35_A_APPLY_MATERIALIZED'
+            ELSE 'FAIL:R35_A rows=' || count(*) END AS r35_a2
+  FROM public.t_r35 WHERE a = 3;
+
+-- R35 teardown (the invalid index is dropped with the table).
+DROP TABLE public.t_r35;
+RESET client_min_messages;

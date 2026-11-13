@@ -229,6 +229,19 @@ elements with citext's case-insensitive `=`, while `array_out` prints `{foo}`
 and `{FOO}` differently — the same identity split. As above, a **non-PK**
 `citext` column (scalar or array) is not an identity column and stays legal.
 
+**Only the PK's KEY columns form the identity — an INCLUDE column does not.** A
+`PRIMARY KEY (a) INCLUDE (b)` index reports `indnatts = 2` but `indnkeyatts = 1`:
+`b` is carried purely as a payload and native uniqueness (hence the identity)
+covers `a` alone. Every identity and uniqueness computation must therefore read
+the **key prefix** — `rd_index->indnkeyatts`, `i.indkey[0:indnkeyatts-1]`,
+`IndexInfo.ii_NumIndexKeyAttrs` — never the full attribute count. Reading
+`indnatts` widens the identity with a column the delta must not key on, so an
+in-branch UPDATE of `b` looks like a PK mutation (rejected 0A000) although native
+allows it; the same confusion in the eager UNIQUE probe and the UPSERT arbiter
+resolution (§1.6) folds the INCLUDE column into the conflict key, deferring a
+genuine key-only `23505` to `apply_branch` or silently degrading an
+`ON CONFLICT (u)` into a plain INSERT.
+
 **Array keys fold their elements.** An array PK renders through `array_out`,
 which prints each element with the *element* type's output function and joins
 them; `array_eq` likewise compares element-wise. So the normalizations above are
@@ -560,6 +573,15 @@ IMMEDIATE` or `NOT DEFERRABLE` index is checked at end of statement and stays
 eager (PostgreSQL exposes no runtime API to observe a `SET CONSTRAINTS`
 override, so the declared mode is what the redirect models).
 
+**A not-ready index is not eagerly enforced.** Native `ExecInsertIndexTuples`
+skips every index whose `IndexInfo.ii_ReadyForInserts` is `false`
+(`pg_index.indisready = false`), so such an index enforces nothing — the
+classic case is a `UNIQUE` index left behind, still not ready, by an aborted
+`CREATE INDEX CONCURRENTLY`. `RelationGetIndexList()` still returns it, so the
+redirect's eager `23505` probes (the plain-INSERT/UPDATE pre-checks, the arbiter
+residual scan, and the same-claim set) apply the same `ii_ReadyForInserts` gate;
+without it they would raise a spurious `23505` for a write native accepts.
+
 **Arbiter selection and the eager residual check.** `ON CONFLICT (target)`
 resolves to exactly one arbiter index. A **PK arbiter** keeps the fast
 `d.key` / PK-ctid probe; a **non-primary UNIQUE arbiter** (keyed or keyless)
@@ -678,6 +700,9 @@ column; a `citext` PRIMARY KEY column (reached through any chain of domain
 last two because their equality classes cannot be
 represented by a text delta key (§1.5); a PRIMARY KEY declared DEFERRABLE
 INITIALLY DEFERRED (single- or multi-column); and an EXCLUDE constraint. The
+collation and `citext` probes test only the PK's **key** columns
+(`i.indkey[0:i.indnkeyatts-1]`), so an INCLUDE (non-key) column of the PK — which
+never participates in uniqueness — is not a PK column and stays legal (§1.5). The
 deferred PK is refused because
 the delta's identity key **is** the serialized PK, so the delta — being keyed on
 `(branch_id, relid, key)` — cannot hold the transient duplicate PK that native

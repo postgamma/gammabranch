@@ -310,7 +310,7 @@ ob_check_branch_scope(void)
 "  FROM pg_index i "
 "  JOIN pg_class c ON c.oid = i.indrelid "
 "  JOIN pg_namespace n ON n.oid = c.relnamespace "
-"  JOIN pg_attribute a ON a.attrelid = c.oid AND a.attnum = ANY(i.indkey) "
+"  JOIN pg_attribute a ON a.attrelid = c.oid AND a.attnum = ANY(i.indkey[0:i.indnkeyatts-1]) "
 "  JOIN pg_collation co ON co.oid = a.attcollation "
 "  WHERE i.indisprimary "
 "    AND NOT co.collisdeterministic "
@@ -331,7 +331,7 @@ ob_check_branch_scope(void)
 "  FROM pg_index i "
 "  JOIN pg_class c ON c.oid = i.indrelid "
 "  JOIN pg_namespace n ON n.oid = c.relnamespace "
-"  JOIN pg_attribute a ON a.attrelid = c.oid AND a.attnum = ANY(i.indkey) "
+"  JOIN pg_attribute a ON a.attrelid = c.oid AND a.attnum = ANY(i.indkey[0:i.indnkeyatts-1]) "
 "  WHERE i.indisprimary "
 "    AND c.relkind = 'r' "
 "    AND a.attnum > 0 "
@@ -3293,7 +3293,10 @@ ob_apply_rel_info_build(Relation rel)
 
 	if (OidIsValid(pk_index_oid) && pk_rel != NULL)
 	{
-		int			n_pk = pk_rel->rd_index->indnatts;
+		/* KEY columns only: the apply MAIN<->delta join must use the same
+		 * identity the delta key was serialized with (see ob_pk_rel_meta),
+		 * which excludes the PK index's INCLUDE (non-key) columns. */
+		int			n_pk = pk_rel->rd_index->indnkeyatts;
 
 		if (n_pk > 0)
 		{
