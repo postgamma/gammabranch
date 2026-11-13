@@ -523,6 +523,33 @@ proposed tuple first) and again on the merged row for a `DO UPDATE` (mirroring
 `ExecUpdate()`), so a candidate that is invalid even though `DO UPDATE` /
 `DO NOTHING` would discard it is still rejected, exactly as in MAIN.
 
+**Eager RLS `WITH CHECK` replay.** Row-level security has two halves and they
+arrive by different routes. The **`USING`** half (which rows a role may see or
+target) is injected by the planner as a filter on the scan / DML target, so the
+branch-scan and redirection read sources inherit it automatically and need no
+replay. The **`WITH CHECK`** half (what a new post-image is allowed to look
+like) is *not* a filter: native evaluates it in the executor via
+`ExecWithCheckOptions()` inside `ExecInsert()` / `ExecUpdate()`, right before
+`ExecConstraints()`. Because the write-redirect short-circuits
+`standard_ExecutorRun()`, that call never fires for a redirected row, so without
+an explicit replay a post-image that violates a `WITH CHECK` policy would be
+silently stored in the branch delta even though the identical statement against
+MAIN is rejected. The constraint helper therefore calls
+`ExecWithCheckOptions()` with the **same `WCOKind` native uses on each code
+path**: `WCO_RLS_INSERT_CHECK` on the INSERT candidate (before `ON CONFLICT`
+resolution, mirroring `ExecInsert()`); `WCO_RLS_UPDATE_CHECK` on a plain UPDATE
+*and* on the new image of an `ON CONFLICT DO UPDATE` (native dispatches the
+conflict UPDATE to `ExecUpdate()`, which checks the UPDATE `WITH CHECK`
+policy); and `WCO_RLS_CONFLICT_CHECK` on the *pre-image* the conflict matched
+(native `ExecOnConflictUpdate()` checks the UPDATE `USING` policy against the
+existing tuple, before projecting the new row). The two `ON CONFLICT DO UPDATE`
+kinds are not interchangeable: `WCO_RLS_CONFLICT_CHECK` carries the `USING`
+clause and `WCO_RLS_UPDATE_CHECK` the `WITH CHECK` clause, so replaying only one
+of them — or the wrong one — silently lets a policy-violating branch UPSERT
+through. Both run before `overlay_delta_insert`. It is a no-op when the relation
+has no RLS policies (`ri_WithCheckOptions == NIL`), so it costs nothing on the
+common path.
+
 **INSERT uniqueness pre-check (R21).** Before a promoted INSERT row is written
 into the delta, the redirect probes the branch delta and then MAIN for the same
 row identity, so a branch-local INSERT that duplicates an existing key fails

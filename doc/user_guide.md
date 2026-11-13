@@ -851,6 +851,7 @@ Alternative: use top-level DML with `RETURNING` directly (see §6.2).
 | PK predicates (`pk = c` / `pk IN (…)` / `pk BETWEEN …` / `pk > c` / their `AND`/`OR` combinations) | ✅ Recommended path (goes through the PK index) |
 | Non-PK predicates (arbitrary filter / Seq scan) | ✅ Supported |
 | Volatile predicates (`nextval()`, …) | ✅ Supported (evaluated once per row, matching native — no doubled side effects) |
+| Row-Level Security (`USING` and `WITH CHECK`) | ✅ Supported — the `USING` visibility filter is injected by the planner and covers branch reads / DML targets; the `WITH CHECK` new-row policy is replayed on the redirected post-image, so a policy-violating INSERT/UPDATE/UPSERT is rejected in a branch exactly as in Main |
 | TEMP table operations inside a branch | ✅ Supported (whitelisted) |
 | CREATE TABLE / ALTER / DROP / CREATE INDEX / DROP TRIGGER | ❌ 0A000 (execute back in Main) |
 | Partitioned table | ❌ Rejected |

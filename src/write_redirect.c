@@ -885,31 +885,81 @@ r21_check_insert_preconditions(Relation rel, TupleTableSlot *slot,
 }
 
 /* ----------------------------------------------------------------
+ * ob_run_rls_with_check
+ *
+ *   Run ONLY the RLS WITH CHECK policies of `kind` against `slot`,
+ *   without the relation's NOT NULL / CHECK constraints.  This is the
+ *   piece of ExecWithCheckOptions() the write-redirect has to replay
+ *   for a tuple the executor would have validated on a DIFFERENT code
+ *   path than the one being redirected: the ON CONFLICT DO UPDATE
+ *   pre-image, whose USING policy (WCO_RLS_CONFLICT_CHECK) native
+ *   checks against the conflicting tuple inside ExecOnConflictUpdate()
+ *   before ExecUpdate() runs the constraints on the new image.
+ *
+ *   The per-tuple ExprContext's scan binding is saved and restored so
+ *   the evaluation cannot leak the temporary slot to callers that
+ *   reuse that context.
+ * ----------------------------------------------------------------
+ */
+static void
+ob_run_rls_with_check(ResultRelInfo *rri, TupleTableSlot *slot,
+					  EState *estate, WCOKind wco_kind)
+{
+	ExprContext *ecx;
+	TupleTableSlot *save_scantuple;
+
+	if (rri == NULL || slot == NULL || estate == NULL)
+		return;
+	if (TupIsNull(slot))
+		return;
+	if (rri->ri_WithCheckOptions == NIL)
+		return;
+
+	ecx = GetPerTupleExprContext(estate);
+	save_scantuple = ecx->ecxt_scantuple;
+	ExecWithCheckOptions(wco_kind, rri, slot, estate);
+	ecx->ecxt_scantuple = save_scantuple;
+}
+
+/* ----------------------------------------------------------------
  * ob_validate_redirect_constraints
  *
- *   Apply the target relation's native NOT NULL and CHECK constraints to a
- *   post-image tuple BEFORE it is written into the delta store, so a
- *   branch-local INSERT/UPDATE fails eagerly with the same SQLSTATE and
- *   message as the identical statement run against MAIN.
+ *   Apply the target relation's native row-level-security WITH CHECK policies
+ *   and NOT NULL / CHECK constraints to a post-image tuple BEFORE it is
+ *   written into the delta store, so a branch-local INSERT/UPDATE fails
+ *   eagerly with the same SQLSTATE and message as the identical statement run
+ *   against MAIN.
  *
  *   The write-redirect short-circuits standard_ExecutorRun(), so the executor
- *   never reaches its own ExecConstraints() call for these rows.  Without this
- *   check an invalid row is silently stored in the delta and only rejected
- *   later, at apply time.
+ *   never reaches its own ExecWithCheckOptions() / ExecConstraints() calls for
+ *   these rows.  Without this check an invalid or policy-violating row is
+ *   silently stored in the delta and only rejected later, at apply time.
  *
- *   Delegates to the executor's ExecConstraints() so the error detail, the
- *   failing-row description and the SQLSTATE match the native messages
- *   exactly.  No-op when the relation declares no constraints, which is also
- *   required because ExecConstraints() asserts on that case.
+ *   `wco_kind` selects the RLS policy being enforced, mirroring what native
+ *   passes for the same statement: WCO_RLS_INSERT_CHECK for an INSERT (the
+ *   candidate row, checked before ON CONFLICT resolution), and
+ *   WCO_RLS_UPDATE_CHECK for a plain UPDATE or for the new image of an
+ *   ON CONFLICT DO UPDATE (native dispatches the DO UPDATE to ExecUpdate()).
+ *   ExecWithCheckOptions() filters the list by this kind, so a mismatched kind
+ *   would silently enforce nothing.
+ *
+ *   Delegates to the executor's ExecWithCheckOptions() / ExecConstraints() so
+ *   the error detail, the failing-row description and the SQLSTATE match the
+ *   native messages exactly.  The constraints step is a no-op when the relation
+ *   declares no constraints, which is also required because ExecConstraints()
+ *   asserts on that case; the WCO step is a no-op when the relation has no RLS
+ *   WITH CHECK policies (ri_WithCheckOptions == NIL).
  *
  *   The per-tuple ExprContext's scan binding is saved and restored so the
- *   CHECK evaluation cannot leak the temporary post-image slot to callers that
- *   reuse that context (e.g. the UPSERT DO UPDATE WHERE predicate).
+ *   evaluation cannot leak the temporary post-image slot to callers that
+ *   reuse that context (e.g. the UPSERT DO UPDATE WHERE predicate); both
+ *   ExecWithCheckOptions() and ExecConstraints() overwrite ecxt_scantuple.
  * ----------------------------------------------------------------
  */
 static void
 ob_validate_redirect_constraints(ResultRelInfo *rri, Relation rel,
-								 TupleTableSlot *slot, EState *estate)
+								 TupleTableSlot *slot, EState *estate,
+								 WCOKind wco_kind)
 {
 	TupleDesc	tupdesc;
 	ExprContext *ecx;
@@ -920,14 +970,18 @@ ob_validate_redirect_constraints(ResultRelInfo *rri, Relation rel,
 	if (TupIsNull(slot))
 		return;
 
-	tupdesc = RelationGetDescr(rel);
-	if (tupdesc->constr == NULL)
-		return;
-
 	ecx = GetPerTupleExprContext(estate);
 	save_scantuple = ecx->ecxt_scantuple;
-	ExecConstraints(rri, slot, estate);
-	ecx->ecxt_scantuple = save_scantuple;
+
+	/* RLS WITH CHECK: native runs this before ExecConstraints(). */
+	ob_run_rls_with_check(rri, slot, estate, wco_kind);
+
+	tupdesc = RelationGetDescr(rel);
+	if (tupdesc->constr != NULL)
+	{
+		ExecConstraints(rri, slot, estate);
+		ecx->ecxt_scantuple = save_scantuple;
+	}
 }
 
 /* ----------------------------------------------------------------
@@ -2272,12 +2326,14 @@ overlay_executor_run_intercept(QueryDesc *queryDesc,
 							overlay_typed_pk_free(pre_pk, pre_pk_n);
 						}
 
-						/* Eager native NOT NULL + CHECK check on the merged
-						 * post-image, so this branch-local UPDATE rejects an
-						 * invalid row immediately (23502 / 23514) instead of
-						 * storing it in the delta and failing at apply. */
+						/* Eager native RLS WITH CHECK + NOT NULL + CHECK check
+						 * on the merged post-image, so this branch-local UPDATE
+						 * rejects an invalid or policy-violating row
+						 * immediately (23502 / 23514 / RLS violation) instead
+						 * of storing it in the delta and failing at apply. */
 						ob_validate_redirect_constraints(rri, rel, old_clean_slot,
-														 queryDesc->estate);
+														 queryDesc->estate,
+														 WCO_RLS_UPDATE_CHECK);
 
 						tdata = overlay_serialize_tuple(rel, old_clean_slot);
 					}
@@ -2625,16 +2681,18 @@ overlay_executor_run_intercept(QueryDesc *queryDesc,
 				pk = overlay_serialize_identity(rel, slot, DELTA_OP_INSERT);
 				tdata = overlay_serialize_tuple(rel, slot);
 
-				/* Eager native NOT NULL + CHECK check on the candidate row,
-				 * BEFORE conflict detection, mirroring ExecInsert(): the
-				 * executor validates the proposed tuple's constraints first
-				 * and only afterwards resolves ON CONFLICT.  Running it here
-				 * (rather than only on the rows that end up written) keeps a
+				/* Eager native RLS WITH CHECK + NOT NULL + CHECK check on the
+				 * candidate row, BEFORE conflict detection, mirroring
+				 * ExecInsert(): the executor validates the proposed tuple's
+				 * RLS INSERT WITH CHECK policies and constraints first and only
+				 * afterwards resolves ON CONFLICT.  Running it here (rather
+				 * than only on the rows that end up written) keeps a
 				 * branch-local INSERT ... ON CONFLICT in line with MAIN even
 				 * when the candidate is skipped (DO NOTHING on conflict) or
 				 * its invalid columns would be overwritten by DO UPDATE. */
 				ob_validate_redirect_constraints(rri, rel, slot,
-												 queryDesc->estate);
+												 queryDesc->estate,
+												 WCO_RLS_INSERT_CHECK);
 
 				/* Same-statement duplicate check: was this key already written
 				 * by an earlier row of THIS command?  (`claimed` is NULL only
@@ -3508,6 +3566,19 @@ overlay_executor_run_intercept(QueryDesc *queryDesc,
 							pk_check_active = true;
 						}
 
+						/* RLS ON CONFLICT: native ExecOnConflictUpdate()
+						 * checks the auxiliary UPDATE's USING policy
+						 * (WCO_RLS_CONFLICT_CHECK) against the EXISTING
+						 * tuple -- the row ON CONFLICT matched -- before
+						 * projecting the new image, and ExecUpdate() then
+						 * checks the UPDATE WITH CHECK policy on that new
+						 * image.  Replay the first here on the live
+						 * pre-image; the post-image check follows below.
+						 * (The INSERT WITH CHECK policy on the candidate
+						 * was already enforced at the top of this loop.) */
+						ob_run_rls_with_check(rri, pre_image_slot, estate,
+											  WCO_RLS_CONFLICT_CHECK);
+
 						if (oc_proj == NULL || estate == NULL ||
 							pre_image_slot == NULL || TupIsNull(pre_image_slot) ||
 							slot == NULL || TupIsNull(slot))
@@ -3624,12 +3695,19 @@ overlay_executor_run_intercept(QueryDesc *queryDesc,
 							overlay_typed_pk_free(pre_pk, pre_n);
 						}
 
-						/* Eager native NOT NULL + CHECK check on the UPSERT
-						 * DO UPDATE post-image, matching the plain INSERT
-						 * path so a branch-local UPSERT rejects an invalid
-						 * row immediately instead of at apply. */
+						/* Eager native RLS WITH CHECK + NOT NULL + CHECK
+						 * check on the UPSERT DO UPDATE post-image,
+						 * matching the plain INSERT path so a branch-local
+						 * UPSERT rejects an invalid or policy-violating row
+						 * immediately instead of at apply.  Native
+						 * dispatches the conflict update to ExecUpdate(),
+						 * which enforces the UPDATE WITH CHECK policy with
+						 * WCO_RLS_UPDATE_CHECK on the new image (the USING
+						 * policy was already checked on the pre-image
+						 * above). */
 						ob_validate_redirect_constraints(rri, rel, post_image,
-														 queryDesc->estate);
+														 queryDesc->estate,
+														 WCO_RLS_UPDATE_CHECK);
 
 						tdata = overlay_serialize_tuple(rel, post_image);
 
