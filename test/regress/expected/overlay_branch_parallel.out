@@ -46,10 +46,10 @@ EXPLAIN (COSTS OFF) SELECT count(*) FROM ob_par;
                ->  Parallel Seq Scan on ob_par
 (5 rows)
 
-SELECT overlay_branch.create_branch('ob_par_b1');
- create_branch 
----------------
-            13
+SELECT overlay_branch.create_branch('ob_par_b1') > 0 AS ob_par_b1_created;
+ ob_par_b1_created 
+-------------------
+ t
 (1 row)
 
 SELECT overlay_branch.use_branch('ob_par_b1');

@@ -99,10 +99,10 @@ ANALYZE ob_mem;
 CREATE TABLE ob_mem_big (id int PRIMARY KEY, v text);
 INSERT INTO ob_mem_big SELECT g, repeat('x', 600) || g FROM generate_series(1, 20000) g;
 ANALYZE ob_mem_big;
-SELECT overlay_branch.create_branch('ob_mem_b1');
- create_branch 
----------------
-            14
+SELECT overlay_branch.create_branch('ob_mem_b1') > 0 AS ob_mem_b1_created;
+ ob_mem_b1_created 
+-------------------
+ t
 (1 row)
 
 SELECT overlay_branch.use_branch('ob_mem_b1');

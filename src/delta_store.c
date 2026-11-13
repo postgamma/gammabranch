@@ -1387,21 +1387,78 @@ overlay_anchor_key_from_ctid(const char *ctid_cstr)
 	return psprintf("A:%u:%u", blk, off);
 }
 
+/*
+ * Synthetic-key high-water mark.
+ *
+ * overlay_synthetic_key() allocates the next "S:<seq>" for a keyless row born
+ * inside the branch.  The durable probe (MAX over the delta) is correct across
+ * statements, but NOT within one command: the command counter does not advance
+ * between rows of a single command, so rows this command already inserted are
+ * invisible to the probe's snapshot and every row would compute the same
+ * S:<n>.  The delta primary key then makes the second insert overwrite the
+ * first, silently dropping rows -- a multi-row INSERT ... VALUES on a keyless
+ * table kept only its last row.  A per-(branch,rel) high-water mark held in
+ * backend memory keeps the sequence advancing inside the command; it only ever
+ * moves forward, so after a rollback it may sit above the durable MAX, which
+ * merely leaves gaps (keys need uniqueness, not contiguity).
+ */
+typedef struct ObSynthSeqKey
+{
+	int32		branch_id;
+	Oid			relid;
+} ObSynthSeqKey;
+
+typedef struct ObSynthSeqEntry
+{
+	ObSynthSeqKey key;
+	int64		last_seq;
+} ObSynthSeqEntry;
+
+static MemoryContext ob_synth_seq_cxt = NULL;
+static HTAB *ob_synth_seq_hash = NULL;
+
+static void
+ob_synth_seq_init(void)
+{
+	HASHCTL		ctl;
+
+	if (ob_synth_seq_hash != NULL)
+		return;
+
+	ob_synth_seq_cxt = AllocSetContextCreate(TopMemoryContext,
+											 "overlay_branch synthetic key seq",
+											 ALLOCSET_SMALL_SIZES);
+
+	memset(&ctl, 0, sizeof(ctl));
+	ctl.keysize = sizeof(ObSynthSeqKey);
+	ctl.entrysize = sizeof(ObSynthSeqEntry);
+	ctl.hcxt = ob_synth_seq_cxt;
+	ob_synth_seq_hash = hash_create("overlay_branch synthetic key seq",
+									32, &ctl,
+									HASH_ELEM | HASH_BLOBS | HASH_CONTEXT);
+}
+
 /* Allocate the next synthetic key "S:<seq>" for a keyless row born
- * inside the branch.  seq = 1 + max(existing S: seq for this
- * (branch,rel)).  Because delta rows are never physically removed until
- * discard, this is monotonic within the branch lifetime. */
+ * inside the branch.  seq = 1 + max(durable MAX(existing S: seq for this
+ * (branch,rel)), backend high-water mark).  Because delta rows are never
+ * physically removed until discard, this is monotonic within the branch
+ * lifetime. */
 char *
 overlay_synthetic_key(int32 branch_id, Oid relid)
 {
 	StringInfoData sql;
 	int			ret;
-	int64		next = 1;
+	int64		db_max = 0;
+	int64		cached;
+	int64		next;
 	char	   *sqlstr;
+	ObSynthSeqKey skey;
+	ObSynthSeqEntry *sentry;
+	bool		found;
 
 	initStringInfo(&sql);
 	appendStringInfo(&sql,
-					 "SELECT COALESCE(MAX(substring(d.key from 3)::bigint), 0) + 1 "
+					 "SELECT COALESCE(MAX(substring(d.key from 3)::bigint), 0) "
 					 "FROM %s d WHERE d.branch_id = %d AND d.relid = %u "
 					 "AND d.key LIKE 'S:%%'",
 					 OBTABLE_DELTA, branch_id, (unsigned int) relid);
@@ -1417,11 +1474,24 @@ overlay_synthetic_key(int32 branch_id, Oid relid)
 									   SPI_tuptable->tupdesc, 1, &isnull);
 
 		if (!isnull)
-			next = DatumGetInt64(v);
+			db_max = DatumGetInt64(v);
 	}
 	SPI_finish();
 	overlay_overlay_helper_exit();
 	pfree(sqlstr);
+
+	ob_synth_seq_init();
+	memset(&skey, 0, sizeof(skey));
+	skey.branch_id = branch_id;
+	skey.relid = relid;
+	sentry = (ObSynthSeqEntry *) hash_search(ob_synth_seq_hash, &skey,
+											 HASH_ENTER, &found);
+	if (!found)
+		sentry->last_seq = 0;
+	cached = sentry->last_seq;
+
+	next = (db_max > cached ? db_max : cached) + 1;
+	sentry->last_seq = next;
 
 	return psprintf("S:" INT64_FORMAT, (int64) next);
 }

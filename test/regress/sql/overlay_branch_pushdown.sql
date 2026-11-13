@@ -69,7 +69,7 @@ CREATE SEQUENCE ob_pd_seq;
 CREATE FUNCTION ob_pd_vol_true(x int) RETURNS boolean LANGUAGE sql VOLATILE
   AS $$ SELECT nextval('ob_pd_seq') > 0 $$;
 
-SELECT overlay_branch.create_branch('ob_pd_b1');
+SELECT overlay_branch.create_branch('ob_pd_b1') > 0 AS ob_pd_b1_created;
 SELECT overlay_branch.use_branch('ob_pd_b1');
 
 -- ---- Overlay edits (all four op shapes against grp=7) ----

@@ -37,6 +37,12 @@
  *   AF.6  targetless DO NOTHING: branch UPDATE moved the value; a live
  *         conflict still skips, the freed value inserts
  *   AF.7  MAIN pristine after leaving; apply materializes both tables
+ *   AG.1  same-command duplicate arbiter value under DO UPDATE   -> ERROR 21000
+ *   AG.2  a DO UPDATE MOVES the arbiter column, then a second row proposing
+ *         the moved value                                   -> ERROR 21000
+ *   AG.3  neither refused statement wrote a delta row (overlay == MAIN)
+ *   AG.4  distinct arbiter keys in one multi-row DO UPDATE still apply
+ *   AG.5  MAIN pristine after leaving; apply materializes AG.4
  *
  * Dependencies:
  *   none (standalone; creates and drops its own tables/branch).
@@ -59,6 +65,7 @@ DROP TABLE IF EXISTS public.bs_AE_expr;
 DROP TABLE IF EXISTS public.bs_AE_plain;
 DROP TABLE IF EXISTS public.bs_AF_up;
 DROP TABLE IF EXISTS public.bs_AF_dn;
+DROP TABLE IF EXISTS public.bs_AG_up;
 DROP EXTENSION IF EXISTS overlay_branch CASCADE;
 RESET client_min_messages;
 CREATE EXTENSION IF NOT EXISTS overlay_branch;
@@ -455,3 +462,108 @@ FROM public.bs_AF_dn;
 RESET client_min_messages;
 DROP TABLE public.bs_AF_up;
 DROP TABLE public.bs_AF_dn;
+/* =========================================================== Section AG */
+-- AG.* SAME-COMMAND duplicate NON-PK UNIQUE arbiter keys.  A single
+--      INSERT ... ON CONFLICT DO UPDATE whose VALUES list proposes the
+--      same arbiter key twice must raise 21000 (cardinality_violation),
+--      exactly like upstream ("cannot affect row a second time").  The
+--      command counter never advances between rows of one command, so
+--      the delta Phase I/II probes cannot see an earlier row written by
+--      THIS command; the write path tracks the arbiter keys it has
+--      already claimed for the statement.  Two shapes:
+--        AG.1 the two rows propose the SAME arbiter value;
+--        AG.2 a DO UPDATE MOVES the arbiter column, so the value the
+--             second row proposes is the one the first row just wrote --
+--             hence the post-image arbiter key must be claimed too.
+SET client_min_messages = warning;
+CREATE TABLE public.bs_AG_up (id INT4 PRIMARY KEY, u INT4 UNIQUE, v TEXT);
+INSERT INTO public.bs_AG_up VALUES (1,1,'a'),(2,2,'b');
+SELECT overlay_branch.create_branch('bs_AG_br');
+ create_branch 
+---------------
+             4
+(1 row)
+
+SELECT overlay_branch.use_branch('bs_AG_br');
+ use_branch 
+------------
+ 
+(1 row)
+
+-- AG.1 both rows propose u=1 -> DO UPDATE 21000
+DO $$
+BEGIN
+  BEGIN
+    INSERT INTO public.bs_AG_up VALUES (5,1,'x'),(6,1,'y')
+      ON CONFLICT (u) DO UPDATE SET v = EXCLUDED.v;
+    RAISE EXCEPTION 'FAIL_AG1_NO_ERROR';
+  EXCEPTION WHEN cardinality_violation THEN NULL;
+  END;
+END $$;
+-- AG.2 first row moves u 1->9 via DO UPDATE; the second row proposes u=9 -> 21000
+DO $$
+BEGIN
+  BEGIN
+    INSERT INTO public.bs_AG_up VALUES (5,1,'x'),(6,9,'y')
+      ON CONFLICT (u) DO UPDATE SET u = 9, v = EXCLUDED.v;
+    RAISE EXCEPTION 'FAIL_AG2_NO_ERROR';
+  EXCEPTION WHEN cardinality_violation THEN NULL;
+  END;
+END $$;
+-- AG.3 neither refused statement wrote a delta row (overlay == MAIN)
+SELECT CASE WHEN string_agg(id||':'||u||':'||v, ',' ORDER BY id) = '1:1:a,2:2:b'
+            THEN 'PASS:AG3_NO_DELTA'
+            ELSE 'FAIL:'||coalesce(string_agg(id||':'||u||':'||v, ',' ORDER BY id),'empty') END AS ag3
+FROM overlay_branch.overlay_main_plus_delta('public.bs_AG_up') AS t(id int, u int, v text);
+        ag3        
+-------------------
+ PASS:AG3_NO_DELTA
+(1 row)
+
+-- AG.4 distinct arbiter keys in one multi-row DO UPDATE still apply (no false 21000)
+INSERT INTO public.bs_AG_up VALUES (7,9,'c'),(8,10,'d')
+  ON CONFLICT (u) DO UPDATE SET v = EXCLUDED.v;
+SELECT CASE WHEN string_agg(id||':'||u||':'||v, ',' ORDER BY id) = '1:1:a,2:2:b,7:9:c,8:10:d'
+            THEN 'PASS:AG4_DISTINCT_OK'
+            ELSE 'FAIL:'||coalesce(string_agg(id||':'||u||':'||v, ',' ORDER BY id),'empty') END AS ag4
+FROM overlay_branch.overlay_main_plus_delta('public.bs_AG_up') AS t(id int, u int, v text);
+         ag4          
+----------------------
+ PASS:AG4_DISTINCT_OK
+(1 row)
+
+-- AG.5 MAIN pristine after leaving; apply materializes AG.4
+SELECT overlay_branch.use_branch(NULL);
+ use_branch 
+------------
+ 
+(1 row)
+
+RESET overlay_branch.current;
+SET overlay_branch.current = '';
+SELECT CASE WHEN string_agg(id||':'||u||':'||v, ',' ORDER BY id) = '1:1:a,2:2:b'
+            THEN 'PASS:AG5_MAIN_PRISTINE'
+            ELSE 'FAIL:'||coalesce(string_agg(id||':'||u||':'||v, ',' ORDER BY id),'empty') END AS ag5
+FROM public.bs_AG_up;
+          ag5           
+------------------------
+ PASS:AG5_MAIN_PRISTINE
+(1 row)
+
+SELECT overlay_branch.apply_branch('bs_AG_br');
+ apply_branch 
+--------------
+ 
+(1 row)
+
+SELECT CASE WHEN string_agg(id||':'||u||':'||v, ',' ORDER BY id) = '1:1:a,2:2:b,7:9:c,8:10:d'
+            THEN 'PASS:AG5_APPLIED'
+            ELSE 'FAIL:'||coalesce(string_agg(id||':'||u||':'||v, ',' ORDER BY id),'empty') END AS ag5b
+FROM public.bs_AG_up;
+       ag5b       
+------------------
+ PASS:AG5_APPLIED
+(1 row)
+
+RESET client_min_messages;
+DROP TABLE public.bs_AG_up;

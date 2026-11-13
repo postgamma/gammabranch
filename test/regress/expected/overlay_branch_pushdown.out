@@ -71,10 +71,10 @@ SELECT count(*) AS pd_main_cnt FROM ob_pd;                       -- expect 200
 CREATE SEQUENCE ob_pd_seq;
 CREATE FUNCTION ob_pd_vol_true(x int) RETURNS boolean LANGUAGE sql VOLATILE
   AS $$ SELECT nextval('ob_pd_seq') > 0 $$;
-SELECT overlay_branch.create_branch('ob_pd_b1');
- create_branch 
----------------
-            15
+SELECT overlay_branch.create_branch('ob_pd_b1') > 0 AS ob_pd_b1_created;
+ ob_pd_b1_created 
+------------------
+ t
 (1 row)
 
 SELECT overlay_branch.use_branch('ob_pd_b1');

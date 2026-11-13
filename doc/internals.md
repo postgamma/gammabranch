@@ -473,18 +473,29 @@ unchanged still hits Phase I by its stored image and keeps `DO UPDATE` semantics
 **Same-statement duplicate arbiter keys.** The command counter does not advance
 between the rows of a single command, so the Phase I/II and R21 SPI probes can
 never see a delta row written by an earlier row of the *same* command. The
-INSERT loop therefore keeps a per-statement hash set of the arbiter keys it has
-already claimed (any table with a PK; keyed by the full serialized identity, so
-it covers composite PKs too). A row claims its key exactly
-when it is written — `promo=1/2/3` add the key; a `DO NOTHING` skip or a
-`DO UPDATE ... WHERE <false>` skip does not. When a later candidate's key is
-already claimed, the loop reproduces native behavior: plain INSERT raises
-`23505` `unique_violation`, `DO UPDATE` raises `21000` `cardinality_violation`,
-and `DO NOTHING` skips the row (first row wins). This mirrors stock PostgreSQL,
-where a duplicate arbiter value inside one command is caught at the index level
-for plain INSERT / DO NOTHING and by the "cannot affect row a second time" check
-for `DO UPDATE`. A keyless table has no arbiter constraint to violate, so the
-set is not built and every row is inserted, exactly as upstream.
+INSERT loop therefore keeps a per-statement hash set of the arbitration keys it
+has already claimed, keyed by typed column values (so `=`-equal rows with
+different text forms — numeric `1.0` vs `1.00`, timestamptz offsets — still
+collide, and composite keys are covered). The claim columns are the PRIMARY KEY
+columns when the arbiter is the PK, or the resolved non-PK UNIQUE arbiter
+columns otherwise; the set is built for any table with a PK **and** for a
+keyless table whose UPSERT arbiter resolves to a single non-partial
+plain-column UNIQUE index — such a table has no PK identity, but its arbiter is
+a real uniqueness constraint a same-statement duplicate can violate. A row
+claims its key exactly when it is written: `promo=1/2/3` add the claim, a
+`DO NOTHING` skip or a `DO UPDATE ... WHERE <false>` skip does not. A
+`DO UPDATE` that **moves** a non-PK UNIQUE arbiter column also claims the
+**post-image** arbiter key, because the rewritten row now holds that value and a
+later row of the same command proposing it targets the very row the statement
+already affected. When a later candidate's key is already claimed, the loop
+reproduces native behavior: plain INSERT raises `23505` `unique_violation`,
+`DO UPDATE` raises `21000` `cardinality_violation`, and `DO NOTHING` skips the
+row (first row wins). This mirrors stock PostgreSQL, where a duplicate arbiter
+value inside one command is caught at the index level for plain INSERT /
+DO NOTHING and by the "cannot affect row a second time" check for `DO UPDATE`. A
+keyless table with **no** resolved arbiter (no `ON CONFLICT` target, or a
+refused one) has no arbiter constraint to violate, so the set is not built and
+every row is inserted, exactly as upstream.
 
 **Eager NOT NULL / CHECK validation.** The write-redirect short-circuits
 `standard_ExecutorRun()`, so the executor's own `ExecConstraints()` never runs
@@ -1199,7 +1210,7 @@ apply time as a conflict), and hints at adding a PRIMARY KEY.
 | Row origin | key encoding | Notes |
 |---|---|---|
 | Present in MAIN (anchored) | `A:<blk>:<off>` | from the slot's `ctid` |
-| Not in MAIN (synthetic INSERT) | `S:<seq>` | monotonic per `(branch_id, relid)`, `seq = 1 + MAX(existing S: seq)` |
+| Not in MAIN (synthetic INSERT) | `S:<seq>` | monotonic per `(branch_id, relid)`; `seq = 1 + max(durable MAX(S: seq), per-backend high-water)` |
 
 `old_version` stays a `blk:off-x<xmin>` token.
 
@@ -1207,7 +1218,15 @@ apply time as a conflict), and hints at adding a PRIMARY KEY.
 
 **Write** uses one unified identity serializer: PK relation → PK serialization
 (status quo); non-PK INSERT with no MAIN origin → `S:<nextseq>`; otherwise
-`A:<ctid>`. **Read** keeps its 2-pass structure; only identity extraction and
+`A:<ctid>`. The `S:` allocator cannot derive `nextseq` from a durable `MAX()`
+probe alone: the command counter does not advance between the rows of one
+command, so a row written earlier in the *same* command is invisible to the
+probe, every row would mint the same key, and the delta primary key
+`(branch_id, relid, key)` would let the last write overwrite the rest (silent
+row loss). It therefore keeps a per-backend high-water mark per
+`(branch_id, relid)` and takes `1 + max(durable MAX, high-water)`; the mark only
+advances within a command, so a rollback leaves at most a gap, never a
+duplicate. **Read** keeps its 2-pass structure; only identity extraction and
 comparison change — Pass 1 uses the MAIN slot's ctid as `A:<blk>:<off>` with an
 empty typed key (comparator falls back to `strcmp`), and Pass 2 appends leftover
 `op='I'` plus unanchored `A:*` orphans. The planner hook injects only under the
@@ -1314,6 +1333,12 @@ columns, so all downstream promotion and apply behaviour is unchanged:
 `MERGE` / `COPY FROM` / DML-CTE, and a keyless UPSERT whose arbiter does not
 resolve to exactly one UNIQUE index; consistency under concurrent `DELETE` /
 whole-table rewrites (silent drop on the read side, apply error as fallback).
+Concurrent branch-only INSERTs from **different sessions** into the same keyless
+table are likewise unsafe: the `S:` high-water mark is per-backend, so two
+sessions can mint the same `S:<seq>` and the delta `ON CONFLICT` upsert silently
+keeps only one row. Within a single command the per-backend mark is exact (the
+common case); cross-session collisions need the writers to be serialized, or a
+PRIMARY KEY, exactly like the anchor fragility above.
 
 ---
 

@@ -47,6 +47,15 @@
  *            plain INSERT), while it does conflict under NULLS NOT
  *            DISTINCT.  Regression: a NULL arbiter value used to bind a
  *            bogus (Datum) 0 text payload and crash the server.
+ *   Part J — multi-row INSERT retention and same-command duplicate
+ *            arbiter keys.  J.1: a single multi-row INSERT (with or
+ *            without ON CONFLICT) mints a distinct "S:<seq>" for every
+ *            row — the allocator must not rely on a durable MAX() probe
+ *            alone, because rows written earlier in the SAME command are
+ *            invisible (no CCI) and every row would otherwise reuse the
+ *            same key, silently overwriting all but the last.  J.2-J.4:
+ *            a same-command duplicate arbiter key under DO UPDATE raises
+ *            21000, DO NOTHING is first-wins, a plain INSERT is 23505.
  *
  * Style rules (identical to the sibling regression files so pg_regress
  * expected .out files stay diff-stable across machines/runs):
@@ -76,7 +85,7 @@ DROP TABLE IF EXISTS public.kn_off, public.kn_on, public.kn_race,
                      public.kn_pk,  public.kn_ups, public.kn_ups2,
                      public.kn_expr, public.kn_move, public.kn_da,
                      public.kn_db, public.kn_nd, public.kn_nd2,
-                     public.kn_reb CASCADE;
+                     public.kn_reb, public.kn_mr, public.kn_dup CASCADE;
 DROP EXTENSION IF EXISTS overlay_branch CASCADE;
 RESET client_min_messages;
 CREATE EXTENSION IF NOT EXISTS overlay_branch;
@@ -535,6 +544,94 @@ SELECT CASE WHEN count(*) = 2
             ELSE 'FAIL:I2_APPLIED:'||count(*)||':'||string_agg(id::text||'='||COALESCE(u::text,'~')||'/'||v, ',' ORDER BY id) END AS i2b
 FROM public.kn_nd2;
 
+/* =====================================================================
+ * Part J — multi-row INSERT retention + same-command duplicate arbiter
+ *   keys.
+ *   J.1 (regression) a single multi-row INSERT ... VALUES on a keyless
+ *       table must keep EVERY row.  The synthetic key "S:<seq>" used to
+ *       be derived solely from a durable MAX() probe; because the command
+ *       counter does not advance between rows of one command, every row
+ *       computed the same S:<n>, so the delta primary key made each later
+ *       row overwrite the earlier one and all but the last were silently
+ *       lost.  Both a plain INSERT and an ON CONFLICT INSERT are covered.
+ *   J.2 a same-command duplicate arbiter key under DO UPDATE -> 21000
+ *       (native "cannot affect row a second time"); the same-statement
+ *       claim set must be built for a keyless table whose UPSERT arbiter
+ *       resolves to a UNIQUE index.
+ *   J.3 a DO UPDATE that MOVES the arbiter column, then a second row
+ *       proposing the moved value -> 21000.
+ *   J.4 same-command duplicate under DO NOTHING is first-wins; under a
+ *       plain INSERT it is 23505.
+ * ===================================================================== */
+SET overlay_branch.keyless_tables = on;
+
+-- J.1 distinct keys, one multi-row INSERT, must keep every row.
+CREATE TABLE public.kn_mr (u int UNIQUE, v text);
+INSERT INTO public.kn_mr VALUES (1,'a'),(2,'b');
+SELECT create_branch('kn_mr_br') AS id_kn_mr_br;
+SELECT use_branch('kn_mr_br');
+INSERT INTO public.kn_mr VALUES (5,'x'),(6,'y'),(7,'z');
+INSERT INTO public.kn_mr VALUES (8,'p'),(9,'q') ON CONFLICT (u) DO UPDATE SET v = EXCLUDED.v;
+SELECT CASE WHEN count(*) = 7
+             AND string_agg(u::text||'='||v, ',' ORDER BY u) = '1=a,2=b,5=x,6=y,7=z,8=p,9=q'
+            THEN 'PASS:J1_MULTIROW_KEPT'
+            ELSE 'FAIL:J1:'||count(*)||':'||string_agg(u::text||'='||v, ',' ORDER BY u) END AS j1
+FROM public.kn_mr;
+SELECT use_branch(NULL);
+RESET overlay_branch.current;
+SET overlay_branch.current = '';
+SELECT apply_branch('kn_mr_br');
+SELECT CASE WHEN count(*) = 7
+             AND string_agg(u::text||'='||v, ',' ORDER BY u) = '1=a,2=b,5=x,6=y,7=z,8=p,9=q'
+            THEN 'PASS:J1_MULTIROW_APPLIED'
+            ELSE 'FAIL:J1_APPLIED:'||count(*)||':'||string_agg(u::text||'='||v, ',' ORDER BY u) END AS j1b
+FROM public.kn_mr;
+
+-- J.2/J.3 same-command duplicate arbiter key -> 21000.
+CREATE TABLE public.kn_dup (u int UNIQUE, v text);
+INSERT INTO public.kn_dup VALUES (1,'a'),(2,'b');
+SELECT create_branch('kn_dup_br') AS id_kn_dup_br;
+SELECT use_branch('kn_dup_br');
+
+DO $$
+BEGIN
+  INSERT INTO public.kn_dup VALUES (1,'x'),(1,'y') ON CONFLICT (u) DO UPDATE SET v = EXCLUDED.v;
+  RAISE NOTICE 'FAIL:J2_KEYLESS_DUP_DO_UPDATE_WAS_ALLOWED';
+EXCEPTION
+  WHEN cardinality_violation THEN RAISE NOTICE 'PASS:J2_KEYLESS_DUP_DO_UPDATE_21000';
+  WHEN OTHERS THEN RAISE NOTICE 'FAIL:J2_OTHER_SQLSTATE=%', SQLSTATE;
+END $$;
+
+DO $$
+BEGIN
+  INSERT INTO public.kn_dup VALUES (1,'x'),(9,'y') ON CONFLICT (u) DO UPDATE SET u = 9, v = EXCLUDED.v;
+  RAISE NOTICE 'FAIL:J3_KEYLESS_ARBITER_MOVE_WAS_ALLOWED';
+EXCEPTION
+  WHEN cardinality_violation THEN RAISE NOTICE 'PASS:J3_KEYLESS_ARBITER_MOVE_21000';
+  WHEN OTHERS THEN RAISE NOTICE 'FAIL:J3_OTHER_SQLSTATE=%', SQLSTATE;
+END $$;
+
+-- J.4 DO NOTHING same-command duplicate is first-wins; a plain INSERT is 23505.
+INSERT INTO public.kn_dup VALUES (3,'x'),(3,'y') ON CONFLICT (u) DO NOTHING;
+DO $$
+BEGIN
+  INSERT INTO public.kn_dup VALUES (4,'x'),(4,'y');
+  RAISE NOTICE 'FAIL:J4_KEYLESS_DUP_PLAIN_WAS_ALLOWED';
+EXCEPTION
+  WHEN unique_violation THEN RAISE NOTICE 'PASS:J4_KEYLESS_DUP_PLAIN_23505';
+  WHEN OTHERS THEN RAISE NOTICE 'FAIL:J4_OTHER_SQLSTATE=%', SQLSTATE;
+END $$;
+
+-- J.4b neither refused statement left a phantom delta row.
+SELECT CASE WHEN string_agg(u::text||'='||v, ',' ORDER BY u) = '1=a,2=b,3=x'
+            THEN 'PASS:J4_KEYLESS_DUP_OVERLAY'
+            ELSE 'FAIL:J4_KEYLESS_DUP_OVERLAY:'||string_agg(u::text||'='||v, ',' ORDER BY u) END AS j4
+FROM public.kn_dup;
+SELECT use_branch(NULL);
+RESET overlay_branch.current;
+SET overlay_branch.current = '';
+SELECT discard_branch('kn_dup_br');
+
 -- ===== Teardown =====
 RESET overlay_branch.keyless_tables;
 SET client_min_messages = warning;
@@ -542,5 +639,5 @@ DROP TABLE IF EXISTS public.kn_off, public.kn_on, public.kn_race,
                      public.kn_pk,  public.kn_ups, public.kn_ups2,
                      public.kn_expr, public.kn_move, public.kn_da,
                      public.kn_db, public.kn_nd, public.kn_nd2,
-                     public.kn_reb CASCADE;
+                     public.kn_reb, public.kn_mr, public.kn_dup CASCADE;
 RESET client_min_messages;

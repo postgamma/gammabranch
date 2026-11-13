@@ -409,7 +409,11 @@ rewritten is excluded from its own conflict probe.
 For `INSERT ... ON CONFLICT` the candidate row is checked before the conflict is
 resolved, and a `DO UPDATE` re-checks the merged row, so the behavior matches
 Main even when `DO NOTHING` or `DO UPDATE` would otherwise discard the offending
-value.
+value. Where Main reports `23505`, a `DO UPDATE` that would touch the same row
+twice in one command — two rows proposing the same arbiter value, or a
+`DO UPDATE` that moves the arbiter column onto a value a later row also proposes
+— raises `21000` `cardinality_violation` ("cannot affect row a second time")
+instead, and `DO NOTHING` keeps the first row.
 
 ```sql
 SELECT use_branch('agent_workspace');

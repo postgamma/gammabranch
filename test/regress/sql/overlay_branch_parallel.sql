@@ -41,7 +41,7 @@ ANALYZE ob_par;
 -- plan here, otherwise the assertions below would be vacuous.
 EXPLAIN (COSTS OFF) SELECT count(*) FROM ob_par;
 
-SELECT overlay_branch.create_branch('ob_par_b1');
+SELECT overlay_branch.create_branch('ob_par_b1') > 0 AS ob_par_b1_created;
 SELECT overlay_branch.use_branch('ob_par_b1');
 
 UPDATE ob_par SET v = 'b' || id WHERE id <= 10;                              -- 10 overlaid rows

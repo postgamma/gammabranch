@@ -102,7 +102,7 @@ CREATE TABLE ob_mem_big (id int PRIMARY KEY, v text);
 INSERT INTO ob_mem_big SELECT g, repeat('x', 600) || g FROM generate_series(1, 20000) g;
 ANALYZE ob_mem_big;
 
-SELECT overlay_branch.create_branch('ob_mem_b1');
+SELECT overlay_branch.create_branch('ob_mem_b1') > 0 AS ob_mem_b1_created;
 SELECT overlay_branch.use_branch('ob_mem_b1');
 
 UPDATE ob_mem SET v = 'u' || v WHERE id % 10 = 0;                          -- 200 overlaid rows

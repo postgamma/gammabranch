@@ -2450,17 +2450,24 @@ overlay_executor_run_intercept(QueryDesc *queryDesc,
 				/* Per-statement "claimed arbiter keys" set (see ob_claim_add /
 				 * ob_claim_lookup), plus a second set for non-PK UNIQUE
 				 * same-claim keys.  Both are keyed by typed column values.
-				 * The arbiter/PK set is only meaningful for a table with a
-				 * PK (a keyless table has no PK identity to violate); the
-				 * UNIQUE set is built for any table carrying a resolvable
-				 * non-PK UNIQUE index (a keyless table may still own one,
-				 * e.g. the UPSERT arbiter).  Both are parented to the query
-				 * context so an error longjmp frees them. */
+				 * The first set carries the arbitration identity: the PK
+				 * columns for a PRIMARY KEY arbiter, or the resolved non-PK
+				 * UNIQUE arbiter columns otherwise.  It is therefore built
+				 * for any table with a PK AND for a KEYLESS table whose
+				 * UPSERT arbiter resolves to a UNIQUE index -- such a table
+				 * has no PK identity, but its arbiter IS a real uniqueness
+				 * constraint a same-statement duplicate can violate (native
+				 * raises 21000 there).  The second set is built for any
+				 * table carrying a resolvable non-PK UNIQUE index (a keyless
+				 * table may still own one, e.g. the UPSERT arbiter).  Both
+				 * are parented to the query context so an error longjmp
+				 * frees them. */
 				{
 					bool		has_pk = overlay_relation_has_pk(rel);
 					bool		has_uq = ob_relation_has_resolvable_unique(rel);
+					bool		has_arb = (arb_natts > 0);
 
-					if (has_pk || has_uq)
+					if (has_pk || has_uq || has_arb)
 					{
 						HASHCTL		ctl;
 
@@ -2474,7 +2481,7 @@ overlay_executor_run_intercept(QueryDesc *queryDesc,
 						ctl.hcxt = claimed_cxt;
 						ctl.hash = ob_claimed_hash;
 						ctl.match = ob_claimed_match;
-						if (has_pk)
+						if (has_pk || has_arb)
 							claimed = hash_create("overlay_branch claimed keys", 64,
 												  &ctl,
 												  HASH_ELEM | HASH_FUNCTION | HASH_COMPARE | HASH_CONTEXT);
@@ -2528,8 +2535,10 @@ overlay_executor_run_intercept(QueryDesc *queryDesc,
 												 queryDesc->estate);
 
 				/* Same-statement duplicate check: was this key already written
-				 * by an earlier row of THIS command?  (`claimed` stays NULL
-				 * for keyless tables.)  The claim columns are the arbiter
+				 * by an earlier row of THIS command?  (`claimed` is NULL only
+				 * for a table with neither a PK nor a resolved arbiter -- a
+				 * keyless table whose UPSERT arbiter resolves to a UNIQUE
+				 * index still builds it.)  The claim columns are the arbiter
 				 * columns when the ON CONFLICT arbiter is a NON-primary
 				 * UNIQUE index — a non-PK arbiter may match a row whose PK
 				 * differs from the proposed one, so the PK is not the
@@ -3570,6 +3579,22 @@ overlay_executor_run_intercept(QueryDesc *queryDesc,
 											 (arb_natts > 0) ? arb_attnos : pk_attnos,
 											 (arb_natts > 0) ? arb_natts : pk_natts,
 											 (arb_natts > 0) ? arb_nulls_not_distinct : true,
+											 claimed, claimed_cxt);
+							/* A DO UPDATE can MOVE a non-primary UNIQUE arbiter
+							 * column: the rewritten row then holds the
+							 * post-image value, so a later row of this same
+							 * command proposing that value targets the very
+							 * row this one just rewrote -- native raises 21000
+							 * ("cannot affect row a second time").  Claim the
+							 * post-image arbiter key too so the loop catches
+							 * it.  (A PK arbiter cannot be mutated -- the R03
+							 * check above forbids it -- so only a non-PK
+							 * arbiter needs the extra claim.) */
+							if (claimed != NULL && arb_natts > 0 &&
+								post_image != NULL && !TupIsNull(post_image))
+								ob_claim_add(rel, post_image,
+											 arb_attnos, arb_natts,
+											 arb_nulls_not_distinct,
 											 claimed, claimed_cxt);
 							overlay_delta_insert(bid, relid, delta_key,
 												 DELTA_OP_UPDATE, old_version, tdata);
