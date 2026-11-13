@@ -1768,6 +1768,49 @@ ob_type_needs_lc_monetary_pin(Oid typid)
 }
 
 /*
+ * ob_type_needs_extra_float_digits_pin
+ *
+ *	True for float4 / float8 (directly, or through a domain / array /
+ *	range / multirange), the one family whose OUTPUT text is not
+ *	round-trip-safe once the session lowered extra_float_digits.
+ *
+ *	float8out prints the shortest representation that re-parses to the
+ *	same value only while extra_float_digits > 0 (the engine default and
+ *	the canonical pin value).  A session that sets it to 0 or below gets
+ *	a SHORT rendering -- 0.1 + 0.2 prints "0.3" instead of
+ *	"0.30000000000000004" -- and that text re-parses to a DIFFERENT
+ *	float8.  The write path always renders its stored payload / identity
+ *	under the canonical pin, but every text-based conflict probe renders
+ *	a LIVE candidate column and compares it as "$n::text::float8": under
+ *	such a session the probe renders lossy text, mismatches the exact
+ *	stored value, and the redirect silently accepts a duplicate that MAIN
+ *	would have rejected.  Sites that render a candidate for such a probe
+ *	must render under the canonical pin; this predicate gates that pin
+ *	(peels a domain, then recurses like the two predicates above) so a
+ *	non-float key column pays nothing.
+ */
+bool
+ob_type_needs_extra_float_digits_pin(Oid typid)
+{
+	Oid			elem;
+
+	typid = getBaseType(typid);
+
+	elem = get_element_type(typid);
+	if (OidIsValid(elem))
+		return ob_type_needs_extra_float_digits_pin(elem);
+
+	if (get_typtype(typid) == TYPTYPE_RANGE)
+		return ob_type_needs_extra_float_digits_pin(get_range_subtype(typid));
+
+	if (get_typtype(typid) == TYPTYPE_MULTIRANGE)
+		return ob_type_needs_extra_float_digits_pin(
+											get_range_subtype(get_multirange_range(typid)));
+
+	return typid == FLOAT4OID || typid == FLOAT8OID;
+}
+
+/*
  * ob_relation_needs_lc_monetary_pin
  *
  *	True when any live column of `rel` carries money (directly, as an

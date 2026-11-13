@@ -395,6 +395,25 @@ the type switch, so a domain over a sensitive type — or an array of one, or a
 **range** over one — is pinned exactly like its base type (a `tstzrange` /
 `daterange` bound is a `timestamptz` / `date`).
 
+**The conflict probes render under the same pin.** The serializers above pin the
+*stored* text, but the write-side duplicate-key probes — the PK/UNIQUE delta
+probe `ob_unique_target_conflict`, the UPSERT Phase I/II arbiters, and the R21
+MAIN pre-check — instead render a *live candidate* column and bind it back as
+`col = $n::text::<type>`. That cast re-parses the rendered text through the
+type's input function, so the render must round-trip. Every other
+GUC-dependent type does so under the session's *own* GUC: the output and the
+re-parse use the same setting, so a self-consistent pair (`timestamptz` keeps
+its zone offset, `date` reorders the same way, `interval` / `bytea` likewise).
+`float4` / `float8` are the exception — output under a *lowered*
+`extra_float_digits` is lossy, not merely differently formatted: `0.1 + 0.2`
+prints `0.3` and `'0.3'::float8` is a *different* float than the candidate, so
+the probe matched nothing and silently accepted a duplicate key that MAIN
+rejects with `23505`. The probes therefore funnel every candidate render through
+`ob_canonical_output()`, which pins `extra_float_digits` (gated by
+`ob_type_needs_extra_float_digits_pin`, a domain / array / range / multirange
+recursion matching only `FLOAT4OID` / `FLOAT8OID`) around the one output call
+and is a no-op for every other type.
+
 ### 1.6 Incremental write path
 
 Entry is the `ExecutorRun` intercept. Core invariant: the MAIN heap is never

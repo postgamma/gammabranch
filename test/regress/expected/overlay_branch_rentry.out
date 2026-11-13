@@ -5134,3 +5134,110 @@ SELECT overlay_branch.discard_branch('br_r37');
 DROP TABLE public.t_r37;
 DROP ROLE ob_rls_role37;
 RESET client_min_messages;
+-- =====================================================================
+-- ===== R38: float key identity under a lowered extra_float_digits ====
+-- ---------------------------------------------------------------------
+--   Every write-side conflict probe renders a live candidate column as
+--   "col = $n::text::<type>" and lets the input function rebuild it, so
+--   the rendered text must round-trip.  float4/float8 output honours
+--   extra_float_digits: at the canonical value (1) it prints the shortest
+--   text that re-parses to the SAME float, but a session that lowered it
+--   to 0 gets a SHORT text -- 0.1 + 0.2 prints "0.3" instead of
+--   "0.30000000000000004" -- that re-parses to a DIFFERENT float8.  The
+--   probe used to render the live candidate under the session GUC, so it
+--   mismatched the exact stored value and SILENTLY accepted a duplicate
+--   that MAIN rejects with 23505.  R38 drives the whole scenario with
+--   extra_float_digits = 0 and asserts the branch rejects it like MAIN.
+--
+-- COVERAGE:
+--   R38_A : duplicate non-PK UNIQUE float value -> 23505 (was accepted)
+--   R38_B : a genuinely distinct float is still accepted
+--   R38_C : duplicate float PRIMARY KEY value -> 23505 (was accepted)
+-- =====================================================================
+SET client_min_messages = WARNING;
+SET extra_float_digits = 0;
+CREATE TABLE public.t_r38u (id int PRIMARY KEY, f float8);
+CREATE UNIQUE INDEX t_r38u_f ON public.t_r38u (f);
+INSERT INTO public.t_r38u VALUES (1, 0.1::float8 + 0.2::float8);
+SELECT overlay_branch.create_branch('br_r38u');
+ create_branch 
+---------------
+            39
+(1 row)
+
+SELECT overlay_branch.use_branch('br_r38u');
+ use_branch 
+------------
+ 
+(1 row)
+
+SHOW extra_float_digits;
+ extra_float_digits 
+--------------------
+ 0
+(1 row)
+
+-- R38_A: the 0.1 + 0.2 candidate collides with the stored 0.3+epsilon row.
+INSERT INTO public.t_r38u VALUES (2, 0.1::float8 + 0.2::float8);
+ERROR:  duplicate key value violates unique constraint "t_r38u_f"
+DETAIL:  A conflicting row already exists in this branch (overlay INSERT/UPDATE pre-check).
+-- R38_B: 0.7 is a different float8 and is accepted.
+INSERT INTO public.t_r38u VALUES (3, 0.7::float8);
+SELECT CASE WHEN count(*) = 2 THEN 'PASS:R38_B_DISTINCT_FLOAT_ACCEPTED'
+            ELSE 'FAIL:R38_B rows=' || count(*) END AS r38_b
+  FROM public.t_r38u;
+               r38_b                
+------------------------------------
+ PASS:R38_B_DISTINCT_FLOAT_ACCEPTED
+(1 row)
+
+SELECT overlay_branch.use_branch(NULL);
+ use_branch 
+------------
+ 
+(1 row)
+
+RESET overlay_branch.current;
+SET overlay_branch.current = '';
+SELECT overlay_branch.discard_branch('br_r38u');
+ discard_branch 
+----------------
+ 
+(1 row)
+
+DROP TABLE public.t_r38u;
+-- R38_C: the same precision loss on a float PRIMARY KEY (R21 MAIN probe).
+CREATE TABLE public.t_r38p (id float8 PRIMARY KEY, v int);
+INSERT INTO public.t_r38p VALUES (0.1::float8 + 0.2::float8, 1);
+SELECT overlay_branch.create_branch('br_r38p');
+ create_branch 
+---------------
+            40
+(1 row)
+
+SELECT overlay_branch.use_branch('br_r38p');
+ use_branch 
+------------
+ 
+(1 row)
+
+INSERT INTO public.t_r38p VALUES (0.1::float8 + 0.2::float8, 2);
+ERROR:  duplicate key value violates unique constraint on relation "t_r38p"
+DETAIL:  Key (id)=(0.30000000000000004) already exists in MAIN heap (R21 pre-check).
+SELECT overlay_branch.use_branch(NULL);
+ use_branch 
+------------
+ 
+(1 row)
+
+RESET overlay_branch.current;
+SET overlay_branch.current = '';
+SELECT overlay_branch.discard_branch('br_r38p');
+ discard_branch 
+----------------
+ 
+(1 row)
+
+DROP TABLE public.t_r38p;
+RESET extra_float_digits;
+RESET client_min_messages;

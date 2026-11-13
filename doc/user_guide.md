@@ -1419,6 +1419,14 @@ INSERT INTO bs_guc_f VALUES ('0'::float8, 'pos');
 ERROR:  duplicate key value violates unique constraint on relation "bs_guc_f"
 DETAIL:  Key (k)=(0) already exists in branch delta (R21 pre-check).
 
+-- the same float8 value collides even when the session lowered extra_float_digits
+SET extra_float_digits = 0;
+INSERT INTO bs_guc_f VALUES (0.1::float8 + 0.2::float8, 'x');
+INSERT INTO bs_guc_f VALUES (0.1::float8 + 0.2::float8, 'y');
+ERROR:  duplicate key value violates unique constraint on relation "bs_guc_f"
+DETAIL:  Key (k)=(0.30000000000000004) already exists in branch delta (R21 pre-check).
+RESET extra_float_digits;
+
 -- bytea: hex vs escape spelling of the same bytes
 SET bytea_output = 'hex';
 INSERT INTO bs_guc_b VALUES ('\x00'::bytea, 'h');

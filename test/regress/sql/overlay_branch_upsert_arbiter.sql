@@ -538,6 +538,32 @@ END $$;
 SELECT overlay_branch.use_branch(NULL);
 SELECT overlay_branch.discard_branch('bs_AH_nd_br');
 
+-- AH.6 A float8 ON CONFLICT arbiter must match a row even when the session
+--      lowered extra_float_digits.  The arbiter probe binds the live
+--      candidate as "$n::text::float8"; under a lowered extra_float_digits
+--      the render used to lose precision (0.1 + 0.2 -> "0.3") and the
+--      conflict was missed, so the branch INSERTed a second row instead of
+--      taking the DO UPDATE path.  With the canonical render restored the
+--      arbiter matches exactly like MAIN (one row, unchanged PK).
+SET extra_float_digits = 0;
+CREATE TABLE public.bs_AH_flt (id INT4 PRIMARY KEY, f FLOAT8);
+CREATE UNIQUE INDEX bs_AH_flt_f ON public.bs_AH_flt (f);
+INSERT INTO public.bs_AH_flt VALUES (1, 0.1::float8 + 0.2::float8);
+SELECT overlay_branch.create_branch('bs_AH_flt_br');
+SELECT overlay_branch.use_branch('bs_AH_flt_br');
+INSERT INTO public.bs_AH_flt VALUES (2, 0.1::float8 + 0.2::float8)
+  ON CONFLICT (f) DO UPDATE SET id = public.bs_AH_flt.id;
+SELECT CASE WHEN string_agg(id||':'||f, ',' ORDER BY id) = '1:0.3'
+            THEN 'PASS:AH6_FLOAT_ARBITER_MATCH'
+            ELSE 'FAIL:'||coalesce(string_agg(id||':'||f, ',' ORDER BY id),'empty') END AS ah6
+FROM overlay_branch.overlay_main_plus_delta('public.bs_AH_flt') AS t(id int, f float8);
+SELECT overlay_branch.use_branch(NULL);
+RESET overlay_branch.current;
+SET overlay_branch.current = '';
+SELECT overlay_branch.discard_branch('bs_AH_flt_br');
+RESET extra_float_digits;
+DROP TABLE public.bs_AH_flt;
+
 RESET client_min_messages;
 DROP TABLE public.bs_AH_def;
 DROP TABLE public.bs_AH_confl;

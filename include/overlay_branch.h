@@ -610,11 +610,19 @@ extern TupleTableSlot  *reconstruct_slot_from_delta(Relation rel, bytea *tuple_d
  * as well (cash_in rejects a foreign currency symbol), so the delta probes
  * and the apply replay pin around their parse when the relation carries a
  * money column.
+ *
+ * The PRODUCER side of a text-based conflict probe (rendering a live
+ * candidate column for a "$n::text::<type>" rebind) has the mirror-image
+ * need: the rendered text must re-parse to the same value.  Only float4 /
+ * float8 are lossy here (extra_float_digits <= 0 yields a short rendering
+ * that round-trips to a different float), so those render sites pin the
+ * canonical GUCs when the column is float (ob_type_needs_extra_float_digits_pin).
  * ---------- */
 extern int              ob_canonical_guc_pin(void);
 extern void             ob_canonical_guc_unpin(int nestlevel);
 extern bool             ob_type_needs_lc_monetary_pin(Oid typid);
 extern bool             ob_relation_needs_lc_monetary_pin(Relation rel);
+extern bool             ob_type_needs_extra_float_digits_pin(Oid typid);
 
 /* ----------
  * Slot/fetch helpers (delta_store.c) — used by write_redirect.c

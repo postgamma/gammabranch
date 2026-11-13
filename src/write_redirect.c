@@ -230,6 +230,53 @@ ob_resolve_upsert_arbiter(ResultRelInfo *rri, AttrNumber **attnos_out,
 }
 
 /* ----------------------------------------------------------------
+ * ob_canonical_output
+ *
+ *   Output-function render of `value` guaranteed to re-parse back to the
+ *   same value through the type's input function.
+ *
+ *   The text-based conflict probes bind a live candidate column as
+ *   "$n::text::<type>" and let the input function rebuild it, so the
+ *   rendered text must round-trip.  For every type except float4 / float8
+ *   the output already does (numeric prints shortest-exact, a timestamptz
+ *   prints an offset that re-parses to the same instant, bytea round-trips
+ *   in either bytea_output mode, ...).  Float output honours
+ *   extra_float_digits: at the canonical value (1) it prints the shortest
+ *   text that round-trips, but a session that lowered it to <= 0 gets a
+ *   lossy short rendering ("0.3" for 0.30000000000000004) that re-parses to
+ *   a DIFFERENT float8 -- the probe then misses a real conflict.  Pin the
+ *   canonical GUCs around the render for the float family and leave every
+ *   other type untouched, so a non-float key pays nothing.
+ * ----------------------------------------------------------------
+ */
+static char *
+ob_canonical_output(Oid typid, Datum value)
+{
+	Oid			outfunc;
+	bool		isvarlena;
+	char	   *result = NULL;
+	int			guc_nl;
+
+	getTypeOutputInfo(typid, &outfunc, &isvarlena);
+
+	if (!ob_type_needs_extra_float_digits_pin(typid))
+		return OidOutputFunctionCall(outfunc, value);
+
+	guc_nl = ob_canonical_guc_pin();
+	PG_TRY();
+	{
+		result = OidOutputFunctionCall(outfunc, value);
+	}
+	PG_FINALLY();
+	{
+		ob_canonical_guc_unpin(guc_nl);
+	}
+	PG_END_TRY();
+
+	return result;
+}
+
+/* ----------------------------------------------------------------
  * ob_slot_col_text
  *
  *   Render one column of a (possibly virtual) slot as text via the
@@ -246,12 +293,9 @@ ob_slot_col_text(Relation rel, TupleTableSlot *slot, AttrNumber attno,
 	TupleDesc	reldesc = RelationGetDescr(rel);
 	int			attidx = attno - 1;
 	Oid			typ;
-	Oid			outfunc;
-	bool		isvarlena;
 	Datum		d;
 
 	typ = TupleDescAttr(reldesc, attidx)->atttypid;
-	getTypeOutputInfo(typ, &outfunc, &isvarlena);
 
 	if (TTS_IS_VIRTUAL(slot))
 	{
@@ -272,7 +316,7 @@ ob_slot_col_text(Relation rel, TupleTableSlot *slot, AttrNumber attno,
 
 	if (*isnull)
 		return NULL;
-	return OidOutputFunctionCall(outfunc, d);
+	return ob_canonical_output(typ, d);
 }
 
 /* ----------------------------------------------------------------
@@ -747,12 +791,12 @@ r21_check_insert_preconditions(Relation rel, TupleTableSlot *slot,
 			}
 			else
 			{
-				Oid			out_func;
-				bool		out_varlena;
 				char	   *valtxt;
 
-				getTypeOutputInfo(att->atttypid, &out_func, &out_varlena);
-				valtxt = OidOutputFunctionCall(out_func, d);
+				/* Canonical render: this text is bound as the MAIN probe
+				 * param ("col = $n::text::<type>"), so a float column must
+				 * be rendered round-trip-safe (ob_canonical_output). */
+				valtxt = ob_canonical_output(att->atttypid, d);
 				appendStringInfoString(&valdesc, valtxt);
 				vals_main[ci] = CStringGetTextDatum(valtxt);
 				pfree(valtxt);
@@ -3142,12 +3186,11 @@ overlay_executor_run_intercept(QueryDesc *queryDesc,
 						}
 						else
 						{
-							Oid			pk_out_func;
-							bool		pk_is_varlena;
 							char	   *pkval_txt;
 
-							getTypeOutputInfo(pk_type, &pk_out_func, &pk_is_varlena);
-							pkval_txt = OidOutputFunctionCall(pk_out_func, pkdatum);
+							/* Canonical render: bound below as "$1::text::<pktype>",
+							 * so a float PK must round-trip (ob_canonical_output). */
+							pkval_txt = ob_canonical_output(pk_type, pkdatum);
 
 							/* WR-1a: PK value bound as $1; relname/colname/type inline. */
 							sql2 = psprintf("SELECT ctid FROM %s WHERE (%s) = $1::text::%s LIMIT 1",
@@ -3226,13 +3269,11 @@ overlay_executor_run_intercept(QueryDesc *queryDesc,
 											 format_type_be(att->atttypid));
 							argtypes_main2[ci] = TEXTOID;
 							{
-								Oid			out_func;
-								bool		out_varlena;
 								char	   *valtxt;
 
-								getTypeOutputInfo(att->atttypid, &out_func,
-												  &out_varlena);
-								valtxt = OidOutputFunctionCall(out_func, d);
+								/* Canonical render: bound as "$n::text::<type>",
+								 * so a float key column must round-trip. */
+								valtxt = ob_canonical_output(att->atttypid, d);
 								vals_main2[ci] = CStringGetTextDatum(valtxt);
 								pfree(valtxt);
 							}
