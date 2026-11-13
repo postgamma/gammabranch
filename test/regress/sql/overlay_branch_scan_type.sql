@@ -21,6 +21,10 @@
  *               read-back SQL used the field-selection `(x).*`, whose bare
  *               name `x` is shadowed by a user column literally named `x`,
  *               aborting the read with "type <T> is not composite".
+ *   Section M — composite (multi-column) PRIMARY KEY identity: the typed-key
+ *               comparator must compare EVERY key column (returning on the
+ *               first equal column aliases rows sharing a leading PK value,
+ *               corrupting overlay reads and defeating the R03 guard).
  *
  * Sections share session; between F→G→H→I→J if the same bs_user table is reused keep it continuous without DISCARD.
  */
@@ -698,3 +702,139 @@ SELECT CASE WHEN count(*) = 1 AND max(x) = 10 AND max(label) = 'main1'
 SELECT overlay_branch.discard_branch('bs_aliasx_b');
 RESET client_min_messages;
 DROP TABLE public.bs_aliasx;
+
+/* =========================================================== Section M */
+-- =====================================================================
+-- ===== Section M: composite (multi-column) PRIMARY KEY identity.
+-- =====   overlay_typed_pk_cmp() drives every BranchScan qsort/bsearch
+-- =====   over the delta store and the write-redirect R03 guard.  It must
+-- =====   compare EVERY key column: returning as soon as the first column
+-- =====   compares equal aliases distinct rows that share a leading PK
+-- =====   value (wrong overlay reads) and makes a real PK mutation look
+-- =====   like a no-op (R03 never fires).  Regression targets:
+-- =====     M1 overlay read must not alias (1,1) with (1,2)'s delta
+-- =====     M2 delta identity = the composite JSON key (D/U/I)
+-- =====     M3 real change of a PK column rejected with 0A000 (R03)
+-- =====     M4 no-op PK SET (b = b) stays legal
+-- =====     M5 apply merges the composite-key delta into MAIN exactly
+-- =====     M6 INSERT duplicating a MAIN composite key -> 23505 (R21)
+-- =====     M7 INSERT duplicating a branch-delta composite key -> 23505
+-- =====     M8 the aborted INSERTs left no delta row behind
+-- =====================================================================
+SET client_min_messages = warning;
+DROP TABLE IF EXISTS public.bs_comppk;
+CREATE TABLE public.bs_comppk (a INT4, b INT4, v TEXT, PRIMARY KEY (a, b));
+INSERT INTO public.bs_comppk VALUES (1,1,'m11'),(1,2,'m12'),(2,1,'m21');
+
+SELECT overlay_branch.create_branch('bs_comppk_b');
+SELECT overlay_branch.use_branch('bs_comppk_b');
+
+UPDATE public.bs_comppk SET v = 'd12' WHERE a = 1 AND b = 2;   -- shares a=1 with (1,1)
+DELETE FROM public.bs_comppk WHERE a = 2 AND b = 1;
+INSERT INTO public.bs_comppk VALUES (3,3,'d33');               -- pure-delta INSERT
+
+-- M.1 overlay read must not alias (1,1) with the delta of (1,2)
+SELECT CASE WHEN string_agg(a::text||','||b::text||':'||v, '|' ORDER BY a,b)
+              = '1,1:m11|1,2:d12|3,3:d33'
+            THEN 'PASS:M1_COMPPK_OVERLAY'
+            ELSE 'FAIL:'||COALESCE(string_agg(a::text||','||b::text||':'||v,'|' ORDER BY a,b),'NULL') END AS m1
+  FROM public.bs_comppk;
+
+-- M.2 delta identities are the composite JSON keys (scoped to this relation;
+--     the shared delta store still holds rows from earlier sections)
+SELECT CASE WHEN string_agg(key||op, '|' ORDER BY key)
+              = '["1", "2"]U|["2", "1"]D|["3", "3"]I'
+            THEN 'PASS:M2_COMPPK_DELTA_KEYS'
+            ELSE 'FAIL:'||COALESCE(string_agg(key||op,'|' ORDER BY key),'NULL') END AS m2
+  FROM overlay_branch.pg_branch_delta
+ WHERE relid = 'public.bs_comppk'::regclass;
+
+-- M.3 a real PK-column change on a composite key must be rejected (R03)
+DO $$
+BEGIN
+    BEGIN
+        UPDATE public.bs_comppk SET b = 9 WHERE a = 1 AND b = 1;
+        RAISE EXCEPTION 'FAIL_M3_NO_ERROR';
+    EXCEPTION WHEN OTHERS THEN
+        IF SQLSTATE <> '0A000' THEN
+            RAISE EXCEPTION 'FAIL_M3: expected 0A000 got % %', SQLSTATE, SQLERRM;
+        END IF;
+    END;
+END $$;
+
+-- M.4 no-op PK SET (b = b) is legal on a composite key
+UPDATE public.bs_comppk SET b = b, v = 'noop' WHERE a = 1 AND b = 1;
+SELECT CASE WHEN v = 'noop' THEN 'PASS:M4_COMPPK_NOOP_PK_SET'
+            ELSE 'FAIL:'||COALESCE(v,'NULL') END AS m4
+  FROM public.bs_comppk WHERE a = 1 AND b = 1;
+
+SELECT overlay_branch.use_branch(NULL);
+RESET overlay_branch.current;
+
+-- M.5 apply merges the composite-key delta into MAIN
+SELECT overlay_branch.apply_branch('bs_comppk_b');
+SELECT CASE WHEN string_agg(a::text||','||b::text||':'||v, '|' ORDER BY a,b)
+              = '1,1:noop|1,2:d12|3,3:d33'
+            THEN 'PASS:M5_COMPPK_APPLY'
+            ELSE 'FAIL:'||COALESCE(string_agg(a::text||','||b::text||':'||v,'|' ORDER BY a,b),'NULL') END AS m5
+  FROM public.bs_comppk;
+
+RESET client_min_messages;
+DROP TABLE public.bs_comppk;
+
+/* =================================================== Section M-cont */
+-- =====================================================================
+-- ===== Section M-cont: R21 INSERT uniqueness pre-check must cover
+-- =====   MULTI-column PRIMARY KEYs (not only the single-column fast
+-- =====   path).  A composite-key INSERT colliding with MAIN, or with a
+-- =====   key already written to the branch delta by an earlier statement,
+-- =====   must fail eagerly with 23505 BEFORE any delta write.
+-- =====================================================================
+SET client_min_messages = warning;
+DROP TABLE IF EXISTS public.bs_comppk2;
+CREATE TABLE public.bs_comppk2 (a INT4, b INT4, v TEXT, PRIMARY KEY (a, b));
+INSERT INTO public.bs_comppk2 VALUES (1,1,'m11'),(2,2,'m22');
+
+SELECT overlay_branch.create_branch('bs_comppk2_b');
+SELECT overlay_branch.use_branch('bs_comppk2_b');
+
+-- M.6 INSERT colliding with a MAIN composite key -> 23505
+DO $$
+BEGIN
+    BEGIN
+        INSERT INTO public.bs_comppk2 VALUES (1,1,'dup');
+        RAISE EXCEPTION 'FAIL_M6_NO_ERROR';
+    EXCEPTION
+        WHEN unique_violation THEN NULL;
+        WHEN OTHERS THEN
+            RAISE EXCEPTION 'FAIL_M6: expected 23505 got % %', SQLSTATE, SQLERRM;
+    END;
+END $$;
+
+-- M.7 first branch-local INSERT of a new composite key succeeds; a second
+--     INSERT of the same key in a LATER statement hits the delta row.
+INSERT INTO public.bs_comppk2 VALUES (3,3,'d33');
+DO $$
+BEGIN
+    BEGIN
+        INSERT INTO public.bs_comppk2 VALUES (3,3,'dup');
+        RAISE EXCEPTION 'FAIL_M7_NO_ERROR';
+    EXCEPTION
+        WHEN unique_violation THEN NULL;
+        WHEN OTHERS THEN
+            RAISE EXCEPTION 'FAIL_M7: expected 23505 got % %', SQLSTATE, SQLERRM;
+    END;
+END $$;
+
+-- M.8 the two aborted INSERTs left no delta row behind
+SELECT CASE WHEN string_agg(key||op, '|' ORDER BY key) = '["3", "3"]I'
+            THEN 'PASS:M8_COMPPK_R21_DELTA'
+            ELSE 'FAIL:'||COALESCE(string_agg(key||op,'|' ORDER BY key),'NULL') END AS m8
+  FROM overlay_branch.pg_branch_delta
+ WHERE relid = 'public.bs_comppk2'::regclass;
+
+SELECT overlay_branch.use_branch(NULL);
+RESET overlay_branch.current;
+SELECT overlay_branch.discard_branch('bs_comppk2_b');
+RESET client_min_messages;
+DROP TABLE public.bs_comppk2;

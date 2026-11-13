@@ -151,8 +151,10 @@ make USE_PGXS=1 installcheck            # L3 + L1
 
 This is a v0.1 release with a deliberately narrow scope. The main limits:
 
-- Managed tables must be plain heap tables with a single-column `PRIMARY KEY`.
-  - Partitioned / foreign tables, views, materialized views, foreign keys, multi-column PKs and non-PK `UNIQUE` constraints are rejected at `create_branch` time. 
+- Managed tables must be plain heap tables with a `PRIMARY KEY` (single- or
+  multi-column).
+  - Partitioned / foreign tables, views, materialized views, foreign keys and
+    non-PK `UNIQUE` constraints are rejected at `create_branch` time. 
   - PK-less tables need the experimental `overlay_branch.keyless_tables = on` GUC and a best-effort `ctid` identity that concurrent writes or `VACUUM FULL` / `CLUSTER` / `TRUNCATE` can invalidate.
 - Blocked inside a branch (SQLSTATE 0A000): `COPY FROM`, `MERGE`,
   data-modifying CTEs, and `UPDATE`s that change the PK column.

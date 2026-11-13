@@ -58,6 +58,13 @@
  *               already claimed for that statement — a later candidate whose
  *               key was already written errors (plain INSERT → 23505,
  *               DO UPDATE → 21000) or is skipped (DO NOTHING → first wins).
+ *   Section AC — composite PRIMARY KEY UPSERT: Phase II (MAIN-side) conflict
+ *               detection must engage for a multi-column PK too.  A composite
+ *               PK leaves the single-column fast path (pk_attno) at 0, so
+ *               gating the MAIN probe on `pk_attno > 0` silently skipped it and
+ *               misclassified every ON CONFLICT as a fresh INSERT.  Covers
+ *               MAIN-conflict DO UPDATE / DO NOTHING, a brand-new key, a
+ *               pure-delta re-UPSERT, and a tombstone rebirth; overlay + apply.
  *
  * ⚠️ Absolutely no DISCARD ALL / RESET between S→T→U: all three sections share the
  * catalog state of branches bs_S_br and bs_U_disc; if interrupted, Section T cannot find "bs_S_br" (already discarded in a different session).
@@ -737,4 +744,82 @@ FROM public.bs_AB_up;
 
 RESET client_min_messages;
 DROP TABLE public.bs_AB_up;
+
+-- =====================================================================
+-- ===== Section AC: composite PRIMARY KEY UPSERT.
+-- =====   Phase II (MAIN-side conflict detection) must engage for a
+-- =====   multi-column PK.  A composite PK makes the single-column fast
+-- =====   path overlay_get_pk_single_attno() return false, leaving the
+-- =====   redirect's pk_attno at 0; the Phase II guard tested `pk_attno > 0`
+-- =====   (or a keyless arbiter), so it was skipped and every ON CONFLICT
+-- =====   was misclassified as a fresh INSERT: DO UPDATE did not update,
+-- =====   DO NOTHING still inserted, and the bogus op='I' delta row made
+-- =====   apply_branch fail with "MAIN row already present".
+-- =====   AC.1 MAIN-conflict DO UPDATE; AC.2 MAIN-conflict DO NOTHING;
+-- =====   AC.3 brand-new key; AC.4 pure-delta re-UPSERT (no duplicate);
+-- =====   AC.5 tombstone rebirth; AC.6 overlay; AC.7 MAIN pristine; AC.8 apply.
+-- =====================================================================
+SET client_min_messages = warning;
+DROP TABLE IF EXISTS public.bs_AC_up;
+CREATE TABLE public.bs_AC_up (a INT4, b INT4, v TEXT, PRIMARY KEY (a, b));
+INSERT INTO public.bs_AC_up VALUES (1,1,'m11'), (2,2,'m22'), (4,4,'m44');
+SELECT overlay_branch.create_branch('bs_AC_br');
+SELECT overlay_branch.use_branch('bs_AC_br');
+
+-- AC.1 MAIN conflict (1,1) DO UPDATE -> update in place
+INSERT INTO public.bs_AC_up VALUES (1,1,'u11')
+  ON CONFLICT (a, b) DO UPDATE SET v = EXCLUDED.v;
+-- AC.2 MAIN conflict (2,2) DO NOTHING -> skip (m22 preserved)
+INSERT INTO public.bs_AC_up VALUES (2,2,'nope')
+  ON CONFLICT (a, b) DO NOTHING;
+-- AC.3 no conflict (3,3) -> fresh INSERT
+INSERT INTO public.bs_AC_up VALUES (3,3,'n33')
+  ON CONFLICT (a, b) DO UPDATE SET v = EXCLUDED.v;
+-- AC.4 pure-delta re-UPSERT: (5,5) branch-born then updated -> single row 'born2'
+INSERT INTO public.bs_AC_up VALUES (5,5,'born');
+INSERT INTO public.bs_AC_up VALUES (5,5,'born2')
+  ON CONFLICT (a, b) DO UPDATE SET v = EXCLUDED.v;
+-- AC.5 tombstone rebirth: DELETE then DO NOTHING -> row reborn
+DELETE FROM public.bs_AC_up WHERE a = 4 AND b = 4;
+INSERT INTO public.bs_AC_up VALUES (4,4,'reborn')
+  ON CONFLICT (a, b) DO NOTHING;
+
+-- AC.6 overlay: five rows, each carrying its branch value
+SELECT CASE WHEN count(*) = 5
+             AND max(v) FILTER (WHERE a=1 AND b=1) = 'u11'
+             AND max(v) FILTER (WHERE a=2 AND b=2) = 'm22'
+             AND max(v) FILTER (WHERE a=3 AND b=3) = 'n33'
+             AND max(v) FILTER (WHERE a=5 AND b=5) = 'born2'
+             AND max(v) FILTER (WHERE a=4 AND b=4) = 'reborn'
+       THEN 'PASS:AC6_OVERLAY'
+       ELSE 'FAIL:'||coalesce(string_agg(a||'.'||b||'='||v, ',' ORDER BY a,b),'empty') END AS ac6
+FROM overlay_branch.overlay_main_plus_delta('public.bs_AC_up') AS t(a int, b int, v text);
+
+-- AC.7 MAIN pristine after leaving the branch (3 rows, original values)
+SELECT overlay_branch.use_branch(NULL);
+RESET overlay_branch.current;
+SET overlay_branch.current = '';
+SELECT CASE WHEN count(*) = 3
+             AND max(v) FILTER (WHERE a=1 AND b=1) = 'm11'
+             AND max(v) FILTER (WHERE a=2 AND b=2) = 'm22'
+             AND max(v) FILTER (WHERE a=4 AND b=4) = 'm44'
+       THEN 'PASS:AC7_MAIN_PRISTINE'
+       ELSE 'FAIL:'||coalesce(string_agg(a||'.'||b||'='||v, ',' ORDER BY a,b),'empty') END AS ac7
+FROM public.bs_AC_up;
+
+-- AC.8 apply materializes the composite-PK UPSERT onto MAIN
+SELECT overlay_branch.apply_branch('bs_AC_br');
+SELECT CASE WHEN count(*) = 5
+             AND max(v) FILTER (WHERE a=1 AND b=1) = 'u11'
+             AND max(v) FILTER (WHERE a=2 AND b=2) = 'm22'
+             AND max(v) FILTER (WHERE a=3 AND b=3) = 'n33'
+             AND max(v) FILTER (WHERE a=5 AND b=5) = 'born2'
+             AND max(v) FILTER (WHERE a=4 AND b=4) = 'reborn'
+       THEN 'PASS:AC8_APPLIED'
+       ELSE 'FAIL:'||coalesce(string_agg(a||'.'||b||'='||v, ',' ORDER BY a,b),'empty') END AS ac8
+FROM public.bs_AC_up;
+
+RESET client_min_messages;
+DROP TABLE public.bs_AC_up;
+
 

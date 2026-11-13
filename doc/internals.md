@@ -157,7 +157,13 @@ working and the snapshot is taken at entry time.
 ### 1.5 The PK as row identity
 
 The PK is the durable row identity within a branch: the delta key is the JSON of
-the PK values, unique with `(branch_id, relid)`. UPDATE/DELETE derive it from the
+the PK values, unique with `(branch_id, relid)`. **Composite (multi-column) PKs
+are fully supported**: the delta key is the JSON array of every key column, and
+the typed comparator (`overlay_typed_pk_cmp`) declares two keys equal only when
+**every** column compares equal — an early return on the first equal column would
+alias distinct rows that share a leading key value (corrupting overlay reads) and
+make a real PK mutation look like a no-op (defeating the R03 guard).
+UPDATE/DELETE derive it from the
 MAIN row fetched by ctid; BranchScan Pass 1 serializes each MAIN row's PK and
 `bsearch`-es the delta; INSERT probes delta and MAIN independently for the UPSERT
 promotion; `old_version` derives from the row's `ctid + xmin`. No-PK tables are
@@ -214,6 +220,16 @@ exists, never the stale MAIN row.
 | false | true | DO_UPD + WHERE ok | 3 | UPDATE pure-delta row |
 | true | true | DO_UPD + WHERE ok | 3 | delta shadows MAIN |
 
+The Phase II MAIN probe engages for **any** keyed table, single- or
+multi-column PK alike (and for a keyless table with a resolved UNIQUE arbiter).
+For a single-column PK it binds `(col) = $1::text::<type>`; for a **composite
+PK** it folds one `col = $n::text::<type>` conjunct per key column (the same text
+round-trip used by R21 / the serialized identity, so BPCHAR / NUMERIC /
+TIMESTAMPTZ compare as typed values, not as text). A NULL key column leaves the
+probe unmatched (a NULL never conflicts) and the statement degrades to a plain
+INSERT. Gating the probe on the single-column fast path alone would silently skip
+it for a composite PK and misclassify every `ON CONFLICT` as a fresh INSERT.
+
 **Delta tombstone shadows MAIN.** Phase I records the delta's latest op for the
 key — including `op='D'` tombstones, not only the live `op='I'`/`'U'` states. A
 tombstone means the branch deleted the row, so an `INSERT ... ON CONFLICT` after
@@ -228,7 +244,8 @@ vanished from the branch for `DO NOTHING` / `DO UPDATE ... WHERE <false>`.
 between the rows of a single command, so the Phase I/II and R21 SPI probes can
 never see a delta row written by an earlier row of the *same* command. The
 INSERT loop therefore keeps a per-statement hash set of the arbiter keys it has
-already claimed (single-column-PK tables only). A row claims its key exactly
+already claimed (any table with a PK; keyed by the full serialized identity, so
+it covers composite PKs too). A row claims its key exactly
 when it is written — `promo=1/2/3` add the key; a `DO NOTHING` skip or a
 `DO UPDATE ... WHERE <false>` skip does not. When a later candidate's key is
 already claimed, the loop reproduces native behavior: plain INSERT raises
@@ -251,6 +268,18 @@ before conflict resolution (mirroring `ExecInsert()`, which validates the
 proposed tuple first) and again on the merged row for a `DO UPDATE` (mirroring
 `ExecUpdate()`), so a candidate that is invalid even though `DO UPDATE` /
 `DO NOTHING` would discard it is still rejected, exactly as in MAIN.
+
+**INSERT uniqueness pre-check (R21).** Before a promoted INSERT row is written
+into the delta, the redirect probes the branch delta and then MAIN for the same
+row identity, so a branch-local INSERT that duplicates an existing key fails
+eagerly with `23505` before any delta write, instead of silently storing an
+unappliable delta row (the conflict would otherwise surface only at
+`apply_branch`). The check covers **single- and multi-column PKs**: the delta
+probe binds the full serialized PK identity (the composite JSON key *is* the
+delta `key`), and the MAIN probe folds a per-PK-column
+`col = $n::text::<type>` conjunctive `WHERE`. A delta tombstone (`op='D'`) makes
+the MAIN row logically invisible in the branch, so the MAIN probe is skipped and
+a rebirth is permitted (see "Rebirth collapse").
 
 **Pure-delta target rows (synthetic ctid).** A row that exists only in the delta
 (op `I`/`U`, no MAIN baseline) has no physical ctid, so the DML-target BranchScan
@@ -333,8 +362,8 @@ BPCHAR / NUMERIC / TIMESTAMPTZ stay correct (§2).
 ### 1.8 Scope & gating + ACL double-defense
 
 Unsupported objects are rejected at `create_branch` time (0A000/55000):
-partitioned / foreign tables, views, matviews, foreign keys, multi-column PKs,
-non-PK UNIQUE. The guard checks cheapest-first (relkind, `relispartition`, user
+partitioned / foreign tables, views, matviews, foreign keys, non-PK UNIQUE. The
+guard checks cheapest-first (relkind, `relispartition`, user
 triggers, foreign keys, then no-PK). The per-DML executor guard validates only
 the statement's DML **target** relations (the `ModifyTable` result relations):
 a range-table entry that is merely read — the FROM/USING side of `INSERT ...
@@ -976,6 +1005,13 @@ columns, so all downstream promotion and apply behaviour is unchanged:
   values, restricted to the live insert/update states (a tombstone stores no
   image, so it is never matched here — see the limitation below);
 - phase two matches a MAIN row carrying the same arbiter values;
+- a NULL arbiter value follows the UNIQUE index's null handling: under the
+  default NULLS DISTINCT index it matches nothing, so the statement degrades to
+  a plain INSERT, while under a NULLS NOT DISTINCT index it matches an existing
+  NULL row. The probe therefore picks `=` (NULLS DISTINCT) or `IS NOT DISTINCT
+  FROM` (NULLS NOT DISTINCT) per the index's `ii_NullsNotDistinct`, and always
+  binds the value as a real SQL NULL — a NULL arbiter column passed as a bogus
+  datum once crashed the server when SPI dereferenced it;
 - on a MAIN hit the delta is re-anchored to that row's ctid with its version
   token, on a delta hit the existing delta key and version are reused, and with
   no hit the row takes a synthetic key as a plain insert.

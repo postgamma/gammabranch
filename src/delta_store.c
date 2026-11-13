@@ -2641,6 +2641,7 @@ overlay_typed_pk_cmp(const TypedKey *a, int a_n,
 					 const TypedKey *b, int b_n)
 {
 	int			i;
+	int			colcmp;
 
 	if (a_n != b_n)
 		return a_n < b_n ? -1 : 1;
@@ -2679,18 +2680,27 @@ overlay_typed_pk_cmp(const TypedKey *a, int a_n,
 		 * When the memoised functions are absent (type had no btree sort
 		 * operators), fall back to the legacy per-comparison catalog
 		 * lookup so behaviour is unchanged for those edge types.
+		 *
+		 * A composite key is equal ONLY when every column is equal: an
+		 * equal column must advance to the next one via `continue`.  A
+		 * bare `return 0` here would falsely declare two keys equal as
+		 * soon as their first column matched, which for a multi-column PK
+		 * makes delta matching alias distinct rows (and silently defeats
+		 * the R03 pk-mutation guard).
 		 * ------------------------------------------------------------ */
 		if (ta->eq_finfo != NULL && ta->lt_finfo != NULL)
 		{
 			if (DatumGetBool(FunctionCall2Coll(ta->eq_finfo, ta->collid,
 											   ta->value, tb->value)))
-				return 0;
+				continue;
 			return DatumGetBool(FunctionCall2Coll(ta->lt_finfo, ta->collid,
 												  ta->value, tb->value))
 				? -1 : 1;
 		}
 
-		return ob_typed_pk_cmp_legacy(ta, tb, i);
+		colcmp = ob_typed_pk_cmp_legacy(ta, tb, i);
+		if (colcmp != 0)
+			return colcmp;
 	}
 	return 0;
 }

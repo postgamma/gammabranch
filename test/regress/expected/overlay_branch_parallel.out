@@ -49,7 +49,7 @@ EXPLAIN (COSTS OFF) SELECT count(*) FROM ob_par;
 SELECT overlay_branch.create_branch('ob_par_b1');
  create_branch 
 ---------------
-            11
+            13
 (1 row)
 
 SELECT overlay_branch.use_branch('ob_par_b1');

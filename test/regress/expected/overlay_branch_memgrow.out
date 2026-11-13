@@ -102,7 +102,7 @@ ANALYZE ob_mem_big;
 SELECT overlay_branch.create_branch('ob_mem_b1');
  create_branch 
 ---------------
-            12
+            14
 (1 row)
 
 SELECT overlay_branch.use_branch('ob_mem_b1');

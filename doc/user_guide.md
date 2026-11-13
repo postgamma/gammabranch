@@ -738,7 +738,9 @@ Alternative: use top-level DML with `RETURNING` directly (see §6.2).
 | Capability | Status |
 | --- | --- |
 | plain INSERT/UPDATE/DELETE | ✅ Supported |
+| Duplicate-key INSERT (single- or multi-column PK) | ❌ Rejected eagerly with `23505`, same as Main — nothing is written to the delta |
 | INSERT … ON CONFLICT (UPSERT) | ✅ Supported (arbitrates on the PK, or on the single UNIQUE constraint in keyless mode — see §6.8) |
+| UPSERT on a composite (multi-column) PK | ✅ Supported — the same conflict detection runs on every PK column, so `DO UPDATE` / `DO NOTHING` behave as in Main |
 | UPDATE/DELETE … RETURNING | ✅ Supported |
 | PK predicates (`pk = c` / `pk IN (…)` / `pk BETWEEN …` / `pk > c` / their `AND`/`OR` combinations) | ✅ Recommended path (goes through the PK index) |
 | Non-PK predicates (arbitrary filter / Seq scan) | ✅ Supported |
@@ -1181,6 +1183,7 @@ Key behavior points:
 | Read/write overlay | INSERT/UPDATE/DELETE/SELECT/apply/discard are the same as for PK tables |
 | Row identity | Based on the row's **physical location** (best-effort): if another session modifies a Main row that the branch anchored to while the branch is alive, apply reports a conflict |
 | UPSERT | `INSERT ... ON CONFLICT` arbitrates on the single `UNIQUE` index named in the statement (single- or multi-column); an arbiter that does not resolve to exactly one plain-column `UNIQUE` index (e.g. an expression index) is still rejected with `0A000` |
+| UPSERT with a NULL arbiter value | Follows the index's null handling: under the default `UNIQUE` (NULLS DISTINCT) a NULL never matches, so the statement degrades to a plain INSERT; under `UNIQUE NULLS NOT DISTINCT` a NULL conflicts with an existing NULL row, just like Main |
 
 > This feature does not aim for full parity with PK tables and is recommended only for experimental / short-term draft scenarios; for long-term use, add a primary key to the table. For design and limitations, see [internals.md](internals.md) §4.
 

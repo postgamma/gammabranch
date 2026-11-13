@@ -74,7 +74,7 @@ CREATE FUNCTION ob_pd_vol_true(x int) RETURNS boolean LANGUAGE sql VOLATILE
 SELECT overlay_branch.create_branch('ob_pd_b1');
  create_branch 
 ---------------
-            13
+            15
 (1 row)
 
 SELECT overlay_branch.use_branch('ob_pd_b1');

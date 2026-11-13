@@ -19,7 +19,8 @@ A PostgreSQL contrib extension that adds **overlay branch** semantics:
 
 Think "git for SQL rows": xact-scoped, protected by branch-level advisory locks.
 
-**Managed tables** = plain heap tables with a **single-column PRIMARY KEY**.
+**Managed tables** = plain heap tables with a **PRIMARY KEY** (single- or
+multi-column; composite keys are fully supported).
 No-PK tables are rejected by default; they are supported only as an
 **experimental** feature behind the GUC `overlay_branch.keyless_tables`
 (`bool`, `PGC_SUSET`, default `off`), which falls back to a best-effort `ctid`
@@ -165,7 +166,7 @@ with both `diff -r` = 0 lines.
 
 ### Scope & gating
 - Reject at `create_branch` time (0A000/55000), never at execution: partitioned /
-  foreign tables, views, matviews, foreign keys, multi-column PKs, non-PK UNIQUE.
+  foreign tables, views, matviews, foreign keys, non-PK UNIQUE.
 - **Write interceptions** — at the very top of the executor intercept before
   any redirect: `COPY FROM` → 0A000, `MERGE` → 0A000, data-modifying CTE on a
   managed table → 0A000.

@@ -39,6 +39,12 @@
  *   Part H — set-based apply coverage (B3): the keyless delta replays
  *            through the ctid-anchor batch join; the batch and per-row
  *            replays are byte-identical (differential off vs on).
+ *   Part I — keyless UPSERT with a NULL arbiter value: the arbiter probe
+ *            must follow the UNIQUE index's null handling — a NULL never
+ *            matches under the default NULLS DISTINCT index (degrade to a
+ *            plain INSERT), while it does conflict under NULLS NOT
+ *            DISTINCT.  Regression: a NULL arbiter value used to bind a
+ *            bogus (Datum) 0 text payload and crash the server.
  *
  * Style rules (identical to the sibling regression files so pg_regress
  * expected .out files stay diff-stable across machines/runs):
@@ -66,7 +72,7 @@ END $$;
 SET client_min_messages = warning;
 DROP TABLE IF EXISTS public.kn_off, public.kn_on, public.kn_race,
                      public.kn_pk,  public.kn_ups, public.kn_ups2,
-                     public.kn_move CASCADE;
+                     public.kn_move, public.kn_nd, public.kn_nd2 CASCADE;
 DROP EXTENSION IF EXISTS overlay_branch CASCADE;
 RESET client_min_messages;
 CREATE EXTENSION IF NOT EXISTS overlay_branch;
@@ -445,11 +451,72 @@ FROM  (SELECT string_agg(v, ',' ORDER BY v) AS s FROM public.kn_da) a,
       (SELECT string_agg(v, ',' ORDER BY v) AS s FROM public.kn_db) b;
 RESET overlay_branch.apply_batch;
 
+/* =====================================================================
+ * Part I — keyless UPSERT with a NULL arbiter value.
+ *   The arbiter probe must mirror the UNIQUE index's null handling:
+ *     * default index (NULLS DISTINCT): a NULL arbiter value never
+ *       matches anything, so ON CONFLICT degrades to a plain INSERT;
+ *     * NULLS NOT DISTINCT index: NULL is a comparable value, so it
+ *       conflicts with an existing NULL row (DO NOTHING skips, DO UPDATE
+ *       rewrites that row).
+ *   Regression: a NULL arbiter value used to be bound as a (Datum) 0
+ *   text payload with a NULL nulls array, making SPI dereference a bogus
+ *   pointer and crash the server.
+ * ===================================================================== */
+SET overlay_branch.keyless_tables = on;
+
+-- I.1 default UNIQUE (NULLS DISTINCT): the NULL arbiter never conflicts,
+--     so every statement is a plain INSERT (three distinct NULL rows).
+CREATE TABLE public.kn_nd (id int, u int UNIQUE, v text);
+INSERT INTO public.kn_nd VALUES (1, 1, 'a');
+SELECT create_branch('kn_nd_br') AS id_kn_nd_br;
+SELECT use_branch('kn_nd_br');
+INSERT INTO public.kn_nd VALUES (2, NULL, 'n2') ON CONFLICT (u) DO UPDATE SET v = 'u2';
+INSERT INTO public.kn_nd VALUES (3, NULL, 'n3') ON CONFLICT (u) DO NOTHING;
+SELECT CASE WHEN count(*) = 3
+             AND string_agg(id::text||'='||COALESCE(u::text,'~')||'/'||v, ',' ORDER BY id) = '1=1/a,2=~/n2,3=~/n3'
+            THEN 'PASS:I1_NULLS_DISTINCT_NO_CONFLICT'
+            ELSE 'FAIL:I1:'||count(*)||':'||string_agg(id::text||'='||COALESCE(u::text,'~')||'/'||v, ',' ORDER BY id) END AS i1
+FROM public.kn_nd;
+SELECT use_branch(NULL);
+RESET overlay_branch.current;
+SET overlay_branch.current = '';
+SELECT apply_branch('kn_nd_br');
+SELECT CASE WHEN count(*) = 3
+             AND string_agg(id::text||'='||COALESCE(u::text,'~')||'/'||v, ',' ORDER BY id) = '1=1/a,2=~/n2,3=~/n3'
+            THEN 'PASS:I1_NULLS_DISTINCT_APPLIED'
+            ELSE 'FAIL:I1_APPLIED:'||count(*)||':'||string_agg(id::text||'='||COALESCE(u::text,'~')||'/'||v, ',' ORDER BY id) END AS i1b
+FROM public.kn_nd;
+
+-- I.2 NULLS NOT DISTINCT: NULL conflicts, so DO NOTHING skips the second
+--     NULL and DO UPDATE rewrites the first NULL row in place.
+CREATE TABLE public.kn_nd2 (id int, u int, v text, UNIQUE NULLS NOT DISTINCT (u));
+INSERT INTO public.kn_nd2 VALUES (1, 1, 'a');
+SELECT create_branch('kn_nd2_br') AS id_kn_nd2_br;
+SELECT use_branch('kn_nd2_br');
+INSERT INTO public.kn_nd2 VALUES (2, NULL, 'n2');
+INSERT INTO public.kn_nd2 VALUES (3, NULL, 'n3') ON CONFLICT (u) DO NOTHING;
+INSERT INTO public.kn_nd2 VALUES (4, NULL, 'n4') ON CONFLICT (u) DO UPDATE SET v = 'n4';
+SELECT CASE WHEN count(*) = 2
+             AND string_agg(id::text||'='||COALESCE(u::text,'~')||'/'||v, ',' ORDER BY id) = '1=1/a,2=~/n4'
+            THEN 'PASS:I2_NULLS_NOT_DISTINCT_CONFLICT'
+            ELSE 'FAIL:I2:'||count(*)||':'||string_agg(id::text||'='||COALESCE(u::text,'~')||'/'||v, ',' ORDER BY id) END AS i2
+FROM public.kn_nd2;
+SELECT use_branch(NULL);
+RESET overlay_branch.current;
+SET overlay_branch.current = '';
+SELECT apply_branch('kn_nd2_br');
+SELECT CASE WHEN count(*) = 2
+             AND string_agg(id::text||'='||COALESCE(u::text,'~')||'/'||v, ',' ORDER BY id) = '1=1/a,2=~/n4'
+            THEN 'PASS:I2_NULLS_NOT_DISTINCT_APPLIED'
+            ELSE 'FAIL:I2_APPLIED:'||count(*)||':'||string_agg(id::text||'='||COALESCE(u::text,'~')||'/'||v, ',' ORDER BY id) END AS i2b
+FROM public.kn_nd2;
+
 -- ===== Teardown =====
 RESET overlay_branch.keyless_tables;
 SET client_min_messages = warning;
 DROP TABLE IF EXISTS public.kn_off, public.kn_on, public.kn_race,
                      public.kn_pk,  public.kn_ups, public.kn_ups2,
                      public.kn_expr, public.kn_move, public.kn_da,
-                     public.kn_db CASCADE;
+                     public.kn_db, public.kn_nd, public.kn_nd2 CASCADE;
 RESET client_min_messages;
