@@ -46,6 +46,7 @@
   - [6.7 DDL RESTRICTED Inside an Active Branch](#67-ddl-restricted-inside-an-active-branch)
   - [6.8 No-PK Tables (Experimental Feature)](#68-no-pk-tables-experimental-feature)
   - [6.9 Delta Size Observability](#69-delta-size-observability)
+  - [6.10 Time, Float, and bytea Keys: Canonical Across Sessions](#610-time-float-and-bytea-keys-canonical-across-sessions)
 
 ---
 
@@ -936,6 +937,22 @@ SELECT code::text, tag FROM bs_pd_bpchar ORDER BY code;
  PD003 | C
 ```
 
+A NUMERIC PK **without** a typmod treats `=`-equal values that print with a
+different scale as one row, exactly like MAIN:
+
+```sql
+CREATE TABLE bs_pd_numeric2(id NUMERIC PRIMARY KEY, tag TEXT);
+SELECT use_branch('agent_workspace');
+INSERT INTO bs_pd_numeric2 VALUES (1.0, 'a');
+INSERT INTO bs_pd_numeric2 VALUES (1.00, 'b');
+ERROR:  duplicate key value violates unique constraint on relation "bs_pd_numeric2"
+DETAIL:  Key (id)=(1.00) already exists in branch delta (R21 pre-check).
+SELECT id, tag FROM bs_pd_numeric2 ORDER BY id;
+ id  | tag
+-----+-----
+ 1.0 | a
+```
+
 #### 6.1.4 Pure Delta × Empty MAIN Heap End-to-End
 
 ```sql
@@ -1323,3 +1340,81 @@ HINT:  Inspect per-relation delta size with SELECT * FROM branch_delta_stats('b_
 | WARNING | Amortized counter, emitted once per session on first overflow, and fail-open (never breaks user DML) |
 
 > For the design, see [internals.md](internals.md) §5.6.
+
+### 6.10 Time, Float, and bytea Keys: Canonical Across Sessions
+
+For these types a branch matches on the *value*, not on its text spelling, so it
+behaves exactly like MAIN no matter how the writing session renders the key:
+`timestamptz` compares as an instant, `float8` `-0.0` equals `+0.0`, and a `bytea`
+value is the same bytes whether spelled in hex or escape form. A stored row value
+is canonical too, so another session reads back exactly what was inserted even
+under its own date/float display settings. That canonical form covers
+`timestamp`, `timestamptz`, `date`, `interval`, `float4`, and `float8`: each of
+these renders through a GUC (`DateStyle`, `IntervalStyle`, `extra_float_digits`)
+without leaving a self-describing marker, so an unpinned payload would be
+re-parsed to a different value by a reader under other settings. In particular a
+`timestamptz` emits a zone offset, but that only fixes the instant's zone —
+`DateStyle` still reorders the date fields, so `2024-06-01 …` written under
+`SQL, DMY` would read back as 6 January under `ISO, MDY`.
+
+```sql
+CREATE TABLE bs_guc_ts(k timestamptz PRIMARY KEY, v text);
+CREATE TABLE bs_guc_f(k float8 PRIMARY KEY, v text);
+CREATE TABLE bs_guc_b(k bytea PRIMARY KEY, v text);
+CREATE TABLE bs_guc_p(id int PRIMARY KEY, ts timestamp, tz timestamptz, f float8);
+SELECT create_branch('bs_guc');
+SELECT use_branch('bs_guc');
+
+-- same instant written under two time zones
+SET TimeZone = 'UTC';
+INSERT INTO bs_guc_ts VALUES ('2024-06-01 00:00:00+00', 'a');
+SET TimeZone = 'Asia/Shanghai';
+INSERT INTO bs_guc_ts VALUES ('2024-06-01 08:00:00+08', 'b');
+ERROR:  duplicate key value violates unique constraint on relation "bs_guc_ts"
+DETAIL:  Key (k)=(2024-06-01 08:00:00+08) already exists in branch delta (R21 pre-check).
+RESET TimeZone;
+
+-- float8 -0.0 and +0.0
+INSERT INTO bs_guc_f VALUES ('-0'::float8, 'neg');
+INSERT INTO bs_guc_f VALUES ('0'::float8, 'pos');
+ERROR:  duplicate key value violates unique constraint on relation "bs_guc_f"
+DETAIL:  Key (k)=(0) already exists in branch delta (R21 pre-check).
+
+-- bytea: hex vs escape spelling of the same bytes
+SET bytea_output = 'hex';
+INSERT INTO bs_guc_b VALUES ('\x00'::bytea, 'h');
+SET bytea_output = 'escape';
+INSERT INTO bs_guc_b VALUES ('\x00'::bytea, 'e');
+ERROR:  duplicate key value violates unique constraint on relation "bs_guc_b"
+DETAIL:  Key (k)=(\000) already exists in branch delta (R21 pre-check).
+RESET bytea_output;
+
+-- stored values keep their value across sessions
+SET DateStyle = 'SQL, DMY';
+SET extra_float_digits = 0;
+INSERT INTO bs_guc_p VALUES (1, timestamp '2024-02-01 05:06:07',
+                             timestamptz '2024-02-01 05:06:07+00',
+                             0.30000000000000004);
+RESET DateStyle;
+RESET extra_float_digits;
+SELECT ts, tz, f FROM bs_guc_p WHERE id = 1;
+         ts          |           tz           |          f
+---------------------+------------------------+---------------------
+ 2024-02-01 05:06:07 | 2024-02-01 05:06:07+00 | 0.30000000000000004
+```
+
+The same holds when a key column is a **domain** over one of these types: a
+domain is matched through its base type, so a `numeric` domain folds `1.0` /
+`1.00` and a `timestamptz` domain folds the same instant (arrays of a domain and
+domains over an array included).
+
+```sql
+CREATE DOMAIN bs_dnum AS numeric;
+CREATE TABLE bs_guc_dom(k bs_dnum PRIMARY KEY, v text);
+SELECT create_branch('bs_guc_dom');
+SELECT use_branch('bs_guc_dom');
+INSERT INTO bs_guc_dom VALUES (1.00, 'a');
+INSERT INTO bs_guc_dom VALUES (1.0, 'b');
+ERROR:  duplicate key value violates unique constraint on relation "bs_guc_dom"
+DETAIL:  Key (k)=(1.0) already exists in branch delta (R21 pre-check).
+```

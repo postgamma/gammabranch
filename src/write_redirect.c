@@ -40,6 +40,7 @@
 #include "utils/builtins.h"
 #include "common/hashfn.h"
 #include "utils/hsearch.h"
+#include "utils/typcache.h"
 
 #ifndef OBSCHEMA
 #define OBSCHEMA        "overlay_branch"
@@ -279,60 +280,274 @@ mt_state_result_rel(ModifyTableState *mt, int i)
 }
 
 /*
- * ob_claimed_hash / ob_claimed_match / ob_claim_key
+ * Same-statement duplicate-claim tracking for the redirect.
  *
- *	Same-statement duplicate-arbiter-key tracking for the INSERT redirect.
  *	PostgreSQL detects a constrained value proposed twice within one command
  *	at the heap/index level (plain INSERT / DO NOTHING) or via the "cannot
  *	affect row a second time" check (ON CONFLICT DO UPDATE).  The redirect
  *	writes every row into the delta under ON CONFLICT DO UPDATE, and a
  *	command-counter bump never happens between the rows of a single command,
  *	so the Phase I/II and R21 SPI probes cannot see an earlier row written by
- *	THIS command.  This small hash set, alive for the duration of one
- *	statement, lets the loop reproduce the native outcome: a later candidate
- *	whose arbiter key was already written errors (plain INSERT ->
- *	unique_violation, DO UPDATE -> cardinality_violation) or is skipped
- *	(DO NOTHING), exactly as upstream does.
+ *	THIS command.  These small hash sets, alive for the duration of one
+ *	statement, let the loop reproduce the native outcome: a later candidate
+ *	whose key was already written errors (plain INSERT -> unique_violation,
+ *	DO UPDATE -> cardinality_violation) or is skipped (DO NOTHING), exactly
+ *	as upstream does.
+ *
+ *	The claim identity is compared as TYPED values (TypedKey), never as text:
+ *	the column type's btree equality operator is applied with the column's
+ *	collation, so NUMERIC precision (1.0 vs 1.00), TIMESTAMPTZ textual
+ *	offsets and BPCHAR r-trim cannot make two `=`-equal rows look distinct.
+ *	A type-consistent hash buckets the entries; an exact typed equality check
+ *	resolves bucket collisions, so a hash collision can never raise a
+ *	spurious 23505.
  */
 typedef struct ObClaimedKey
 {
-	char	   *key;			/* NUL-terminated serialized identity (in cxt) */
+	uint32		hash;			/* type-consistent hash (dynahash key) */
+	int			nkeys;			/* number of key columns */
+	TypedKey   *keys;			/* typed column values (in claim cxt) */
 } ObClaimedKey;
+
+/*
+ * ob_typed_eq
+ *
+ *	Type-aware equality of one claimed column: NULL-safe, then the type's
+ *	btree equality operator with the column's collation.  Falls back to
+ *	textual identity only for a type that exposes no btree equality at all.
+ */
+static bool
+ob_typed_eq(const TypedKey *a, const TypedKey *b)
+{
+	if (a->isnull || b->isnull)
+		return (a->isnull && b->isnull);
+	if (a->typid != b->typid)
+		return false;
+	if (a->eq_finfo != NULL)
+		return DatumGetBool(FunctionCall2Coll(a->eq_finfo, a->collid,
+											  a->value, b->value));
+
+	{
+		Oid			outfunc;
+		bool		isvarlena;
+		char	   *sa;
+		char	   *sb;
+		bool		eq;
+
+		getTypeOutputInfo(a->typid, &outfunc, &isvarlena);
+		sa = OidOutputFunctionCall(outfunc, a->value);
+		sb = OidOutputFunctionCall(outfunc, b->value);
+		eq = (strcmp(sa, sb) == 0);
+		pfree(sa);
+		pfree(sb);
+		return eq;
+	}
+}
+
+static bool
+ob_claim_keys_equal(const ObClaimedKey *a, const ObClaimedKey *b)
+{
+	int			i;
+
+	if (a->nkeys != b->nkeys)
+		return false;
+	for (i = 0; i < a->nkeys; i++)
+		if (!ob_typed_eq(&a->keys[i], &b->keys[i]))
+			return false;
+	return true;
+}
 
 static uint32
 ob_claimed_hash(const void *key, Size keysize)
 {
-	const char *s = *((const char *const *) key);
-
 	(void) keysize;
-	return hash_bytes((const unsigned char *) s, (int) strlen(s));
+	return ((const ObClaimedKey *) key)->hash;
 }
 
 static int
 ob_claimed_match(const void *key1, const void *key2, Size keysize)
 {
-	const char *s1 = *((const char *const *) key1);
-	const char *s2 = *((const char *const *) key2);
-
 	(void) keysize;
-	return strcmp(s1, s2);
+	return ob_claim_keys_equal((const ObClaimedKey *) key1,
+							   (const ObClaimedKey *) key2) ? 0 : 1;
 }
 
-static void
-ob_claim_key(HTAB *claimed, MemoryContext cxt, const char *pk)
+/*
+ * ob_slot_col_datum
+ *
+ *	Read one column of a (possibly virtual) slot as a Datum, widening a
+ *	virtual slot's tts_nvalid first: the by-ref content lives in tts_values
+ *	and must never be reached through slot_getattr, which would materialise
+ *	and corrupt it.
+ */
+static Datum
+ob_slot_col_datum(TupleTableSlot *slot, AttrNumber attno, bool *isnull)
 {
-	ObClaimedKey *ent;
-	char	   *probe = (char *) pk;
-	bool		found;
-	MemoryContext old;
+	int			attidx = attno - 1;
 
-	ent = (ObClaimedKey *) hash_search(claimed, &probe, HASH_ENTER, &found);
-	if (!found)
+	if (TTS_IS_VIRTUAL(slot))
 	{
-		old = MemoryContextSwitchTo(cxt);
-		ent->key = pstrdup(pk);
-		MemoryContextSwitchTo(old);
+		if (slot->tts_nvalid < attno)
+		{
+			TupleDesc	std = slot->tts_tupleDescriptor;
+
+			if (std)
+				slot->tts_nvalid = std->natts;
+		}
+		*isnull = slot->tts_isnull[attidx];
+		return slot->tts_values[attidx];
 	}
+	return slot_getattr(slot, attno, isnull);
+}
+
+/*
+ * ob_typed_claim_build
+ *
+ *	Build a TypedKey array describing the given columns of `slot`, allocate
+ *	it in `cxt`, and compute a type-consistent hash.  Returns NULL (and
+ *	*out_n = 0) when the key can never conflict: the column list is empty, or
+ *	a column is NULL under a NULLS DISTINCT unique index (a NULL never
+ *	matches another row).  `nulls_not_distinct` must be true for a PRIMARY
+ *	KEY.
+ */
+static TypedKey *
+ob_typed_claim_build(Relation rel, TupleTableSlot *slot,
+					 AttrNumber *attnos, int natts,
+					 bool nulls_not_distinct,
+					 MemoryContext cxt, int *out_n, uint32 *out_hash)
+{
+	TupleDesc	reldesc = RelationGetDescr(rel);
+	MemoryContext old;
+	TypedKey  *keys;
+	uint32		h = 0;
+	int			i;
+
+	*out_n = 0;
+	*out_hash = 0;
+	if (natts <= 0)
+		return NULL;
+
+	old = MemoryContextSwitchTo(cxt);
+	keys = (TypedKey *) palloc0(sizeof(TypedKey) * natts);
+	MemoryContextSwitchTo(old);
+
+	for (i = 0; i < natts; i++)
+	{
+		AttrNumber	attno = attnos[i];
+		Form_pg_attribute att = TupleDescAttr(reldesc, attno - 1);
+		TypeCacheEntry *tc;
+		TypedKey   *tk = &keys[i];
+		Datum		d;
+		bool		isnull;
+		bool		deterministic;
+
+		d = ob_slot_col_datum(slot, attno, &isnull);
+
+		if (isnull && !nulls_not_distinct)
+		{
+			/* NULLS DISTINCT: this row can never conflict with another. */
+			overlay_typed_pk_free(keys, i);
+			return NULL;
+		}
+
+		tk->typid = att->atttypid;
+		tk->typmod = att->atttypmod;
+		tk->collid = att->attcollation;
+		tk->typlen = att->attlen;
+		tk->typbyval = att->attbyval;
+		tk->lt_finfo = NULL;
+		tc = lookup_type_cache(att->atttypid,
+							   TYPECACHE_EQ_OPR_FINFO |
+							   TYPECACHE_HASH_PROC_FINFO);
+		tk->eq_finfo = OidIsValid(tc->eq_opr_finfo.fn_oid)
+			? &tc->eq_opr_finfo : NULL;
+
+		if (isnull)
+		{
+			tk->isnull = true;
+			tk->value = (Datum) 0;
+			h = hash_combine(h, (uint32) 0x4E554C4C);	/* "NULL" */
+			continue;
+		}
+
+		tk->isnull = false;
+		old = MemoryContextSwitchTo(cxt);
+		tk->value = datumCopy(d, att->attbyval, att->attlen);
+		MemoryContextSwitchTo(old);
+
+		/* Hash with the type's own hash support proc, which PostgreSQL
+		 * requires to agree with the type's equality operator, so
+		 * `=`-equal values always land in the same bucket.  A
+		 * non-deterministic collation makes the (collation-insensitive)
+		 * text/byte hash disagree with `=`, so degenerate to a constant
+		 * bucket there and let the typed equality do all the work. */
+		deterministic = !OidIsValid(att->attcollation) ||
+			get_collation_isdeterministic(att->attcollation);
+		if (OidIsValid(tc->hash_proc_finfo.fn_oid) && deterministic)
+			h = hash_combine(h,
+							 DatumGetUInt32(FunctionCall1Coll(&tc->hash_proc_finfo,
+															  att->attcollation,
+															  tk->value)));
+		else
+			h = hash_combine(h, (uint32) 0x4E4F4E44);	/* "NOND" */
+	}
+
+	*out_n = natts;
+	*out_hash = h;
+	return keys;
+}
+
+/*
+ * ob_claim_add
+ *
+ *	Record a claim for the given column list of `slot`.  The typed key is
+ *	built (and kept) in `cxt`; re-proposing an already-claimed key leaves the
+ *	first entry in place and frees the rebuild.  No-op when the key can never
+ *	conflict.
+ */
+static void
+ob_claim_add(Relation rel, TupleTableSlot *slot,
+			 AttrNumber *attnos, int natts, bool nulls_not_distinct,
+			 HTAB *claimed, MemoryContext cxt)
+{
+	ObClaimedKey probe;
+	bool		found;
+	int			n;
+
+	probe.keys = ob_typed_claim_build(rel, slot, attnos, natts,
+									  nulls_not_distinct, cxt, &n, &probe.hash);
+	if (probe.keys == NULL)
+		return;
+	probe.nkeys = n;
+	(void) hash_search(claimed, &probe, HASH_ENTER, &found);
+	if (found)
+		overlay_typed_pk_free(probe.keys, n);
+}
+
+/*
+ * ob_claim_lookup
+ *
+ *	Return true when the given column list of `slot` was already claimed by
+ *	an earlier row of the SAME command.  The probe key is transient and
+ *	freed before returning.
+ */
+static bool
+ob_claim_lookup(Relation rel, TupleTableSlot *slot,
+				AttrNumber *attnos, int natts, bool nulls_not_distinct,
+				HTAB *claimed, MemoryContext cxt)
+{
+	ObClaimedKey probe;
+	bool		found;
+	int			n;
+
+	probe.keys = ob_typed_claim_build(rel, slot, attnos, natts,
+									  nulls_not_distinct, cxt, &n, &probe.hash);
+	if (probe.keys == NULL)
+		return false;
+	probe.nkeys = n;
+	(void) hash_search(claimed, &probe, HASH_FIND, &found);
+	overlay_typed_pk_free(probe.keys, n);
+	return found;
 }
 
 /*
@@ -708,56 +923,6 @@ ob_validate_redirect_constraints(ResultRelInfo *rri, Relation rel,
 }
 
 /* ----------------------------------------------------------------
- * ob_build_arbiter_key
- *
- *   Serialize the arbiter columns of a candidate row into one stable
- *   NUL-terminated string, used ONLY as a same-statement duplicate-claim
- *   key.  Returns NULL when the key cannot conflict at all: under the
- *   default NULLS DISTINCT unique index a NULL never matches, so no claim
- *   is recorded.  Each component is length-prefixed so values that embed
- *   the separators cannot alias a different column tuple.
- * ----------------------------------------------------------------
- */
-static char *
-ob_build_arbiter_key(Relation rel, TupleTableSlot *slot, AttrNumber *attnos,
-					 int natts, bool nulls_not_distinct)
-{
-	StringInfoData buf;
-	MemoryContext old;
-	char	   *result;
-	int			i;
-
-	initStringInfo(&buf);
-	for (i = 0; i < natts; i++)
-	{
-		bool		isnull = false;
-		char	   *txt = ob_slot_col_text(rel, slot, attnos[i], &isnull);
-
-		if (isnull)
-		{
-			if (!nulls_not_distinct)
-			{
-				/* NULLS DISTINCT: a NULL arbiter never conflicts. */
-				pfree(buf.data);
-				return NULL;
-			}
-			appendStringInfoString(&buf, "N;");
-		}
-		else
-		{
-			appendStringInfo(&buf, "V%d:%s;", (int) strlen(txt), txt);
-			pfree(txt);
-		}
-	}
-
-	old = MemoryContextSwitchTo(TopMemoryContext);
-	result = pstrdup(buf.data);
-	MemoryContextSwitchTo(old);
-	pfree(buf.data);
-	return result;
-}
-
-/* ----------------------------------------------------------------
  * ob_unique_target_conflict
  *
  *   Probe the branch delta and MAIN for a row conflicting with the
@@ -1029,63 +1194,20 @@ ob_relation_has_resolvable_unique(Relation rel)
 }
 
 /* ----------------------------------------------------------------
- * ob_unique_key_build
+ * ob_unique_claims_apply
  *
- *   Serialize the indexed columns of `slot` for UNIQUE index `idxoid`
- *   into one stable NUL-terminated string, prefixed with the index OID,
- *   used as the per-statement same-claim key.  Returns NULL when the key
- *   can never conflict (a NULL column under a NULLS DISTINCT index).
- *   Each component is length-prefixed so values that embed the separators
- *   cannot alias a different column tuple.  The result is palloc'd in the
- *   caller's memory context and must be pfree'd by the caller.
- * ----------------------------------------------------------------
- */
-static char *
-ob_unique_key_build(Relation rel, Oid idxoid, TupleTableSlot *slot,
-					AttrNumber *attnos, int natts, bool nulls_not_distinct)
-{
-	StringInfoData buf;
-	int			i;
-
-	initStringInfo(&buf);
-	appendStringInfo(&buf, "u%u|", idxoid);
-	for (i = 0; i < natts; i++)
-	{
-		bool		isnull = false;
-		char	   *txt = ob_slot_col_text(rel, slot, attnos[i], &isnull);
-
-		if (isnull)
-		{
-			if (!nulls_not_distinct)
-			{
-				/* NULLS DISTINCT: a NULL never conflicts. */
-				pfree(buf.data);
-				return NULL;
-			}
-			appendStringInfoString(&buf, "N;");
-		}
-		else
-		{
-			appendStringInfo(&buf, "V%d:%s;", (int) strlen(txt), txt);
-			pfree(txt);
-		}
-	}
-	return buf.data;
-}
-
-/* ----------------------------------------------------------------
- * ob_unique_claim_lookup
- *
- *   Return the OID of the first resolvable non-PK UNIQUE index of `rel`
- *   whose key for `slot` was already claimed by an earlier row of the
- *   SAME command, or InvalidOid when none was.  Mirrors native's
- *   immediate index-level duplicate detection (the command counter does
- *   not advance between rows of one command, so the SPI probes cannot
- *   see a sibling row).
+ *   Walk every resolvable non-PK UNIQUE index of `rel` and either test
+ *   (add=false: return the OID of the first index whose typed key for
+ *   `slot` was already claimed by an earlier row of the SAME command) or
+ *   record (add=true: claim `slot`'s key for each such index).  Mirrors
+ *   native's immediate index-level duplicate detection -- the command
+ *   counter does not advance between rows of one command, so the SPI
+ *   probes cannot see a sibling row.
  * ----------------------------------------------------------------
  */
 static Oid
-ob_unique_claim_lookup(Relation rel, TupleTableSlot *slot, HTAB *claimed)
+ob_unique_claims_apply(Relation rel, TupleTableSlot *slot, HTAB *claimed,
+					   MemoryContext cxt, bool add)
 {
 	List	   *indexoids = RelationGetIndexList(rel);
 	Oid			pkidx = RelationGetPrimaryKeyIndex(rel);
@@ -1102,9 +1224,6 @@ ob_unique_claim_lookup(Relation rel, TupleTableSlot *slot, HTAB *claimed)
 		bool		ok = true;
 		int			n;
 		int			i;
-		char	   *key;
-		char	   *probe;
-		bool		found;
 
 		if (idxoid == pkidx)
 			continue;
@@ -1130,13 +1249,9 @@ ob_unique_claim_lookup(Relation rel, TupleTableSlot *slot, HTAB *claimed)
 		if (!ok)
 			continue;
 
-		key = ob_unique_key_build(rel, idxoid, slot, attnos, n, nnd);
-		if (key == NULL)
-			continue;
-		probe = key;
-		(void) hash_search(claimed, &probe, HASH_FIND, &found);
-		pfree(key);
-		if (found)
+		if (add)
+			ob_claim_add(rel, slot, attnos, n, nnd, claimed, cxt);
+		else if (ob_claim_lookup(rel, slot, attnos, n, nnd, claimed, cxt))
 		{
 			hit = idxoid;
 			break;
@@ -1145,71 +1260,6 @@ ob_unique_claim_lookup(Relation rel, TupleTableSlot *slot, HTAB *claimed)
 
 	list_free(indexoids);
 	return hit;
-}
-
-/* ----------------------------------------------------------------
- * ob_unique_claims_add
- *
- *   Record, in `claimed`, the per-index UNIQUE keys of a row the redirect
- *   has just written, so a later row of the same command that proposes
- *   the same value is caught (native index-level detection).  Only the
- *   resolvable non-PK UNIQUE indexes are recorded; the PK / arbiter key
- *   is claimed separately by ob_claim_key().
- * ----------------------------------------------------------------
- */
-static void
-ob_unique_claims_add(Relation rel, TupleTableSlot *slot, HTAB *claimed,
-					 MemoryContext cxt)
-{
-	List	   *indexoids = RelationGetIndexList(rel);
-	Oid			pkidx = RelationGetPrimaryKeyIndex(rel);
-	ListCell   *lc;
-
-	foreach(lc, indexoids)
-	{
-		Oid			idxoid = lfirst_oid(lc);
-		Relation	idxrel;
-		IndexInfo  *ii;
-		AttrNumber	attnos[INDEX_MAX_KEYS];
-		bool		nnd;
-		bool		ok = true;
-		int			n;
-		int			i;
-		char	   *key;
-
-		if (idxoid == pkidx)
-			continue;
-
-		idxrel = index_open(idxoid, AccessShareLock);
-		ii = BuildIndexInfo(idxrel);
-		n = ii->ii_NumIndexAttrs;
-		nnd = ii->ii_NullsNotDistinct;
-		if (!ii->ii_Unique || n <= 0 || n > INDEX_MAX_KEYS ||
-			ii->ii_Predicate != NIL)
-			ok = false;
-		for (i = 0; ok && i < n; i++)
-		{
-			if (ii->ii_IndexAttrNumbers[i] <= 0)
-			{
-				ok = false;
-				break;
-			}
-			attnos[i] = ii->ii_IndexAttrNumbers[i];
-		}
-		index_close(idxrel, AccessShareLock);
-
-		if (!ok)
-			continue;
-
-		key = ob_unique_key_build(rel, idxoid, slot, attnos, n, nnd);
-		if (key != NULL)
-		{
-			ob_claim_key(claimed, cxt, key);
-			pfree(key);
-		}
-	}
-
-	list_free(indexoids);
 }
 
 /* ----------------------------------------------------------------
@@ -1244,7 +1294,7 @@ ob_enforce_plain_unique(Relation rel, TupleTableSlot *slot, int32 bid,
 
 	if (claimed != NULL)
 	{
-		hit = ob_unique_claim_lookup(rel, slot, claimed);
+		hit = ob_unique_claims_apply(rel, slot, claimed, claimed_cxt, false);
 		if (OidIsValid(hit))
 		{
 			char	   *idxname = get_rel_name(hit);
@@ -1271,7 +1321,7 @@ ob_enforce_plain_unique(Relation rel, TupleTableSlot *slot, int32 bid,
 	}
 
 	if (claimed != NULL)
-		ob_unique_claims_add(rel, slot, claimed, claimed_cxt);
+		ob_unique_claims_apply(rel, slot, claimed, claimed_cxt, true);
 }
 
 /* ----------------------------------------------------------------
@@ -1741,7 +1791,7 @@ overlay_executor_run_intercept(QueryDesc *queryDesc,
 											  "overlay_branch update claimed uniq keys",
 											  ALLOCSET_SMALL_SIZES);
 					memset(&ctl, 0, sizeof(ctl));
-					ctl.keysize = sizeof(char *);
+					ctl.keysize = sizeof(ObClaimedKey);
 					ctl.entrysize = sizeof(ObClaimedKey);
 					ctl.hcxt = claimed_cxt;
 					ctl.hash = ob_claimed_hash;
@@ -2269,6 +2319,8 @@ overlay_executor_run_intercept(QueryDesc *queryDesc,
 				HTAB	   *claimed = NULL;
 				MemoryContext claimed_cxt = NULL;
 				HTAB	   *claimed_uq = NULL;	/* non-PK UNIQUE same-claim set */
+				AttrNumber	pk_attnos[INDEX_MAX_KEYS];	/* real PK columns */
+				int			pk_natts = 0;
 
 				{
 					ResultRelInfo *rri0 = rri;
@@ -2351,17 +2403,32 @@ overlay_executor_run_intercept(QueryDesc *queryDesc,
 						pk_attno = 0;
 				}
 
+				/* Materialise the real PK column list once for the whole
+				 * statement: the same-claim set is typed over these columns
+				 * (or the arbiter columns) rather than a serialized text. */
+				{
+					List	   *pklist = overlay_get_pk_attnos_list(rel);
+					ListCell   *lc_pk;
+
+					foreach(lc_pk, pklist)
+					{
+						if (pk_natts < INDEX_MAX_KEYS)
+							pk_attnos[pk_natts++] = (AttrNumber) lfirst_int(lc_pk);
+					}
+					list_free(pklist);
+				}
+
 				subplan = outerPlanState(mt);
 
-				/* Per-statement "claimed arbiter keys" set (see ob_claim_key),
-				 * plus a second set for non-PK UNIQUE same-claim keys.
-				 * The arbiter/PK set is keyed by serialized identity and is
-				 * only meaningful for a table with a PK (a keyless table has
-				 * no PK identity to violate); the UNIQUE set is built for any
-				 * table carrying a resolvable non-PK UNIQUE index (a keyless
-				 * table may still own one, e.g. the UPSERT arbiter).  Both
-				 * are parented to the query context so an error longjmp frees
-				 * them. */
+				/* Per-statement "claimed arbiter keys" set (see ob_claim_add /
+				 * ob_claim_lookup), plus a second set for non-PK UNIQUE
+				 * same-claim keys.  Both are keyed by typed column values.
+				 * The arbiter/PK set is only meaningful for a table with a
+				 * PK (a keyless table has no PK identity to violate); the
+				 * UNIQUE set is built for any table carrying a resolvable
+				 * non-PK UNIQUE index (a keyless table may still own one,
+				 * e.g. the UPSERT arbiter).  Both are parented to the query
+				 * context so an error longjmp frees them. */
 				{
 					bool		has_pk = overlay_relation_has_pk(rel);
 					bool		has_uq = ob_relation_has_resolvable_unique(rel);
@@ -2375,7 +2442,7 @@ overlay_executor_run_intercept(QueryDesc *queryDesc,
 												  "overlay_branch claimed keys",
 												  ALLOCSET_SMALL_SIZES);
 						memset(&ctl, 0, sizeof(ctl));
-						ctl.keysize = sizeof(char *);
+						ctl.keysize = sizeof(ObClaimedKey);
 						ctl.entrysize = sizeof(ObClaimedKey);
 						ctl.hcxt = claimed_cxt;
 						ctl.hash = ob_claimed_hash;
@@ -2403,7 +2470,6 @@ overlay_executor_run_intercept(QueryDesc *queryDesc,
 				char	   *tdata;
 				char	   *old_version = NULL;
 				char	   *pure_delta_key = NULL;
-				char	   *claim_key = NULL;   /* arbiter-key claim string (arbiter path) */
 				char	   *conflict_key = NULL; /* conflicted row's own PK (keyed arbiter path) */
 				int			promotion = 0; /* 0=skip 1=INSERT 2=UPDATE(main) 3=UPDATE(pure) */
 				TupleTableSlot *pre_image_slot = NULL;
@@ -2434,26 +2500,22 @@ overlay_executor_run_intercept(QueryDesc *queryDesc,
 				ob_validate_redirect_constraints(rri, rel, slot,
 												 queryDesc->estate);
 
-				/* Same-statement duplicate check: was this arbiter key already
-				 * written by an earlier row of THIS command?  (PK tables only;
-				 * `claimed` stays NULL for keyless tables.)  On the arbiter
-				 * path the claim key is the arbiter columns — a non-PK arbiter
-				 * may match a row whose PK differs from the proposed one, so
-				 * the PK is not the conflict identity there. */
+				/* Same-statement duplicate check: was this key already written
+				 * by an earlier row of THIS command?  (`claimed` stays NULL
+				 * for keyless tables.)  The claim columns are the arbiter
+				 * columns when the ON CONFLICT arbiter is a NON-primary
+				 * UNIQUE index — a non-PK arbiter may match a row whose PK
+				 * differs from the proposed one, so the PK is not the
+				 * conflict identity there — otherwise the PRIMARY KEY
+				 * columns.  Comparison is typed (not textual) so `=`-equal
+				 * rows with different text forms (numeric 1.0 vs 1.00,
+				 * timestamptz offsets) are still caught. */
 				if (claimed != NULL)
-				{
-					char	   *pk_probe = pk;
-
-					if (arb_natts > 0)
-					{
-						claim_key = ob_build_arbiter_key(rel, slot, arb_attnos,
-														 arb_natts,
-														 arb_nulls_not_distinct);
-						if (claim_key != NULL)
-							pk_probe = claim_key;
-					}
-					(void) hash_search(claimed, &pk_probe, HASH_FIND, &key_claimed);
-				}
+					key_claimed = ob_claim_lookup(rel, slot,
+												  (arb_natts > 0) ? arb_attnos : pk_attnos,
+												  (arb_natts > 0) ? arb_natts : pk_natts,
+												  (arb_natts > 0) ? arb_nulls_not_distinct : true,
+												  claimed, claimed_cxt);
 
 				/* ================================================================
 				 * === B2 UPSERT: 2-Phase Conflict Detection (delta shadows
@@ -3445,8 +3507,11 @@ overlay_executor_run_intercept(QueryDesc *queryDesc,
 							oldmc = MemoryContextSwitchTo(
 								queryDesc->estate->es_query_cxt);
 							if (claimed != NULL)
-								ob_claim_key(claimed, claimed_cxt,
-											 claim_key != NULL ? claim_key : pk);
+								ob_claim_add(rel, slot,
+											 (arb_natts > 0) ? arb_attnos : pk_attnos,
+											 (arb_natts > 0) ? arb_natts : pk_natts,
+											 (arb_natts > 0) ? arb_nulls_not_distinct : true,
+											 claimed, claimed_cxt);
 							overlay_delta_insert(bid, relid, delta_key,
 												 DELTA_OP_UPDATE, old_version, tdata);
 							MemoryContextSwitchTo(oldmc);
@@ -3524,8 +3589,11 @@ overlay_executor_run_intercept(QueryDesc *queryDesc,
 						oldmc = MemoryContextSwitchTo(
 							queryDesc->estate->es_query_cxt);
 						if (claimed != NULL)
-							ob_claim_key(claimed, claimed_cxt,
-										 claim_key != NULL ? claim_key : pk);
+							ob_claim_add(rel, slot,
+										 (arb_natts > 0) ? arb_attnos : pk_attnos,
+										 (arb_natts > 0) ? arb_natts : pk_natts,
+										 (arb_natts > 0) ? arb_nulls_not_distinct : true,
+										 claimed, claimed_cxt);
 						overlay_delta_insert(bid, relid, pk,
 											 DELTA_OP_INSERT, NULL, tdata);
 						MemoryContextSwitchTo(oldmc);
@@ -3575,7 +3643,6 @@ overlay_executor_run_intercept(QueryDesc *queryDesc,
 				if (tdata) pfree(tdata);
 				if (old_version) pfree(old_version);
 				if (pure_delta_key) pfree(pure_delta_key);
-				if (claim_key) pfree(claim_key);
 				if (conflict_key) pfree(conflict_key);
 				ExecClearTuple(slot);
 			}

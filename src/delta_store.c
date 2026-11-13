@@ -37,6 +37,8 @@
 #include "nodes/execnodes.h"
 #include "utils/builtins.h"
 #include "utils/datum.h"
+#include "utils/fmgrprotos.h"
+#include "utils/guc.h"
 #include "utils/hsearch.h"
 #include "utils/inval.h"
 #include "utils/json.h"
@@ -1084,6 +1086,7 @@ typedef struct ObPkRelMeta
 {
 	Oid			relid;			/* hash key = table Oid */
 	bool		has_pk;
+	bool		guc_sensitive;	/* any PK col's output depends on a session GUC */
 	int			n_pk;
 	ObPkColMeta cols[OB_MAX_PK_COLS];
 } ObPkRelMeta;
@@ -1100,6 +1103,7 @@ static HTAB *ob_pk_rel_hash = NULL;
 static HTAB *ob_pk_type_hash = NULL;
 
 static void ob_pk_cache_invalidate_cb(Datum arg, Oid relid);
+static bool ob_identity_type_is_guc_sensitive(Oid typid);
 
 static void
 ob_pk_cache_init(void)
@@ -1297,7 +1301,13 @@ ob_pk_rel_meta(Relation rel)
 
 			col->attno = attno;
 			if (attno <= 0 || attno > reldesc->natts)
-				continue;		/* expression column: no type metadata */
+			{
+				/* Expression column: no type metadata, and the unknown
+				 * output function may be GUC-dependent — pin the
+				 * canonical identity GUCs defensively. */
+				entry->guc_sensitive = true;
+				continue;
+			}
 			att = TupleDescAttr(reldesc, attno - 1);
 			col->typid = att->atttypid;
 			col->typmod = att->atttypmod;
@@ -1306,6 +1316,8 @@ ob_pk_rel_meta(Relation rel)
 			col->typlen = att->attlen;
 			col->typbyval = att->attbyval;
 			ob_pk_type_cmp_fmgrs(col->typid, &col->eq_finfo, &col->lt_finfo);
+			if (ob_identity_type_is_guc_sensitive(col->typid))
+				entry->guc_sensitive = true;
 		}
 
 		index_close(pk_rel, AccessShareLock);
@@ -1478,26 +1490,154 @@ overlay_serialize_identity(Relation rel, TupleTableSlot *slot, char op)
 }
 
 /* ================================================================
+ * Canonical output GUC context (doc/internals.md §1.5)
+ *
+ * Two serializers render a value through its column type's output
+ * function into text that outlives the writing session:
+ *
+ *   - the delta identity key (overlay_serialize_pk /
+ *     overlay_serialize_pk_from_single_datum), whose text MUST be
+ *     byte-identical for '='-equal values across sessions, and
+ *   - the delta tuple payload (overlay_serialize_tuple), whose text is
+ *     re-parsed by the reading session's input functions.
+ *
+ * A handful of output functions are NOT pure functions of the value:
+ * they read session GUCs — TimeZone / DateStyle for the date-time
+ * family, IntervalStyle for interval, extra_float_digits for
+ * float4/float8, bytea_output for bytea.  Left alone, two sessions with
+ * different settings either fail to match on the SAME value (identity
+ * key → the delta PK (branch_id, relid, key) stores two rows and every
+ * text-key probe misses) or re-parse the payload into a DIFFERENT value
+ * (silent corruption).  Whenever a column is such a type we pin those
+ * GUCs to a canonical value for the duration of the serialization only,
+ * using GUC_ACTION_SAVE so guc.c unwinds the change automatically on
+ * error (and because SAVE is the one action permitted inside a parallel
+ * worker).  GUC-insensitive types (int, text, uuid, …) skip the pin
+ * entirely, so the hot common path pays nothing.
+ * ================================================================ */
+static bool
+ob_identity_type_is_guc_sensitive(Oid typid)
+{
+	Oid			elem;
+
+	/* A domain renders through its base type's output function but has its
+	 * own OID, so peel it first — a domain over timestamptz must be pinned
+	 * exactly like timestamptz.  getBaseType also collapses nested domains
+	 * and leaves an array's own OID (it is not a domain) intact. */
+	typid = getBaseType(typid);
+
+	/* An array column renders through its element output function, so
+	 * recurse once (arrays are not nested as distinct types). */
+	elem = get_element_type(typid);
+	if (OidIsValid(elem))
+		return ob_identity_type_is_guc_sensitive(elem);
+
+	switch (typid)
+	{
+		case TIMESTAMPTZOID:
+		case TIMESTAMPOID:
+		case DATEOID:
+		case TIMETZOID:
+		case INTERVALOID:
+		case FLOAT4OID:
+		case FLOAT8OID:
+		case BYTEAOID:
+			return true;
+		default:
+			return false;
+	}
+}
+
+/*
+ * ob_payload_type_roundtrip_unsafe
+ *
+ *	The subset of ob_identity_type_is_guc_sensitive whose output ALSO fails
+ *	to survive a round trip through a differently-configured reader: the
+ *	type carries no self-describing marker, so DateStyle / IntervalStyle /
+ *	extra_float_digits can make timestamp_in / date_in / timestamptz_in /
+ *	interval_in / float8in re-parse the stored payload text into a different
+ *	value.
+ *
+ *	timestamptz belongs here: even though it always emits a zone offset (or
+ *	name), that only pins the instant's zone — DateStyle still reorders the
+ *	date fields, so `2024-06-01 00:00:00 UTC` written under SQL,DMY as
+ *	`01/06/2024 00:00:00 UTC` is read back under ISO,MDY as 6 January.
+ *	`timetz` (no date field) and `bytea` (two mutually-accepted spellings)
+ *	do round-trip, so they skip the pin.
+ */
+static bool
+ob_payload_type_roundtrip_unsafe(Oid typid)
+{
+	Oid			elem;
+
+	/* Peel a domain first (own OID, base type's I/O functions). */
+	typid = getBaseType(typid);
+
+	elem = get_element_type(typid);
+	if (OidIsValid(elem))
+		return ob_payload_type_roundtrip_unsafe(elem);
+
+	switch (typid)
+	{
+		case TIMESTAMPOID:
+		case TIMESTAMPTZOID:
+		case DATEOID:
+		case INTERVALOID:
+		case FLOAT4OID:
+		case FLOAT8OID:
+			return true;
+		default:
+			return false;
+	}
+}
+
+static int
+ob_canonical_guc_pin(void)
+{
+	int			nl = NewGUCNestLevel();
+
+	(void) set_config_option("TimeZone", "UTC",
+							 PGC_USERSET, PGC_S_SESSION,
+							 GUC_ACTION_SAVE, true, 0, false);
+	(void) set_config_option("DateStyle", "ISO, MDY",
+							 PGC_USERSET, PGC_S_SESSION,
+							 GUC_ACTION_SAVE, true, 0, false);
+	(void) set_config_option("IntervalStyle", "postgres",
+							 PGC_USERSET, PGC_S_SESSION,
+							 GUC_ACTION_SAVE, true, 0, false);
+	(void) set_config_option("extra_float_digits", "1",
+							 PGC_USERSET, PGC_S_SESSION,
+							 GUC_ACTION_SAVE, true, 0, false);
+	(void) set_config_option("bytea_output", "hex",
+							 PGC_USERSET, PGC_S_SESSION,
+							 GUC_ACTION_SAVE, true, 0, false);
+	return nl;
+}
+
+static void
+ob_canonical_guc_unpin(int nestlevel)
+{
+	AtEOXact_GUC(true, nestlevel);
+}
+
+/* ================================================================
  * PK / row serialization (JSON)
  * ================================================================ */
-char *
-overlay_serialize_pk(Relation rel, TupleTableSlot *slot)
+
+/*
+ * ob_serialize_pk_body
+ *	Build the canonical PK identity text.  The caller has already
+ *	established the canonical GUC context when the PK is GUC-sensitive
+ *	(see overlay_serialize_pk), so this helper is context-agnostic.
+ */
+static char *
+ob_serialize_pk_body(Relation rel, TupleTableSlot *slot, ObPkRelMeta *pm)
 {
-	ObPkRelMeta *pm;
 	StringInfoData json;
 	char	   *result;
 	MemoryContext oldmc;
 
-	Assert(rel != NULL && slot != NULL);
-
-	/* RD-4: one cached catalog lookup instead of RelationGetIndexList()
-	 * + index_open() on every row. */
-	pm = ob_pk_rel_meta(rel);
-	if (!pm->has_pk || pm->n_pk <= 0)
-		ereport(ERROR,
-				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
-				 errmsg("overlay_serialize_pk requires a primary key on %s",
-						RelationGetRelationName(rel))));
+	Assert(rel != NULL && slot != NULL && pm != NULL);
 
 	/* RD-8: build the JSON array text in pure C instead of a
 	 * `SELECT to_jsonb(ARRAY[...])::text` SPI round-trip (~8us/row).
@@ -1525,7 +1665,7 @@ overlay_serialize_pk(Relation rel, TupleTableSlot *slot)
 					 errmsg("overlay_serialize_pk: cannot find PK column (attno=%d) inside UPDATE/DELETE junk-column slot (natts=%d)",
 							attno, slot->tts_tupleDescriptor->natts)));
 
-		typid = pm->cols[i].typid;
+		typid = getBaseType(pm->cols[i].typid);
 		val = slot_getattr(slot, slot_idx, &isnull);
 		if (isnull)
 		{
@@ -1537,9 +1677,44 @@ overlay_serialize_pk(Relation rel, TupleTableSlot *slot)
 			Oid			outfuncoid;
 			bool		typeIsVarlena;
 			char	   *valstr;
+			Datum		outval = val;
+			bool		have_trimmed = false;
+
+			/* Canonicalize NUMERIC to a scale-invariant rendering so that
+			 * two PK values that are '='-equal but print with a different
+			 * dscale (e.g. 1.0 vs 1.00 on a NUMERIC column WITHOUT a
+			 * typmod) collapse to ONE identity key.  Without this the delta
+			 * PK (branch_id, relid, key) would hold two rows for a single
+			 * logical row and every text-key probe -- R21 delta pre-check,
+			 * UPSERT Phase I pure-delta probe, the delta O(1) lookup in
+			 * BranchScan and overlay_delta_lookup() -- would miss the
+			 * shadowing row, so a branch INSERT of an '='-equal PK would
+			 * silently succeed instead of raising the native 23505.
+			 * BPCHAR gets an equivalent r-trim below; both mirror the
+			 * `CAST(... AS <pktype>)::text` normalization the const-side
+			 * serializer (overlay_serialize_pk_from_single_datum) applies,
+			 * so the two producers stay byte-identical. */
+			if (typid == NUMERICOID)
+			{
+				outval = DirectFunctionCall1(numeric_trim_scale, val);
+				have_trimmed = true;
+			}
+			else if (typid == FLOAT8OID)
+			{
+				/* -0.0 and +0.0 are '='-equal (float8eq) but render "-0"
+				 * and "0"; collapse -0.0 to +0.0 so the two spellings
+				 * share one identity key. */
+				if (DatumGetFloat8(val) == 0.0)
+					outval = Float8GetDatum((float8) 0.0);
+			}
+			else if (typid == FLOAT4OID)
+			{
+				if (DatumGetFloat4(val) == 0.0)
+					outval = Float4GetDatum((float4) 0.0);
+			}
 
 			getTypeOutputInfo(typid, &outfuncoid, &typeIsVarlena);
-			valstr = OidOutputFunctionCall(outfuncoid, val);
+			valstr = OidOutputFunctionCall(outfuncoid, outval);
 			/* BPCHAR r-trim: PG bpchar→text cast silently strips trailing
 			 * blanks, so P0 fast-path (which casts via ::text) would
 			 * produce 'AB12' for a char(8) value 'AB12    '.  To match we
@@ -1555,6 +1730,8 @@ overlay_serialize_pk(Relation rel, TupleTableSlot *slot)
 			}
 			escape_json(&json, valstr);
 			pfree(valstr);
+			if (have_trimmed)
+				pfree(DatumGetPointer(outval));
 		}
 	}
 	appendStringInfoChar(&json, ']');
@@ -1566,8 +1743,60 @@ overlay_serialize_pk(Relation rel, TupleTableSlot *slot)
 	return result;
 }
 
+/*
+ * overlay_serialize_pk
+ *
+ *	Canonical PK identity text.  When any PK column's output function
+ *	reads a session GUC, pin the canonical identity GUCs around the
+ *	serialization so every session renders byte-identical keys (see the
+ *	"Canonical identity GUC context" note above).  PG_FINALLY restores
+ *	the GUCs on any error path, so an error swallowed by an inner
+ *	PG_CATCH can never leave the session pinned to UTC/ISO.
+ */
 char *
-overlay_serialize_tuple(Relation rel, TupleTableSlot *slot)
+overlay_serialize_pk(Relation rel, TupleTableSlot *slot)
+{
+	ObPkRelMeta *pm;
+	char	   *result = NULL;
+	int			guc_nl;
+
+	Assert(rel != NULL && slot != NULL);
+
+	/* RD-4: one cached catalog lookup instead of RelationGetIndexList()
+	 * + index_open() on every row. */
+	pm = ob_pk_rel_meta(rel);
+	if (!pm->has_pk || pm->n_pk <= 0)
+		ereport(ERROR,
+				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+				 errmsg("overlay_serialize_pk requires a primary key on %s",
+						RelationGetRelationName(rel))));
+
+	if (!pm->guc_sensitive)
+		return ob_serialize_pk_body(rel, slot, pm);
+
+	guc_nl = ob_canonical_guc_pin();
+	PG_TRY();
+	{
+		result = ob_serialize_pk_body(rel, slot, pm);
+	}
+	PG_FINALLY();
+	{
+		ob_canonical_guc_unpin(guc_nl);
+	}
+	PG_END_TRY();
+
+	return result;
+}
+
+/*
+ * ob_serialize_tuple_body
+ *
+ *	Relation-shape → JSON payload text.  Pure with respect to GUCs only
+ *	when every column type is GUC-insensitive; overlay_serialize_tuple
+ *	below pins the canonical GUCs otherwise.
+ */
+static char *
+ob_serialize_tuple_body(Relation rel, TupleTableSlot *slot)
 {
 	TupleDesc	reldesc;
 	int			natts;
@@ -1700,6 +1929,57 @@ overlay_serialize_tuple(Relation rel, TupleTableSlot *slot)
 							 result, len)));
 
 	pfree(jsonbuf.data);
+	return result;
+}
+
+/*
+ * overlay_serialize_tuple
+ *
+ *	Serialized payload text is re-parsed by the reading session's input
+ *	functions, so when any column type's output fails to round-trip across a
+ *	differently-configured session (see ob_payload_type_roundtrip_unsafe) we
+ *	pin the canonical GUCs around the body.  PG_FINALLY restores them on any
+ *	error path.  Tables with only GUC-safe columns skip the pin entirely.
+ */
+char *
+overlay_serialize_tuple(Relation rel, TupleTableSlot *slot)
+{
+	TupleDesc	reldesc;
+	int			i;
+	bool		sensitive = false;
+	char	   *result = NULL;
+	int			guc_nl;
+
+	Assert(rel != NULL && slot != NULL);
+
+	reldesc = RelationGetDescr(rel);
+	for (i = 0; i < reldesc->natts; i++)
+	{
+		Form_pg_attribute att = TupleDescAttr(reldesc, i);
+
+		if (att->attisdropped)
+			continue;
+		if (ob_payload_type_roundtrip_unsafe(att->atttypid))
+		{
+			sensitive = true;
+			break;
+		}
+	}
+
+	if (!sensitive)
+		return ob_serialize_tuple_body(rel, slot);
+
+	guc_nl = ob_canonical_guc_pin();
+	PG_TRY();
+	{
+		result = ob_serialize_tuple_body(rel, slot);
+	}
+	PG_FINALLY();
+	{
+		ob_canonical_guc_unpin(guc_nl);
+	}
+	PG_END_TRY();
+
 	return result;
 }
 
@@ -2245,12 +2525,12 @@ overlay_get_pk_attnos_list(Relation rel)
  *       …).  The resulting ::text representation is byte-identical to
  *       what the WRITE side emits for the same stored-in-table value.
  */
-char *
-overlay_serialize_pk_from_single_datum(Relation rel,
-									   AttrNumber pk_attno,
-									   Datum pk_val,
-									   bool pk_isnull,
-									   Oid consttype)
+static char *
+ob_serialize_pk_single_datum_body(Relation rel,
+								  AttrNumber pk_attno,
+								  Datum pk_val,
+								  bool pk_isnull,
+								  Oid consttype)
 {
 	TupleDesc	reldesc;
 	Form_pg_attribute pkatt;
@@ -2279,6 +2559,7 @@ overlay_serialize_pk_from_single_datum(Relation rel,
 		char	   *litstr;
 		char	   *q;
 		const char *pktypname;
+		Oid			base_typid;
 
 		/* Stage 1: use the CONST'S OWN type to stringify its Datum. */
 		getTypeOutputInfo(consttype, &lit_outfuncoid, &lit_typeIsVarlena);
@@ -2305,8 +2586,32 @@ overlay_serialize_pk_from_single_datum(Relation rel,
 		q = quote_literal_cstr(litstr);
 		pktypname = format_type_with_typemod(pk_typid, pkatt->atttypmod);
 
-		appendStringInfo(&arr_sql, "CAST (%s AS %s)::text",
-						 q, pktypname);
+		/* The branch selection below must look through a domain: a domain over
+		 * numeric / float8 carries its own OID but the base type's semantics.
+		 * pktypname stays the domain name so the CAST still applies the
+		 * domain's own typmod rounding before the normalization. */
+		base_typid = getBaseType(pk_typid);
+
+		/* NUMERIC: apply the same scale-invariant normalization the WRITE
+		 * side performs (numeric_trim_scale in overlay_serialize_pk), so a
+		 * const probe key for 1.0 / 1.00 matches the stored identity key on
+		 * a typmod-less NUMERIC PK.  CAST(q AS numeric(10,2)) still applies
+		 * any column typmod rounding/padding FIRST; trim_scale then drops
+		 * the trailing zeros. */
+		if (base_typid == NUMERICOID)
+			appendStringInfo(&arr_sql,
+							 "CAST (pg_catalog.trim_scale(CAST (%s AS %s)) AS text)",
+							 q, pktypname);
+		else if (base_typid == FLOAT8OID || base_typid == FLOAT4OID)
+			/* Collapse -0.0 to +0.0: adding +0.0 does exactly that in
+			 * IEEE, matching the WRITE-side float normalization so the
+			 * "-0"/"0" spellings share one identity key. */
+			appendStringInfo(&arr_sql,
+							 "CAST ((CAST (%s AS %s) + %s '0') AS text)",
+							 q, pktypname, pktypname);
+		else
+			appendStringInfo(&arr_sql, "CAST (%s AS %s)::text",
+							 q, pktypname);
 		pfree(q);
 		pfree(litstr);
 	}
@@ -2331,6 +2636,49 @@ overlay_serialize_pk_from_single_datum(Relation rel,
 		MemoryContextSwitchTo(oldmc);
 	}
 	SPI_finish();
+	return result;
+}
+
+/*
+ * overlay_serialize_pk_from_single_datum
+ *
+ *	Canonical identity text for a single-column const probe.  When the PK
+ *	column type's output depends on a session GUC (date/time family,
+ *	float, bytea) the CAST(...)::text below would render differently per
+ *	session, so pin the canonical identity GUCs around the SPI call (see
+ *	the "Canonical identity GUC context" note).  PG_FINALLY restores them
+ *	on any error path.
+ */
+char *
+overlay_serialize_pk_from_single_datum(Relation rel,
+									   AttrNumber pk_attno,
+									   Datum pk_val,
+									   bool pk_isnull,
+									   Oid consttype)
+{
+	Oid			pk_typid;
+	char	   *result = NULL;
+	int			guc_nl;
+
+	Assert(rel != NULL);
+	pk_typid = TupleDescAttr(RelationGetDescr(rel), pk_attno - 1)->atttypid;
+
+	if (!ob_identity_type_is_guc_sensitive(pk_typid))
+		return ob_serialize_pk_single_datum_body(rel, pk_attno, pk_val,
+												 pk_isnull, consttype);
+
+	guc_nl = ob_canonical_guc_pin();
+	PG_TRY();
+	{
+		result = ob_serialize_pk_single_datum_body(rel, pk_attno, pk_val,
+												   pk_isnull, consttype);
+	}
+	PG_FINALLY();
+	{
+		ob_canonical_guc_unpin(guc_nl);
+	}
+	PG_END_TRY();
+
 	return result;
 }
 

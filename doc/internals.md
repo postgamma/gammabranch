@@ -170,6 +170,56 @@ promotion; `old_version` derives from the row's `ctid + xmin`. No-PK tables are
 rejected by default; under `overlay_branch.keyless_tables=on` they fall back to a
 best-effort ctid anchor after a one-shot WARNING (§4).
 
+**The identity text is canonical.** The `key` is the PK values rendered through
+their type output function and `escape_json`, so two `=`-equal PK values must
+render to the *same* text or the delta PK `(branch_id, relid, key)` would hold
+two rows for one logical row and every text-key probe (R21's delta pre-check, the
+UPSERT Phase I probe, the O(1) delta lookup) would miss the shadowing row — a
+branch INSERT of an `=`-equal PK would then silently succeed instead of raising
+the native `23505`, and an UPSERT `DO NOTHING` would duplicate the row. Some
+types need an explicit normalization: a typmod-less NUMERIC prints `1.0` / `1.00`
+for the same value, so it is scale-trimmed (trailing zeros dropped) before
+rendering; BPCHAR is r-trimmed (blank-padded comparison semantics). Both
+producers — the slot serializer on the write path and the literal serializer
+behind the const probes — must apply the identical normalization and stay
+byte-identical; the delta PK then deduplicates the two spellings for free.
+A column declared with a DOMAIN has its own `pg_type` OID, so the type tests must
+look through it first: `getBaseType()` peels a (possibly nested) domain to the
+base type, and only then do the NUMERIC / FLOAT / BPCHAR and GUC-sensitivity
+checks fire — otherwise a `numeric` domain re-splits `1.0` / `1.00` and a
+`timestamptz` domain renders two identities per instant. `get_element_type()`
+runs after the peel so an array *of* a domain and a domain *over* an array both
+resolve to the element type.
+
+**GUC-dependent output is pinned.** A few output functions are not pure
+functions of the value: `TimeZone` / `DateStyle` (the date-time family),
+`IntervalStyle` (`interval`), `extra_float_digits` (`float4` / `float8`) and
+`bytea_output` (`bytea`) all read the session. Both serializers — the identity
+key and the delta payload `tuple_data` — render through those functions, so each
+pins the GUCs to one canonical setting (`UTC`, `ISO, MDY`, `postgres`, `1`,
+`hex`) for the duration of the call, inside a `GUC_ACTION_SAVE` nest level that
+PostgreSQL unwinds on any error. Without the pin the SAME instant renders to two
+identity texts under different `TimeZone`s (`…00:00:00+00` vs
+`…08:00:00+08`), splitting one logical row across two delta keys; and the
+payload, re-parsed by the reader's *input* functions, silently changes value (a
+`timestamp` written under `DateStyle='SQL, DMY'` reads back as another date, a
+`float8` written under `extra_float_digits=0` loses precision). The payload pin
+covers the types whose text is not self-describing — `timestamp`, `timestamptz`,
+`date`, `interval`, `float4`, `float8`. `timestamptz` belongs here even though
+it emits a zone offset: the offset fixes the instant's zone, but `DateStyle`
+still reorders the date fields, so `2024-06-01 …` written under `SQL, DMY` as
+`01/06/2024 …` reads back as 6 January under `ISO, MDY`. `timetz` (no date
+field) and `bytea` (two mutually-accepted spellings) do round-trip, so they skip
+the pin. GUC-insensitive types (int, text, uuid, …) skip it too; the pin is paid
+only by a table that actually carries one of the listed columns.
+
+Finally, `float4` / `float8` collapse `-0.0` to `+0.0` before rendering: the two
+are `=`-equal (`float8eq`) yet print `-0` and `0`, and must share one identity
+key. Both sensitivity predicates (`ob_identity_type_is_guc_sensitive` and
+`ob_payload_type_roundtrip_unsafe`) peel a domain with `getBaseType()` before
+the type switch, so a domain over a sensitive type — or an array of one — is
+pinned exactly like its base type.
+
 ### 1.6 Incremental write path
 
 Entry is the `ExecutorRun` intercept. Core invariant: the MAIN heap is never
@@ -541,9 +591,11 @@ Two-layer O(1): L1 pushes `WHERE pkcol = <val>` into the MAIN baseline read (PK
 uniqueness bounds it to ≤1 row, keeping the index scan); L2 uses an O(1) exact
 delta lookup instead of the O(M) full load. The predicate is decompiled over the
 whole `OpExpr(Var(pk), Const)` so the `Const`'s type drives its literal; any
-ERROR / NULL / oversize deparse disables the fast path. L1 only filters —
-`scan.plan.qual` re-checks every row, so a mis-pushed predicate can pull extra
-MAIN rows but never a wrong result.
+ERROR / NULL / oversize deparse disables the fast path. The literal is serialized
+through the same canonical identity text the write path stores (§1.5), so a
+differently-spelled but `=`-equal key (e.g. `1.00` vs `1.0`, or the same instant
+under two `TimeZone`s) still finds the delta row. L1 only filters — `scan.plan.qual` re-checks every row, so a
+mis-pushed predicate can pull extra MAIN rows but never a wrong result.
 
 ### 2.4 Predicate pushdown for `IN` / range / `OR`
 
