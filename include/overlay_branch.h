@@ -15,6 +15,7 @@
 #include "executor/tuptable.h"
 #include "nodes/pg_list.h"
 #include "utils/relcache.h"
+#include "storage/block.h"
 #include "storage/lmgr.h"
 #include "storage/lockdefs.h"
 #include "storage/lock.h"
@@ -600,6 +601,26 @@ extern AttrNumber       rel_attno_to_slot_idx(TupleDesc slotdesc, AttrNumber rel
 extern char            *slot_get_ctid_cstr(TupleTableSlot *slot);
 extern TupleTableSlot  *fetch_tuple_by_ctid(Relation rel, const char *ctid_cstr,
 											MemoryContext result_cxt);
+
+/* ----------
+ * ACC-1 synthetic ctid (branch_scan.c ⇄ write_redirect.c)
+ *
+ * A DML-target BranchScan stamps a pure-delta orphan — a row that lives only in
+ * the delta store, with no MAIN baseline — with a SYNTHETIC ctid so the write
+ * redirect can tell it apart from a MAIN-anchored row: the ctid block number is
+ * OB_SYNTH_CTID_BLOCK and the offset number is the 1-based index of the row's
+ * delta key in the scan's own key list.  A real ctid never carries this block
+ * (that would need a ~16 TB single relation) and slot_get_ctid_cstr() reports
+ * the synthetic value as "no physical ctid".  The offset field is a uint16,
+ * hence the hard cap on the number of pure-delta rows a single DML may target.
+ * ----------
+ */
+#define OB_SYNTH_CTID_BLOCK  ((BlockNumber) 0xFFFFFFFEu)
+#define OB_SYNTH_MAX_IDX     ((uint32) 0xFFFFu)
+
+struct PlanState;                   /* forward decl */
+extern char            *overlay_dml_target_pure_delta_key(struct PlanState *subplan,
+														  TupleTableSlot *slot);
 
 /* ----------
  * write_redirect.c entry point — thin dispatch from

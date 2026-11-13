@@ -15,6 +15,20 @@
  *       overlay_branch._debug_snapshot_ttl_seconds forces the cap to 0s, the next write
  *       is kicked out of the branch (state=expired) and the errhint names the TTL reason
  *       (snapshot_max_hold_minutes (R19 TTL)) instead of "by another session".
+ *   R-FORUPDATE row-locking guard: SELECT ... FOR UPDATE / FOR SHARE over a
+ *       branch-managed relation must ERROR 0A000 (never crash the backend on an
+ *       invalid virtual-slot ctid); the DML read side stays redirected and MAIN
+ *       is untouched.
+ *   R-SYSCOL system-column support: inside a branch only ctid (the row's MAIN
+ *       anchor) and tableoid are populated on the scan slot; xmin/xmax/cmin/cmax
+ *       must ERROR 0A000 on both the plain-SELECT and the DML-target scan (the
+ *       latter used to read 0 and delete every row).  A ctid-subquery DELETE
+ *       must reach MAIN rows through the overlay again.
+ *   §CTX branch-context truth: current_branch() and `SET overlay_branch.current`
+ *       must follow the LIVE write path, not the raw GUC string -- after a
+ *       cross-branch ROLLBACK current_branch() reports no branch (the GUC is
+ *       stale) and writes land on MAIN; after an explicit exit a plain user SET
+ *       re-enters the branch (writes land in its delta).
  * GLOBAL CLEANUP: DROP TABLE r_entry_t + DROP 2 branches; RESET client_min_messages
  */
 -- ===== 0. Prerequisite guard (same as the other regression files) =====
@@ -90,6 +104,156 @@ SELECT CASE WHEN count(*) = 2 THEN 'PASS:R05_COPY_NO_ROWS_ADDED'
 (1 row)
 
 COMMIT;
+-- Re-enter the branch for the next sub-tests in the section.
+SELECT overlay_branch.use_branch('br_r_entry');
+ use_branch 
+------------
+ 
+(1 row)
+
+-- ----- R-FU: row-locking clause guard.  A SELECT ... FOR UPDATE/SHARE over a
+-- -----      branch-managed relation used to abort the backend: the LockRows
+-- -----      node calls heap_lock_tuple() on the ctid of each row, and a
+-- -----      BranchScan row is a virtual slot with no physical MAIN ctid.
+-- -----      It must now ERROR 0A000 instead.  The DML read side (planner row
+-- -----      marks with strength LCS_NONE) is unaffected: a plain UPDATE
+-- -----      inside the branch is still redirected into the delta.
+DO $$
+DECLARE
+    cnt integer;
+BEGIN
+    BEGIN
+        PERFORM pk_id FROM public.r_entry_t FOR UPDATE;
+        RAISE EXCEPTION 'FAIL_RFU_FORUPDATE_NO_ERROR';
+    EXCEPTION WHEN OTHERS THEN
+        IF SQLSTATE <> '0A000' THEN
+            RAISE EXCEPTION 'FAIL_RFU_FORUPDATE: expected 0A000 got % %', SQLSTATE, SQLERRM;
+        END IF;
+    END;
+    BEGIN
+        PERFORM pk_id FROM public.r_entry_t FOR SHARE;
+        RAISE EXCEPTION 'FAIL_RFU_FORSHARE_NO_ERROR';
+    EXCEPTION WHEN OTHERS THEN
+        IF SQLSTATE <> '0A000' THEN
+            RAISE EXCEPTION 'FAIL_RFU_FORSHARE: expected 0A000 got % %', SQLSTATE, SQLERRM;
+        END IF;
+    END;
+    -- Read side of DML keeps working (status still active, write redirected).
+    UPDATE public.r_entry_t SET note = note || '-rfu' WHERE pk_id = 1;
+    SELECT count(*) INTO cnt FROM public.r_entry_t;   -- overlay still sees 2 rows
+    IF cnt <> 2 THEN RAISE EXCEPTION 'FAIL_RFU_OVERLAY_CNT cnt=%', cnt; END IF;
+    PERFORM overlay_branch.use_branch('br_r_entry');
+END $$;
+-- ----- R-SYSCOL: system-column support inside a branch.  A branch scan slot is
+-- -----      materialised from a virtual tuple, so it owns no storage tuple of
+-- -----      its own.  Only `ctid` (the row's MAIN anchor) and `tableoid` (the
+-- -----      relation OID) are meaningful and must be populated; the remaining
+-- -----      system columns (xmin/xmax/cmin/cmax) describe a physical tuple a
+-- -----      branch row never has and must be rejected with 0A000 -- reading
+-- -----      them either errored deep inside tts_virtual_getsysattr (plain
+-- -----      SELECT) or silently returned 0 off the heap-backed DML-target slot
+-- -----      (so `DELETE ... WHERE xmin = 0` matched every row).  Leaving ctid
+-- -----      unset also made `DELETE ... WHERE ctid IN (SELECT ctid FROM t)`
+-- -----      silently match nothing.  Every write below runs in one rolled-back
+-- -----      transaction, so the shared fixture is left untouched.
+BEGIN;
+SELECT overlay_branch.use_branch('br_r_entry');
+ use_branch 
+------------
+ 
+(1 row)
+
+-- marker delta row proves the reads below go through BranchScan, not MAIN.
+INSERT INTO public.r_entry_t VALUES (98, 980, 'syscol-marker');
+SELECT CASE WHEN count(*) = 1 THEN 'PASS:SYSCOL_BRANCH_ACTIVE'
+            ELSE 'FAIL:SYSCOL not-in-branch' END AS syscol_active
+  FROM public.r_entry_t WHERE pk_id = 98;
+       syscol_active       
+---------------------------
+ PASS:SYSCOL_BRANCH_ACTIVE
+(1 row)
+
+-- (a) ctid / tableoid are populated on a plain branch SELECT: a MAIN-origin row
+--     names the relation and its real MAIN ctid; a pure-delta row has no MAIN
+--     storage, so its ctid stays the invalid all-ones value.
+SELECT tableoid = 'public.r_entry_t'::regclass AS syscol_tableoid_ok
+  FROM public.r_entry_t WHERE pk_id = 1;
+ syscol_tableoid_ok 
+--------------------
+ t
+(1 row)
+
+SELECT ctid <> '(4294967295,0)'::tid AS syscol_ctid_ok
+  FROM public.r_entry_t WHERE pk_id = 1;
+ syscol_ctid_ok 
+----------------
+ t
+(1 row)
+
+SELECT ctid = '(4294967295,0)'::tid AS syscol_puredelta_ctid_invalid
+  FROM public.r_entry_t WHERE pk_id = 98;
+ syscol_puredelta_ctid_invalid 
+-------------------------------
+ t
+(1 row)
+
+-- (b) xmin/xmax/cmin/cmax are rejected with 0A000 on both the plain-SELECT and
+--     the DML-target scan (the latter used to read 0 and delete every row).
+DO $$
+DECLARE
+    col text;
+BEGIN
+    FOREACH col IN ARRAY ARRAY['xmin', 'xmax', 'cmin', 'cmax'] LOOP
+        BEGIN
+            EXECUTE format('SELECT %s FROM public.r_entry_t', col);
+            RAISE EXCEPTION 'FAIL_SYSCOL_SELECT_NO_ERROR col=%', col;
+        EXCEPTION WHEN OTHERS THEN
+            IF SQLSTATE <> '0A000' THEN
+                RAISE EXCEPTION 'FAIL_SYSCOL_SELECT col=% got % %', col, SQLSTATE, SQLERRM;
+            END IF;
+        END;
+    END LOOP;
+    BEGIN
+        EXECUTE 'DELETE FROM public.r_entry_t WHERE xmin = 0';
+        RAISE EXCEPTION 'FAIL_SYSCOL_DML_NO_ERROR';
+    EXCEPTION WHEN OTHERS THEN
+        IF SQLSTATE <> '0A000' THEN
+            RAISE EXCEPTION 'FAIL_SYSCOL_DML got % %', SQLSTATE, SQLERRM;
+        END IF;
+    END;
+END $$;
+SELECT CASE WHEN count(*) = 3 THEN 'PASS:SYSCOL_DML_XMIN_GATE_NO_DELETE'
+            ELSE 'FAIL:SYSCOL_DML_XMIN_GATE cnt=' || count(*) END AS syscol_dml_gate
+  FROM public.r_entry_t;   -- pk 1, 2, 98 all still there
+           syscol_dml_gate           
+-------------------------------------
+ PASS:SYSCOL_DML_XMIN_GATE_NO_DELETE
+(1 row)
+
+-- (c) a ctid-subquery DELETE now reaches MAIN rows through the overlay: the
+--     subquery (a plain SELECT) exposes each MAIN-origin row's real ctid, so
+--     `WHERE ctid IN (...)` matches and deletes them; a pure-delta row exposes
+--     no valid MAIN ctid, and the synthetic DML-target ctid never equals it, so
+--     it is left alone.
+INSERT INTO public.r_entry_t VALUES (99, 990, 'delta-only');
+DELETE FROM public.r_entry_t WHERE ctid IN (SELECT ctid FROM public.r_entry_t);
+SELECT CASE WHEN count(*) = 0 THEN 'PASS:SYSCOL_CTID_DEL_MAIN'
+            ELSE 'FAIL:SYSCOL_CTID_DEL main_left=' || count(*) END AS syscol_del_main
+  FROM public.r_entry_t WHERE pk_id IN (1, 2);
+      syscol_del_main      
+---------------------------
+ PASS:SYSCOL_CTID_DEL_MAIN
+(1 row)
+
+SELECT CASE WHEN count(*) = 2 THEN 'PASS:SYSCOL_CTID_DEL_KEEPS_DELTA'
+            ELSE 'FAIL:SYSCOL_CTID_DEL delta_left=' || count(*) END AS syscol_del_delta
+  FROM public.r_entry_t WHERE pk_id IN (98, 99);
+         syscol_del_delta         
+----------------------------------
+ PASS:SYSCOL_CTID_DEL_KEEPS_DELTA
+(1 row)
+
+ROLLBACK;
 -- Re-enter the branch for the next sub-tests in the section.
 SELECT overlay_branch.use_branch('br_r_entry');
  use_branch 
@@ -2079,4 +2243,169 @@ SELECT overlay_branch.discard_branch('br_a9_1');
 DROP TABLE public.a9_users;
 DROP TABLE public.a9_orders;
 DROP TABLE public.a9_products;
+/* ================================================================
+ * §CTX: current_branch() and SET overlay_branch.current must track the
+ *       LIVE branch context (the write path), not the raw GUC string.
+ *
+ *   Two latent bugs pinned here:
+ *     (1) current_branch() used to read `overlay_branch.current` FIRST.
+ *         After a cross-branch ROLLBACK the GUC is restored to its
+ *         pre-transaction branch name, but the abort path cannot
+ *         re-enter a branch (no transaction state), so the internal
+ *         context is dropped to "no branch".  current_branch() then
+ *         reported a branch the session was NOT writing to.
+ *     (2) The assign hook's abort-restore guard fired on EVERY
+ *         `SET overlay_branch.current` while the context happened to be
+ *         inactive (e.g. right after an explicit use_branch(NULL) exit),
+ *         silently swallowing the SET: the GUC named a branch the
+ *         session had not entered and writes still landed on MAIN.
+ *
+ *   Fixture: r_ctx_bug_t (2 MAIN rows) + br_ctx_a / br_ctx_b, torn down so
+ *   the schema stays clean.
+ * ================================================================ */
+SELECT overlay_branch.use_branch(NULL);   -- guarantee MAIN context
+ use_branch 
+------------
+ 
+(1 row)
+
+CREATE TABLE public.r_ctx_bug_t (
+    pk_id integer PRIMARY KEY,
+    v     integer
+);
+INSERT INTO public.r_ctx_bug_t VALUES (1, 10), (2, 20);
+SELECT overlay_branch.create_branch('br_ctx_a') > 0 AS ctx_a_created;
+ ctx_a_created 
+---------------
+ t
+(1 row)
+
+SELECT overlay_branch.create_branch('br_ctx_b') > 0 AS ctx_b_created;
+ ctx_b_created 
+---------------
+ t
+(1 row)
+
+/* ---- CTX1 (bug 2): after an explicit exit, a plain user
+ *      `SET overlay_branch.current = '<branch>'` MUST enter the branch.
+ *      Evidence: br_ctx_a's delta gains exactly the inserted row, and
+ *      MAIN is untouched (a swallowed SET would leave the delta empty
+ *      and write the row to MAIN instead). ---- */
+SELECT overlay_branch.use_branch('br_ctx_a');
+ use_branch 
+------------
+ 
+(1 row)
+
+SELECT overlay_branch.use_branch(NULL);
+ use_branch 
+------------
+ 
+(1 row)
+
+SELECT coalesce(public.current_branch(), '<none>') AS ctx1_after_exit;
+ ctx1_after_exit 
+-----------------
+ <none>
+(1 row)
+
+SET overlay_branch.current = 'br_ctx_a';
+INSERT INTO public.r_ctx_bug_t VALUES (101, 1010);
+SELECT CASE WHEN count(*) = 1 THEN 'PASS:CTX1_SET_REENTERS_BRANCH'
+            ELSE 'FAIL:CTX1 delta_cnt=' || count(*) END AS ctx1
+  FROM overlay_branch.pg_branch_delta d
+  JOIN overlay_branch.pg_branch b USING (branch_id)
+ WHERE b.branch_name = 'br_ctx_a';
+             ctx1              
+-------------------------------
+ PASS:CTX1_SET_REENTERS_BRANCH
+(1 row)
+
+SELECT overlay_branch.use_branch(NULL);
+ use_branch 
+------------
+ 
+(1 row)
+
+SELECT CASE WHEN count(*) = 2 THEN 'PASS:CTX1_SET_WROTE_DELTA_NOT_MAIN'
+            ELSE 'FAIL:CTX1 MAIN_rows=' || count(*) END AS ctx1b
+  FROM public.r_ctx_bug_t;
+               ctx1b                
+------------------------------------
+ PASS:CTX1_SET_WROTE_DELTA_NOT_MAIN
+(1 row)
+
+/* ---- CTX2 (bug 1): a cross-branch ROLLBACK leaves the GUC naming the
+ *      pre-transaction branch while the session sits outside any branch
+ *      (the rollback emits a WARNING saying exactly that).  current_branch()
+ *      must report "none" (it used to echo the stale GUC), and the next
+ *      write MUST land on MAIN (br_ctx_a's delta stays at 1 row). ---- */
+SELECT overlay_branch.use_branch('br_ctx_a');
+ use_branch 
+------------
+ 
+(1 row)
+
+BEGIN;
+SELECT overlay_branch.use_branch('br_ctx_b');
+ use_branch 
+------------
+ 
+(1 row)
+
+ROLLBACK;
+WARNING:  overlay_branch: branch "br_ctx_a" was not restored after a transaction rollback
+DETAIL:  The session was on branch "br_ctx_b" inside the aborted (sub)transaction; the rollback could not re-enter a branch, so the session is now outside any branch.
+HINT:  Re-enter with SELECT overlay_branch.use_branch('br_ctx_a').
+SELECT coalesce(public.current_branch(), '<none>') AS ctx2_after_rb;
+ ctx2_after_rb 
+---------------
+ <none>
+(1 row)
+
+SELECT current_setting('overlay_branch.current') AS ctx2_guc_stale;
+ ctx2_guc_stale 
+----------------
+ br_ctx_a
+(1 row)
+
+INSERT INTO public.r_ctx_bug_t VALUES (202, 2020);
+SELECT CASE WHEN count(*) = 1 THEN 'PASS:CTX2_ROLLBACK_WROTE_MAIN_NOT_DELTA'
+            ELSE 'FAIL:CTX2 delta_cnt=' || count(*) END AS ctx2
+  FROM overlay_branch.pg_branch_delta d
+  JOIN overlay_branch.pg_branch b USING (branch_id)
+ WHERE b.branch_name = 'br_ctx_a';
+                  ctx2                   
+-----------------------------------------
+ PASS:CTX2_ROLLBACK_WROTE_MAIN_NOT_DELTA
+(1 row)
+
+SELECT CASE WHEN count(*) = 3 THEN 'PASS:CTX2_ROLLBACK_WROTE_MAIN_ROW'
+            ELSE 'FAIL:CTX2 MAIN_rows=' || count(*) END AS ctx2b
+  FROM public.r_ctx_bug_t;
+               ctx2b               
+-----------------------------------
+ PASS:CTX2_ROLLBACK_WROTE_MAIN_ROW
+(1 row)
+
+/* ---- CTX teardown ---- */
+SELECT overlay_branch.use_branch(NULL);
+ use_branch 
+------------
+ 
+(1 row)
+
+SELECT overlay_branch.discard_branch('br_ctx_a');
+ discard_branch 
+----------------
+ 
+(1 row)
+
+SELECT overlay_branch.discard_branch('br_ctx_b');
+ discard_branch 
+----------------
+ 
+(1 row)
+
+DROP TABLE public.r_ctx_bug_t;
 RESET client_min_messages;

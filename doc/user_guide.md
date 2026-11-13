@@ -178,6 +178,28 @@ SELECT use_branch('does_not_exist');
 ERROR:  branch "does_not_exist" does not exist
 ```
 
+Branch selection is **transaction-scoped**: a `use_branch()` issued inside a
+transaction is undone when that transaction rolls back (or a savepoint rolls
+back). If the session was already on another branch before `BEGIN`, the rollback
+cannot silently re-enter it, so the session lands outside any branch and emits a
+one-shot WARNING rather than keep the wrong branch.
+
+```sql
+BEGIN;
+SELECT use_branch('agent_workspace');   -- inside the branch
+ROLLBACK;                               -- branch selection undone
+SELECT current_branch();                -- (empty) — back outside any branch
+```
+
+Setting the `overlay_branch.current` GUC is an equivalent way to enter or leave a
+branch, including right after leaving one:
+
+```sql
+SELECT use_branch(NULL);                          -- leave, back in Main
+SET overlay_branch.current = 'agent_workspace';   -- re-enter the branch
+SELECT current_branch();                          -- agent_workspace
+```
+
 ### 1.3 current_branch() — Query the Current Branch
 
 ```sql
@@ -196,6 +218,10 @@ SELECT current_branch();
  agent_workspace
 (1 row)
 ```
+
+`current_branch()` reports the branch the session actually writes to. After a
+cross-branch rollback (§1.2) it returns empty even though `overlay_branch.current`
+may still name the pre-transaction branch.
 
 ### 1.4 list_branches() — List Branches
 
@@ -348,6 +374,24 @@ statement always operates on the same branch image a `SELECT` would return.
 ```sql
 -- Branch sees products id=1 as price 100; a DML reading products must agree.
 UPDATE orders SET note = products.name FROM products WHERE orders.pid = products.id;
+```
+
+The **DML target** itself may be a row that exists only in the branch (a row this
+branch inserted, so Main has no such row). Such a target is updated or deleted
+just like any other, including when it is reached through a join — the statement
+sees the same branch image a `SELECT` would return.
+
+```sql
+INSERT INTO products VALUES (5, 'Fig', 40);      -- branch-only row
+INSERT INTO price_ref(pid, new_price) VALUES (5, 42);
+
+-- Both the target (products id=5) and the read source are branch-only.
+UPDATE products SET price = price_ref.new_price
+  FROM price_ref WHERE products.id = price_ref.pid;
+-- UPDATE 1 ; products id=5 now has price 42 inside the branch
+
+DELETE FROM products USING price_ref WHERE products.id = price_ref.pid;
+-- DELETE 1 ; products id=5 is gone from the branch
 ```
 
 **Constraint checks are eager.** A branch-local write validates the target
@@ -590,6 +634,8 @@ The following scenarios are **explicitly rejected** (they do not silently pass t
 | Writing directly to `pg_branch` / `pg_branch_delta` | Rejected | Native PG view error |
 | DML on a VIEW / MATVIEW / FOREIGN TABLE | Rejected | Intercepted by the guard |
 | **COPY FROM / MERGE / Data-Modifying CTE** | Rejected | `0A000 feature_not_supported` |
+| **SELECT ... FOR UPDATE / FOR SHARE** | Rejected | `0A000 feature_not_supported` |
+| **Reading `xmin` / `xmax` / `cmin` / `cmax`** | Rejected — a branch row has no storage tuple; only `ctid` (the row's MAIN anchor) and `tableoid` are meaningful | `0A000 does not support the "xmin" system column inside a branch` |
 | **UPDATE SET pk_col = ...** (change the primary key) | Rejected | `Updating the PRIMARY KEY column ... is not supported` |
 | **UPSERT ... DO UPDATE SET pk_col = ...** (change the primary key) | Rejected | `overlay_branch does not support UPSERT ON CONFLICT DO UPDATE that modifies primary key columns` |
 | Insufficient privilege to call use/apply/discard/create | Rejected | `42501 insufficient_privilege` |
@@ -696,11 +742,14 @@ Alternative: use top-level DML with `RETURNING` directly (see §6.2).
 | UPDATE/DELETE … RETURNING | ✅ Supported |
 | PK predicates (`pk = c` / `pk IN (…)` / `pk BETWEEN …` / `pk > c` / their `AND`/`OR` combinations) | ✅ Recommended path (goes through the PK index) |
 | Non-PK predicates (arbitrary filter / Seq scan) | ✅ Supported |
+| Volatile predicates (`nextval()`, …) | ✅ Supported (evaluated once per row, matching native — no doubled side effects) |
 | TEMP table operations inside a branch | ✅ Supported (whitelisted) |
 | CREATE TABLE / ALTER / DROP / CREATE INDEX / DROP TRIGGER | ❌ 0A000 (execute back in Main) |
 | Partitioned table | ❌ Rejected |
 | FK cascade write | ❌ Rejected |
 | COPY FROM / MERGE / Data-Modifying CTE | ❌ Rejected |
+| SELECT … FOR UPDATE / FOR SHARE / FOR NO KEY UPDATE | ❌ Rejected (row locks target Main rows, which a branch never modifies) |
+| Reading `xmin` / `xmax` / `cmin` / `cmax` system columns | ❌ Rejected (a branch row owns no storage tuple; only `ctid` and `tableoid` are meaningful) |
 | UPDATE SET pk_col | ❌ Rejected (use DELETE + INSERT instead) |
 | DML on a no-PK table | ❌ Rejected by default; ✅ when `overlay_branch.keyless_tables=on` (experimental, see §6.8) |
 
@@ -712,6 +761,8 @@ Handling suggestions for RESTRICTED items:
 | COPY FROM | Rewrite as a multi-row `INSERT INTO t VALUES (...), (...)` |
 | MERGE | Split into separate INSERT ON CONFLICT / UPDATE / DELETE |
 | Data-Modifying CTE | Change to top-level DML + RETURNING |
+| SELECT … FOR UPDATE/SHARE | Run it in Main (after `use_branch(NULL)`); a branch's writes never lock Main rows |
+| Reading xmin/xmax/cmin/cmax | Read them in Main (after `use_branch(NULL)`); a branch row has no storage tuple to expose them |
 | UPDATE pk | Change to `DELETE WHERE pk=old` + `INSERT VALUES (new_pk, ...)` |
 | FK cascade write | In the application layer, explicitly write the child table before the parent table |
 

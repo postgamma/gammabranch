@@ -403,4 +403,87 @@ SELECT CASE WHEN string_agg(id || '=' || w, ',' ORDER BY id) = '1=b1,2=m2,3=b3'
 
 DROP TABLE acc1_rdst;
 DROP TABLE acc1_rsrc;
+-- ===== ACC1_PDTARGET: a pure-delta DML TARGET reached through a join =====
+-- Regression for the former backend crash.  When a join is planned as a
+-- nested loop whose OUTER side is the DML target and whose INNER side is a
+-- filtered read source, a pure-delta target row (a row this branch inserted)
+-- used to be dropped by the scan-side qual before write-redirect saw it; the
+-- old independent qual pass then re-derived it wrongly and the executor
+-- dereferenced a stale ctid -> crash.  ACC-1 now stamps the row with a
+-- synthetic ctid and processes it inline in the main redirect loop, so the
+-- target row is correctly updated / deleted.
+SET enable_hashjoin = off;
+SET enable_mergejoin = off;
+CREATE TABLE acc1_pdt (id int PRIMARY KEY, v text);
+CREATE TABLE acc1_pds (id int PRIMARY KEY, w text, flag bool);
+INSERT INTO acc1_pdt VALUES (1, 'm1'), (2, 'm2');
+INSERT INTO acc1_pds VALUES (1, 's1', true), (2, 's2', true);
+SELECT create_branch('acc1_pdt_b');
+ create_branch 
+---------------
+             5
+(1 row)
+
+SELECT use_branch('acc1_pdt_b');
+ use_branch 
+------------
+ 
+(1 row)
+
+-- Branch-only rows on BOTH the target and the read source.
+INSERT INTO acc1_pdt VALUES (10, 'pd10');
+INSERT INTO acc1_pds VALUES (10, 's10', true);
+-- join UPDATE: every target row (including the branch-only id=10) takes the
+-- matching source value.
+UPDATE acc1_pdt SET v = acc1_pds.w
+  FROM acc1_pds WHERE acc1_pdt.id = acc1_pds.id AND acc1_pds.flag;
+SELECT CASE WHEN string_agg(id || '=' || v, ',' ORDER BY id) = '1=s1,2=s2,10=s10'
+            THEN 'PASS:ACC1_PDTARGET_UPDATE'
+            ELSE 'FAIL:ACC1_PDTARGET_UPDATE:' || string_agg(id || '=' || v, ',' ORDER BY id)
+       END AS acc1_pdt_up FROM acc1_pdt;
+        acc1_pdt_up        
+---------------------------
+ PASS:ACC1_PDTARGET_UPDATE
+(1 row)
+
+-- join DELETE: the branch-only target id=10 is reached and removed.
+DELETE FROM acc1_pdt USING acc1_pds
+ WHERE acc1_pdt.id = acc1_pds.id AND acc1_pds.flag AND acc1_pds.id = 10;
+SELECT CASE WHEN string_agg(id || '=' || v, ',' ORDER BY id) = '1=s1,2=s2'
+            THEN 'PASS:ACC1_PDTARGET_DELETE'
+            ELSE 'FAIL:ACC1_PDTARGET_DELETE:' || string_agg(id || '=' || v, ',' ORDER BY id)
+       END AS acc1_pdt_del FROM acc1_pdt;
+       acc1_pdt_del        
+---------------------------
+ PASS:ACC1_PDTARGET_DELETE
+(1 row)
+
+-- apply: the branch image materialises onto MAIN (id=10 never existed in MAIN).
+SELECT use_branch(NULL);
+ use_branch 
+------------
+ 
+(1 row)
+
+SELECT apply_branch('acc1_pdt_b');
+NOTICE:  overlay_branch: APPLY BRANCH 'acc1_pdt_b' (passes D→U→I with optimistic conflict detection)
+NOTICE:  overlay_branch: APPLY BRANCH 'acc1_pdt_b' completed (state=applied, delta rows deleted)
+ apply_branch 
+--------------
+ 
+(1 row)
+
+SELECT CASE WHEN string_agg(id || '=' || v, ',' ORDER BY id) = '1=s1,2=s2'
+            THEN 'PASS:ACC1_PDTARGET_APPLY'
+            ELSE 'FAIL:ACC1_PDTARGET_APPLY:' || string_agg(id || '=' || v, ',' ORDER BY id)
+       END AS acc1_pdt_apply FROM acc1_pdt;
+      acc1_pdt_apply      
+--------------------------
+ PASS:ACC1_PDTARGET_APPLY
+(1 row)
+
+DROP TABLE acc1_pdt;
+DROP TABLE acc1_pds;
+RESET enable_hashjoin;
+RESET enable_mergejoin;
 DROP EXTENSION overlay_branch CASCADE;

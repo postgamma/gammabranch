@@ -452,7 +452,7 @@ SELECT count(*) = 0 AS d8_pk11_absent_in_main
   FROM (TABLE t_inv) x WHERE pk = 11;
 
 -- D9. current_branch after ERROR-driven kickout is empty
-SELECT current_branch() = '' AS d9_kicked_out_after_err;
+SELECT coalesce(current_branch(), '') = '' AS d9_kicked_out_after_err;
 
 /* ============================================================
  * SECTION E: THROTTLE — is_active(name) checks do NOT kick out

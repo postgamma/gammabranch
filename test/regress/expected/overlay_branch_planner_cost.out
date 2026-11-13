@@ -35,7 +35,7 @@ SELECT count(*) AS a8_main_cnt FROM a8_planner;       -- expect 200
 SELECT overlay_branch.create_branch('a8_cost_branch');
  create_branch 
 ---------------
-            20
+            22
 (1 row)
 
 SELECT overlay_branch.use_branch('a8_cost_branch');

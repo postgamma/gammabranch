@@ -276,11 +276,12 @@ FROM pd_t4 WHERE id = 99;
  PASS:P10
 (1 row)
 
--- P11: NOP guards (CTID-based writes + multi-table JOIN WR)
---   These are intentionally out-of-scope: WR hook must not
---   corrupt data by silently performing half-work; instead it must keep
---   the row untouched so the user can detect the no-op via CASE assertions
---   (matches the documented scope: only PK-equality quals supported).
+-- P11: CTID-based write guards + JOIN WR.
+--   A `WHERE ctid = ...` write refers to MAIN storage only; a pure-delta row
+--   has no MAIN ctid, so these stay a safe NOP (the user detects the no-op via
+--   CASE assertions).  A multi-table JOIN write is NOT out of scope: the
+--   executor applies the join over the overlay and the target row is reached
+--   (ACC-1 synthetic-ctid inline handling, §1.6).
 CREATE TABLE pd_t5 (id int PRIMARY KEY, v text, payload text);
 CREATE TABLE pd_t6 (id int PRIMARY KEY, ref int);
 SELECT create_branch('b11');
@@ -320,19 +321,36 @@ SELECT CASE WHEN count(*) = 1 THEN 'PASS:P11_2_DEL_CTID_NOP'
  PASS:P11_2_DEL_CTID_NOP
 (1 row)
 
--- P11.3 UPDATE ... FROM (join): decomposes only single-rel PK-equality
---       quals; join quals cannot be rewritten into a PK exact-match.  Guard
---       MUST produce a safe NOP, not a partial or mis-joined write.
-UPDATE pd_t5 SET payload = 'WRONG-join-upd'
+-- P11.3 UPDATE ... FROM (join): the DML TARGET (pd_t5.id=1) is a pure-delta
+--       row and pd_t6.ref=1 is its read-source match.  The executor evaluates
+--       the join over the overlay, and the target row is stamped with a
+--       synthetic ctid so write-redirect reaches and updates it — the write
+--       must land, not be skipped.
+UPDATE pd_t5 SET payload = 'join-upd'
   FROM pd_t6
  WHERE pd_t5.id = pd_t6.ref
    AND pd_t6.id = 101;
-SELECT CASE WHEN payload = 'base' THEN 'PASS:P11_3_UPD_JOIN_NOP'
+SELECT CASE WHEN payload = 'join-upd' THEN 'PASS:P11_3_UPD_JOIN_OK'
             ELSE 'FAIL:P11_3 payload=' || COALESCE(payload,'NULL') END AS p11_3
   FROM pd_t5 WHERE id = 1;
-          p11_3          
--------------------------
- PASS:P11_3_UPD_JOIN_NOP
+         p11_3          
+------------------------
+ PASS:P11_3_UPD_JOIN_OK
+(1 row)
+
+-- P11.3b DELETE ... USING (join): the pure-delta target row is reached through
+--        the join and deleted.
+INSERT INTO pd_t5 VALUES (2, 'orig2', 'base2');    -- pure delta row
+INSERT INTO pd_t6 VALUES (102, 2);
+DELETE FROM pd_t5
+  USING pd_t6
+ WHERE pd_t5.id = pd_t6.ref AND pd_t6.id = 102;
+SELECT CASE WHEN count(*) = 0 THEN 'PASS:P11_3B_DEL_USING_OK'
+            ELSE 'FAIL:P11_3B count=' || count(*) END AS p11_3b
+  FROM pd_t5 WHERE id = 2;
+          p11_3b          
+--------------------------
+ PASS:P11_3B_DEL_USING_OK
 (1 row)
 
 -- P11.4 RETURNING * on pure-delta UPDATE (PK-equality): pure-delta UPDATE

@@ -764,10 +764,15 @@ slot_get_ctid_cstr(TupleTableSlot *slot)
 
 			ip = *DatumGetItemPointer(d);
 			/* ACC-1: a pure-delta overlay row (no MAIN counterpart) carries an
-			 * invalid ItemPointer (block/offset 0).  Treat it as "no ctid" so
-			 * the WR ctid loop skips it — those rows are handled by the
-			 * pure-delta SPI pass — instead of emitting a bogus "(0,0)". */
+			 * invalid ItemPointer (block/offset 0) OR, when emitted by a
+			 * DML-target BranchScan, a SYNTHETIC ctid (block
+			 * OB_SYNTH_CTID_BLOCK).  Neither is a physical row location, so
+			 * report "no ctid": the write path resolves the row's delta
+			 * identity instead, and the keyless anchor path must never build
+			 * "A:..." from a synthetic block. */
 			if (!ItemPointerIsValid(&ip))
+				return NULL;
+			if (ItemPointerGetBlockNumber(&ip) == OB_SYNTH_CTID_BLOCK)
 				return NULL;
 			{
 				char	   *out = (char *) palloc(32);

@@ -785,10 +785,10 @@ SELECT count(*) = 0 AS d8_pk11_absent_in_main
 (1 row)
 
 -- D9. current_branch after ERROR-driven kickout is empty
-SELECT current_branch() = '' AS d9_kicked_out_after_err;
+SELECT coalesce(current_branch(), '') = '' AS d9_kicked_out_after_err;
  d9_kicked_out_after_err 
 -------------------------
- f
+ t
 (1 row)
 
 /* ============================================================

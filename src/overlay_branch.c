@@ -979,18 +979,66 @@ overlay_guc_assign_current_branch(const char *newval, void *extra)
 		CurrentBranchContext->branch_name[0] == '\0')
 		return;
 
-	/* LAYER-1 (PL/pgSQL abort-restore guard):
-	 *   If CurrentBranchContext EXISTS but is_active == FALSE, we are
-	 *   on a PL/pgSQL subxact-abort GUC RESTORE PATH.  Throttle /
-	 *   discard / apply have already kicked us off the branch and run
-	 *   exit_cleanup.  Check hook ran BEFORE the abort started and
+	/* LAYER-1 (transaction-end abort-restore guard):
+	 *   On a PL/pgSQL subxact-abort GUC RESTORE, or any abort/commit GUC
+	 *   replay, CurrentBranchContext may already be inactive because
+	 *   throttle / discard / apply kicked us off the branch and ran
+	 *   exit_cleanup.  The check hook ran BEFORE the abort started and
 	 *   said the name is valid (exists+active at that time), but the
 	 *   catalog state has moved on since — we MUST NOT call use_internal
 	 *   (would call SPI inside an abort unwind → PANIC).  The GUC value
 	 *   has already been written by PG; we simply skip the enter side-
-	 *   effect.  Any subsequent user action will re-SET and re-check. */
-	if (CurrentBranchContext != NULL && !CurrentBranchContext->is_active)
+	 *   effect.
+	 *
+	 *   Gated on !IsTransactionState(): with a live transaction this is a
+	 *   plain user `SET overlay_branch.current = '<branch>'`, which MUST
+	 *   enter the branch (see LAYER-1b below) — swallowing it here left the
+	 *   GUC claiming a branch the session was not actually on. */
+	if (!IsTransactionState() &&
+		CurrentBranchContext != NULL && !CurrentBranchContext->is_active)
 		return;
+
+	/* LAYER-1b (transaction-end GUC RESTORE guard): see
+	 * doc/internals.md §3.1 / §6.1.
+	 *
+	 * AtEOXact_GUC()/AtEOSubXact_GUC() restore a transaction's GUC changes
+	 * when the transaction (or subtransaction) ends, on COMMIT and ABORT
+	 * alike.  PG writes the restored value into overlay_branch_current_name
+	 * and THEN calls this hook, while the surrounding transaction state is
+	 * TRANS_COMMIT or TRANS_ABORT, so IsTransactionState() is FALSE.  Any
+	 * SPI / relation access here (the mode-preserve lookup below and
+	 * use_internal()) reaches RelationIdGetRelation(), whose
+	 * Assert(IsTransactionState()) fires and SIGABRTs the backend.  We
+	 * therefore cannot (re)enter a branch here.
+	 *
+	 * The empty-value path above is memory-only and still correct.  For a
+	 * non-empty restore: if the session already sits on exactly this branch
+	 * there is nothing to do; otherwise the context points at a different
+	 * branch (a use_branch()/SET that ran inside the ended transaction), or
+	 * has already been cleared by LAYER-1 above, so we drop to the safe "no
+	 * branch" state rather than silently keep the wrong branch — the GUC
+	 * value itself was already written by PG and cannot be undone from an
+	 * assign hook. */
+	if (!IsTransactionState())
+	{
+		if (CurrentBranchContext != NULL &&
+			CurrentBranchContext->is_active &&
+			strcmp(CurrentBranchContext->branch_name, newval) != 0)
+		{
+			ereport(WARNING,
+					(errcode(ERRCODE_WARNING),
+					 errmsg("overlay_branch: branch \"%s\" was not restored after a "
+							"transaction rollback", newval),
+					 errdetail("The session was on branch \"%s\" inside the aborted "
+							   "(sub)transaction; the rollback could not re-enter a "
+							   "branch, so the session is now outside any branch.",
+							   CurrentBranchContext->branch_name),
+					 errhint("Re-enter with SELECT overlay_branch.use_branch('%s').",
+							 newval)));
+			ob_exit_branch_cleanup(CurrentBranchContext);
+		}
+		return;
+	}
 
 	/* I8.2 mode-preserve: GUC 1-arg SET (no mode param) — reuse cached mode.
 	 * Without this, assign hook always calls use_internal() → mode='live'
@@ -1873,23 +1921,17 @@ overlay_branch_current(PG_FUNCTION_ARGS)
 	const char *name;
 	NameData   *result;
 
-	if (overlay_branch_current_name != NULL &&
-		*overlay_branch_current_name != '\0')
-	{
-		name = overlay_branch_current_name;
-	}
-	else if (CurrentBranchContext != NULL &&
-			 CurrentBranchContext->is_active &&
-			 CurrentBranchContext->branch_name[0] != '\0')
-	{
-		name = CurrentBranchContext->branch_name;
-	}
-	else
-	{
-		name = NULL;
-	}
+	/* Report the branch the session's writes actually land in — the live
+	 * branch context — NOT the raw `overlay_branch.current` GUC string.
+	 * The two can diverge: after a cross-branch ROLLBACK the GUC is
+	 * restored to its pre-transaction value while the abort path cannot
+	 * re-enter a branch (no transaction state), so the context is dropped
+	 * to "no branch".  Reading the GUC there would claim a branch the
+	 * session is not on, contradicting is_active() and the write path.
+	 * See doc/internals.md §3.2 / §6.2. */
+	name = overlay_branch_get_current_name();
 
-	if (name == NULL)
+	if (name == NULL || *name == '\0')
 		PG_RETURN_NULL();
 
 	result = (NameData *) palloc0(sizeof(NameData));

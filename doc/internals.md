@@ -66,7 +66,7 @@
 |------|------|
 | [overlay_branch.c](../src/overlay_branch.c) | `_PG_init`, GUCs, executor + utility hooks, guards, SQL dispatch, `overlay_main_plus_delta` SRF |
 | [branch_lifecycle.c](../src/branch_lifecycle.c) | create/use/apply/discard, advisory lock + CAS, snapshot/mode caches, NOTIFY, invalidation, ACL |
-| [write_redirect.c](../src/write_redirect.c) | redirect INSERT/UPDATE/DELETE, pure-delta post-processing, UPSERT promotion, RETURNING |
+| [write_redirect.c](../src/write_redirect.c) | redirect INSERT/UPDATE/DELETE, pure-delta target rows, UPSERT promotion, RETURNING |
 | [delta_store.c](../src/delta_store.c) | PK/tuple serialization, `old_version` token, delta-table SPI, typed PK compare |
 | [branch_scan.c](../src/branch_scan.c) | planner hook, CustomScan 2-pass overlay, cost model, pathlist pruning |
 
@@ -252,12 +252,20 @@ proposed tuple first) and again on the merged row for a `DO UPDATE` (mirroring
 `ExecUpdate()`), so a candidate that is invalid even though `DO UPDATE` /
 `DO NOTHING` would discard it is still rejected, exactly as in MAIN.
 
-**Pure-delta post-processing**: rows living only in the delta (op I/U) are never
-seen by the UPDATE/DELETE subplan (which scans only MAIN). A post-pass collects
-delta I/U rows, keeps the latest per key, runs the subplan's qual on each
-candidate, then writes DELETE or UPDATE for survivors. A non-empty qual is
-required: whole-table DML skips pure-delta rows to avoid deleting freshly
-inserted rows.
+**Pure-delta target rows (synthetic ctid).** A row that exists only in the delta
+(op `I`/`U`, no MAIN baseline) has no physical ctid, so the DML-target BranchScan
+stamps it with a **synthetic ctid** (block `OB_SYNTH_CTID_BLOCK`, offset = the
+1-based index of that row's delta key in the scan's recorded key list). The
+redirect loop sees `slot_get_ctid_cstr()` report "no ctid" for such a row, calls
+`overlay_dml_target_pure_delta_key()` to resolve the recorded key, reconstructs
+the pre-image from the delta payload, and processes the row **inline** in the
+same loop as a MAIN-anchored one — same SET-merge / post-image / eager-constraint
+path, then `overlay_delta_insert` with `op='U'`/`'D'` and the stored key as the
+identity. The statement's own join/qual filtering has already been applied by the
+executor before the subplan yields the row, so every row that reaches the
+redirect is one the DML actually targets: there is no separate qual pass and no
+whole-table special case. The DML target is bounded to `OB_SYNTH_MAX_IDX`
+pure-delta rows per statement.
 
 **RETURNING** captures the affected rows into slots in `es_query_cxt` and replays
 them through the plan's `DestReceiver`. Because the write path short-circuits
@@ -340,6 +348,33 @@ a session-private TEMP whitelist. At the very top of the executor intercept,
 `standard_ExecutorRun` without the redirect raises ERROR 55000 (write-through
 choke).
 
+**Row-locking clause gate.** A `SELECT ... FOR UPDATE/SHARE` over a
+branch-managed relation also raises 0A000. A locking clause makes the planner
+emit a `PlanRowMark` with strength `LCS_FORUPDATE` / `LCS_FORSHARE` /
+`LCS_FORNOKEYUPDATE`, and the `LockRows` node then calls `heap_lock_tuple()` on
+the ctid of every returned row. BranchScan emits overlay rows through a virtual
+slot that carries no physical MAIN ctid, and a pure-delta row has no MAIN heap
+row at all, so that call trips the `ItemPointerIsValid` assertion and aborts the
+backend. Refusing is also semantically right: branch writes land in the delta
+store and never touch MAIN rows, so a MAIN tuple lock is meaningless. The guard
+lives in `ob_branchscan_begin` (the point a BranchScan is initialised for the
+locked relation) and inspects `EState.es_plannedstmt->rowMarks`; it fires only
+for a real locking clause (`strength != LCS_NONE`). The `ROW_MARK_REFERENCE`
+row marks the planner adds for the **read** side of `UPDATE` / `DELETE` /
+`MERGE` carry `LCS_NONE` and pass through untouched, so in-branch DML keeps
+working.
+
+**System-column gate.** Only `ctid` (a row's MAIN storage anchor) and `tableoid`
+(the relation OID) are meaningful on a branch scan slot; the remaining system
+columns (`xmin` / `xmax` / `cmin` / `cmax`) describe a physical storage tuple
+that no branch row owns, so reading them is either a generic
+`tts_virtual_getsysattr` "cannot retrieve a system column in this context" error
+(plain SELECT) or a silent `0` off a heap-backed DML-target slot — the latter
+made `DELETE ... WHERE xmin = 0` match and delete **every** row. `ob_branchscan_begin`
+therefore walks the scan node's own targetlist and qual for a negative-attno
+`Var` of the scan relid (excluding `ctid` / `tableoid`) and raises `0A000` at
+plan-unpack time, mirroring the COPY / MERGE / FOR UPDATE gates.
+
 **ACL double-defense** — branch administration is privileged. The SQL
 layer grants DML on `pg_branch` / `pg_branch_delta` only to
 `overlay_branch_administrators` (delta is revoked from PUBLIC — R22
@@ -395,6 +430,16 @@ Latest-wins holds because the delta PK guarantees one row per key. Rows are
 emitted on demand, so `LIMIT`/cursors stop early; order is "Pass 1 in MAIN order,
 Pass 2 in delta append order". Cost O(M log M + N log M).
 
+**Emitted slot system columns.** An overlay row is synthesised (a virtual tuple
+on a plain SELECT, a heap tuple on a DML target), so it carries no storage
+identity of its own. The scan therefore sets `tts_tableOid` to the relation OID
+and `tts_tid` to the row's MAIN anchor, **after** the slot is stored (the virtual
+`clear()` resets both fields): a MAIN-origin or merged row inherits its MAIN
+`ctid`, while a pure-delta orphan (no MAIN row) keeps an invalid `ctid` so a
+`WHERE ctid = ...` predicate is a safe no-op. Leaving them unset made a plain
+`tableoid` read `0` and a `DELETE ... WHERE ctid IN (SELECT ctid FROM t)`
+silently match nothing; the other system columns are gate-rejected (§1.8).
+
 ### 2.3 P0 PK-equality fast path (`WHERE pk = const`)
 
 Two-layer O(1): L1 pushes `WHERE pkcol = <val>` into the MAIN baseline read (PK
@@ -428,6 +473,18 @@ dropping the MAIN rows the SPI pass filtered out) and any side effect
 runs in the same statement and snapshot, so both sites see the same value. The
 guard is exercised by `test/regress/sql/overlay_branch_pushdown.sql`.
 
+**The Pass-1 MAIN prefilter is volatile-gated too.** On the full-table read path
+(`has_pk_pred == false`) the scan may pre-filter MAIN rows with
+`scan.plan.qual` before merging. The same hazard applies: a volatile clause left
+in the prefilter runs once on the raw MAIN row and again by the post-merge
+`ExecQual` on the overlay row, so a side effect fires twice and the two results
+can disagree. A volatile clause therefore also disables the prefilter and is
+evaluated only by the single post-merge `ExecQual`. Note the prefilter exists
+only on the no-PK-clause path — a query carrying a PK clause takes the P0
+point-row fast path (§2.3), which never prefilters — so the two volatile paths
+(PK-clause vs full-table) are pinned separately by PD.6 and PD.7 in
+`test/regress/sql/overlay_branch_pushdown.sql`.
+
 ### 2.5 DML-target BranchScan (ACC-1) and read sources
 
 The hook injects for `CMD_SELECT` and for every RTE of a DML that is **read**.
@@ -439,8 +496,16 @@ overlay, so consecutive in-branch writes break (`SET v = v||'+1'` then
 anchor `old_version`; the emitted slot is a real heap tuple allocated in
 `es_query_cxt` (**not** the scan context, which is deleted before
 `ExecResetTupleTable`). WR's pre-image becomes "MAIN row for anchoring, overlay
-row for values"; a Pass 2 pure-delta row has an invalid ctid and takes the "no
-ctid → skip" branch, so the SELECT path is unaffected.
+row for values".
+
+A DML-target scan must also let WR act on a **pure-delta** target row (a row the
+**branch itself inserted**, so it exists only in the delta and has no MAIN ctid).
+The scan records the delta key of each Pass 2 orphan it emits and stamps that row
+with a synthetic ctid (`OB_SYNTH_CTID_BLOCK` + a 1-based key index);
+`overlay_dml_target_pure_delta_key()` resolves it back to the key so WR processes
+the row inline (§1.6). The synthetic block is chosen above any real heap block
+number, and a plain `SELECT` (non-DML-target) scan never stamps it, so the
+SELECT path is unaffected.
 
 Every other RTE of a DML is a read source — the FROM/USING side of
 `UPDATE ... FROM` / `DELETE ... USING` and the source of `INSERT ... SELECT` —
@@ -548,6 +613,41 @@ changing state. The opt-in may be set only for DML command types and
 non-catalog-only statements — pure SELECT, `DECLARE CURSOR` and utility
 statements stay observer-only, else a kickout could let the next DML write MAIN
 silently.
+
+**Transaction-end GUC restore (LAYER-1b).** The `overlay_branch.current` assign
+hook re-enters or leaves a branch as a *side effect*, so it must stay safe on
+every path PostgreSQL calls it. `AtEOXact_GUC()` / `AtEOSubXact_GUC()` replay a
+transaction's GUC changes on COMMIT **and on ABORT** — `ROLLBACK`, `ROLLBACK TO
+SAVEPOINT`, and a PL/pgSQL `EXCEPTION` block — and on the abort path
+`AbortTransaction()` / `AbortSubTransaction()` have already set the
+current-transaction state to `TRANS_ABORT`, so `IsTransactionState()` is
+**false**. Any SPI / relation access there (the mode-preserve lookup and
+`use_internal()`) reaches `RelationIdGetRelation()`, whose
+`Assert(IsTransactionState())` fires and `SIGABRT`s the backend. A
+`!IsTransactionState()` guard therefore short-circuits the hook before any SPI:
+if the live context already names `newval` there is nothing to do, otherwise the
+context points at a branch entered inside the aborted (sub)transaction and the
+hook drops to the safe no-branch state with a WARNING. The GUC value itself was
+already written by PostgreSQL and cannot be undone from an assign hook, so
+re-entering the old branch is deliberately not attempted (invariant 4).
+
+**Abort-restore guard (LAYER-1).** A PL/pgSQL `EXCEPTION` block or any
+(sub)transaction abort replays its GUC changes with the context possibly already
+inactive (throttle / discard / apply kicked the session off the branch and ran
+`exit_cleanup`). Re-entering there would run SPI inside an abort unwind, so the
+guard returns early — but **only when there is no live transaction**
+(`!IsTransactionState()`). A plain user `SET overlay_branch.current = '<branch>'`
+also runs with an inactive context (e.g. right after an explicit
+`use_branch(NULL)`), and with a live transaction it is *not* a restore: it must
+enter the branch. Gating the guard on `!IsTransactionState()` keeps the abort
+path SPI-free while letting the user SET take effect.
+
+**`current_branch()` reflects the context, not the GUC.** The SQL function
+returns the branch the writer is actually on — `overlay_branch_get_current_name()`
+over the live `BranchContext` — never the raw `overlay_branch.current` string. The
+two diverge on the ROLLBACK corner case above: the GUC is restored to the
+pre-transaction name while the context has been dropped to no-branch, and
+reporting the GUC would claim a branch the session is not writing to (§6.2).
 
 ### 3.3 Layer 2 - branch-level advisory lock
 
@@ -1075,7 +1175,8 @@ built with set-based DML so `M` stays controllable. Output goes to
 3. **The planner hook pre-check order is fixed** — B0 → B1 → R16 → B2 →
    `is_active` (§2.1).
 4. **The GUC check hook is side-effect free**; only the assign hook acts, and it
-   never raises ERROR.
+   never raises ERROR and never runs SPI / relation access when
+   `IsTransactionState()` is false (the abort-path GUC restore, §3.2).
 5. **Recursion guards are balanced under `PG_TRY`/`PG_FINALLY`**, including the
    abort path.
 6. **Cross-SPI memory lives in `TopMemoryContext`**, copied out before
@@ -1108,6 +1209,17 @@ built with set-based DML so `M` stays controllable. Output goes to
 16. **Volatile clauses are never pushed into the hidden SPI MAIN query** — only
     stable/immutable clauses, so double evaluation cannot drop rows or fire a
     side effect twice (§2.4).
+17. **Only `ctid` and `tableoid` are served on a branch scan slot**; a negative
+    `Var` for `xmin` / `xmax` / `cmin` / `cmax` raises `0A000` at plan-unpack
+    time, because no branch row owns a storage tuple (§1.8).
+18. **The emitted slot's `tts_tableOid` / `tts_tid` are set after the store** —
+    `tableoid` names the relation, `ctid` the row's MAIN anchor (invalid for a
+    pure-delta orphan), so system-column reads and a ctid-subquery DELETE work
+    (§2.2).
+19. **`current_branch()` reports the live branch context, never the raw GUC
+    string** — the two diverge after a cross-branch ROLLBACK, where the GUC keeps
+    the pre-transaction name while the context is dropped to no-branch (§3.2,
+    §6.2).
 
 ### 6.2 Corner cases
 
@@ -1130,3 +1242,18 @@ built with set-based DML so `M` stays controllable. Output goes to
   heaps, so a throttled one-shot WARNING is emitted at the lifecycle entry points
   when a publication covering the delta would break isolation, failing open under
   `PG_TRY` (§1.8).
+- **ROLLBACK after an in-transaction `use_branch`.** A `use_branch()` inside a
+  transaction that then aborts makes `AtEOXact_GUC()` / `AtEOSubXact_GUC()`
+  restore the pre-transaction GUC value, re-firing the assign hook after
+  `AbortTransaction()` has set the state to `TRANS_ABORT`. The LAYER-1b guard
+  keeps the hook SPI-free: on the same branch it is a no-op, on a changed branch
+  it warns and drops to no-branch (the GUC value itself was already restored by
+  PostgreSQL and cannot be undone) (§3.2). After such a rollback the session
+  sits outside any branch even though `overlay_branch.current` still names the
+  pre-transaction branch: `current_branch()` reports no branch and writes go to
+  MAIN (invariant 19).
+- **`SET overlay_branch.current` after an explicit exit.** Right after
+  `use_branch(NULL)` the context is inactive but the session still has a live
+  transaction, so a plain `SET overlay_branch.current = '<branch>'` re-enters the
+  branch — the LAYER-1 abort-restore guard is gated on `!IsTransactionState()`
+  and must not swallow it (§3.2).

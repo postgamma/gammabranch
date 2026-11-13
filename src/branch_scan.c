@@ -156,6 +156,11 @@ typedef struct OverlayScanState
     /* ---- Pass 2: pure-delta orphans (no MAIN counterpart) ---- */
     bool            pass2_started;
     ListCell       *pass2_cur;
+    /* ACC-1: key of the delta row handed back by the CURRENT next() call when
+     * that row is a pure-delta orphan (Pass 2), else NULL.  A DML-target
+     * BranchScan stamps it as a synthetic ctid so write-redirect can resolve
+     * the delta identity of an emitted row (doc/internals.md §2.5). */
+    const char     *last_pure_delta_key;
 
     /* ---- B2: keyless anchor re-anchoring (doc/internals.md §4.5) ----
      * A concurrent UPDATE moves an anchored MAIN row to a new ctid, leaving
@@ -175,6 +180,7 @@ static OverlayScanState *overlay_scan_open(Relation rel, int32 branch_id,
                                            const char *general_where_sql,
                                            ExprState *qual,
                                            ExprContext *qual_econtext,
+                                           bool qual_is_volatile,
                                            bool dml_target,
                                            MemoryContext result_cxt);
 static TupleTableSlot *overlay_scan_next(OverlayScanState *st);
@@ -288,7 +294,18 @@ typedef struct ExtendedCustomScanState
      * ctid system column (row identity) is retrievable (see doc/internals.md
      * §2.5).  Set in CreateCustomScanState from the plan, not in Begin. */
     bool          dml_target;
+    /* ACC-1: delta keys of the pure-delta orphans this scan has emitted, in
+     * emission order, kept only for a DML target.  Index N-1 is handed to
+     * write-redirect through the synthetic ctid "(OB_SYNTH_CTID_BLOCK,N)" so
+     * it can resolve the delta identity of an inline-processed pure-delta row
+     * (doc/internals.md §2.5).  Palloc'd in es_query_cxt; never freed here. */
+    List         *dml_synth_keys;
 } ExtendedCustomScanState;
+
+/* ACC-1: OB_SYNTH_CTID_BLOCK / OB_SYNTH_MAX_IDX (the synthetic ctid stamped on
+ * a pure-delta orphan emitted by a DML-target BranchScan) live in
+ * overlay_branch.h: write_redirect.c shares them through
+ * overlay_dml_target_pure_delta_key(). */
 
 /* css MUST be a valid CustomScanState* whose embedding is ExtendedCustomScanState.
  * Since css is field offset 0 we could simply cast, but explicit arithmetic
@@ -522,6 +539,7 @@ overlay_scan_open(Relation rel, int32 branch_id,
                   const char *general_where_sql,
                   ExprState *qual,
                   ExprContext *qual_econtext,
+                  bool qual_is_volatile,
                   bool dml_target,
                   MemoryContext result_cxt)
 {
@@ -580,9 +598,18 @@ overlay_scan_open(Relation rel, int32 branch_id,
      * Pass 2 orphan -- and an orphan has no MAIN ctid, so the write path would
      * skip it.  Disabling the prefilter keeps every MAIN row paired with its
      * own ctid; the post-merge qual (which sees the overlay values) then makes
-     * the correct keep/kill call. */
+     * the correct keep/kill call.
+     *
+     * A volatile clause must NOT be prefiltered either: it would be evaluated
+     * once here on the raw MAIN row and once more by the post-merge qual on
+     * the overlay row, so any side effect (nextval(), ...) would fire twice
+     * and the two evaluations could disagree (silently dropping a row whose
+     * branch edit would have satisfied the predicate).  Leaving such clauses
+     * to the single post-merge ExecQual matches native single-evaluation
+     * semantics. */
     st->do_prefilter   = (qual != NULL && qual_econtext != NULL &&
-                          st->rel_has_pk && !dml_target);
+                          st->rel_has_pk && !dml_target &&
+                          !qual_is_volatile);
 
     /* RD-3: one shared tupdesc for every emitted slot.  CreateTupleDescCopy()
      * is NOT reference-counted (tdrefcount == -1), so MakeSingleTupleTableSlot
@@ -884,6 +911,10 @@ overlay_scan_next(OverlayScanState *st)
     if (st == NULL)
         return NULL;
 
+    /* Default: the row produced by this call is MAIN-anchored (has a real
+     * ctid).  Pass 2 overrides this before handing back a pure-delta orphan. */
+    st->last_pure_delta_key = NULL;
+
     /* Reclaim the scratch of the row handed back by the previous call (its
      * consumer already copied what it needed) and build the next row there,
      * so the footprint stays constant over an arbitrarily long scan. */
@@ -1141,6 +1172,9 @@ overlay_scan_next(OverlayScanState *st)
             new_slot = reconstruct_slot_from_delta(st->rel, dt->tuple_data,
                                                    st->row_cxt);
             dt->emitted = true;
+            /* ACC-1: remember the delta identity of this orphan so a DML-target
+             * BranchScan can stamp it as the emitted row's synthetic ctid. */
+            st->last_pure_delta_key = dt->key;
             MemoryContextSwitchTo(oldcxt);
             return new_slot;
         }
@@ -2222,7 +2256,98 @@ ob_branchscan_create_custom_scan_state(CustomScan *cscan)
      * ExtendedCustomScanState private fields. */
     ebs->css.custom_ps = NIL;
     ebs->dml_target = (dml_target != 0);
+    ebs->dml_synth_keys = NIL;
     return (Node *) ebs;
+}
+
+/* ================================================================
+ * ACC-1: synthetic ctid for pure-delta DML-target rows
+ *
+ * ob_make_synth_ctid() writes the (block = OB_SYNTH_CTID_BLOCK,
+ * offset = 1-based key index) identity into a caller-supplied ItemPointer.
+ *
+ * ob_find_dml_target_state() locates the DML-target BranchScan state in a
+ * PlanState subtree.  overlay_dml_target_pure_delta_key() is the accessor
+ * write_redirect.c calls: it returns a palloc'd copy of the delta key of the
+ * pure-delta row the slot carries, or NULL when the slot is MAIN-anchored (or
+ * did not come from a DML-target BranchScan).
+ * ================================================================ */
+static void
+ob_make_synth_ctid(uint32 idx, ItemPointer ip)
+{
+    ItemPointerSet(ip, OB_SYNTH_CTID_BLOCK, (OffsetNumber) idx);
+}
+
+static ExtendedCustomScanState *
+ob_find_dml_target_state(PlanState *ps)
+{
+    ExtendedCustomScanState *ebs;
+
+    if (ps == NULL)
+        return NULL;
+
+    if (ps->plan != NULL && IsA(ps->plan, CustomScan))
+    {
+        CustomScan *cs = (CustomScan *) ps->plan;
+
+        if (cs->methods == &ob_branchscan_scan_methods)
+        {
+            ebs = CSS2BS((CustomScanState *) ps);
+            if (ebs->dml_target)
+                return ebs;
+        }
+    }
+
+    ebs = ob_find_dml_target_state(outerPlanState(ps));
+    if (ebs != NULL)
+        return ebs;
+    return ob_find_dml_target_state(innerPlanState(ps));
+}
+
+char *
+overlay_dml_target_pure_delta_key(struct PlanState *subplan, TupleTableSlot *slot)
+{
+    TupleDesc   td;
+    int         natts;
+    int         j;
+
+    if (subplan == NULL || slot == NULL)
+        return NULL;
+
+    /* Cheap early-out first: only a slot whose ctid column carries the
+     * synthetic block needs the plan-tree walk (pure-delta rows are rare). */
+    td = slot->tts_tupleDescriptor;
+    natts = td->natts;
+    for (j = 0; j < natts; j++)
+    {
+        Form_pg_attribute satt = TupleDescAttr(td, j);
+        bool        isnull;
+        Datum       d;
+        ItemPointerData ip;
+        uint32      idx;
+        ExtendedCustomScanState *ebs;
+
+        if (satt->attisdropped)
+            continue;
+        if (strcmp(NameStr(satt->attname), "ctid") != 0)
+            continue;
+
+        d = slot_getattr(slot, (AttrNumber) (j + 1), &isnull);
+        if (isnull)
+            return NULL;
+        ip = *DatumGetItemPointer(d);
+        if (ItemPointerGetBlockNumber(&ip) != OB_SYNTH_CTID_BLOCK)
+            return NULL;
+
+        ebs = ob_find_dml_target_state(subplan);
+        if (ebs == NULL)
+            return NULL;
+        idx = (uint32) ItemPointerGetOffsetNumber(&ip);
+        if (idx == 0 || idx > (uint32) list_length(ebs->dml_synth_keys))
+            return NULL;
+        return pstrdup((char *) list_nth(ebs->dml_synth_keys, (int) (idx - 1)));
+    }
+    return NULL;
 }
 
 /* ================================================================
@@ -2280,7 +2405,7 @@ ob_overlay_srf_open(Oid relid, int32 branch_id, MemoryContext result_cxt)
     h->rel = table_open(relid, AccessShareLock);
     h->st  = overlay_scan_open(h->rel, branch_id,
                                false, NULL, NULL, false, NULL,
-                               NULL, NULL, false, result_cxt);
+                               NULL, NULL, false, false, result_cxt);
 
     h->cb.func = ob_srf_scan_reset_cb;
     h->cb.arg  = h;
@@ -2312,6 +2437,50 @@ ob_overlay_srf_close(void *handle)
     ob_srf_scan_release((ObSrfScanHandle *) handle);
 }
 
+/* ----------------------------------------------------------------
+ * ob_expr_refs_unsupported_syscol
+ *   Walk an expression for a system-column Var of relation `scanrelid`
+ *   that BranchScan cannot serve.  BranchScan surfaces a branch row's
+ *   MAIN anchor as `ctid` and the relation OID as `tableoid`; the
+ *   remaining system columns (xmin/xmax/cmin/cmax) describe a physical
+ *   storage tuple that a branch row -- MAIN-origin or pure-delta --
+ *   does not carry, so reading them would be silently wrong (a
+ *   heap-backed DML-target slot returns 0 from heap_getsysattr) or trip
+ *   tts_virtual_getsysattr's "cannot retrieve a system column" error.
+ *   Reject them at plan-unpack time with 0A000, mirroring the COPY /
+ *   MERGE / FOR UPDATE gates.
+ * ---------------------------------------------------------------- */
+typedef struct ObSyscolScanCtx
+{
+    Index       scanrelid;
+    AttrNumber  found_attnum;   /* 0 = none, else the offending attnum */
+} ObSyscolScanCtx;
+
+static bool
+ob_expr_refs_unsupported_syscol(Node *node, void *context)
+{
+    ObSyscolScanCtx *ctx = (ObSyscolScanCtx *) context;
+
+    if (node == NULL)
+        return false;
+
+    if (IsA(node, Var))
+    {
+        Var *var = (Var *) node;
+
+        if (var->varlevelsup == 0 && var->varno == ctx->scanrelid &&
+            var->varattno < 0 &&
+            var->varattno != SelfItemPointerAttributeNumber &&
+            var->varattno != TableOidAttributeNumber)
+        {
+            ctx->found_attnum = var->varattno;
+            return true;
+        }
+    }
+
+    return expression_tree_walker(node, ob_expr_refs_unsupported_syscol, context);
+}
+
 static void
 ob_branchscan_begin(CustomScanState *node, EState *estate, int eflags)
 {
@@ -2338,6 +2507,71 @@ ob_branchscan_begin(CustomScanState *node, EState *estate, int eflags)
         rte = rt_fetch(rti, estate->es_range_table);
         relid = rte->relid;
     }
+
+    /* --- Row-locking clause guard ---
+     *
+     * A `SELECT ... FOR UPDATE/SHARE` over a relation this branch overlays
+     * would make the LockRows node call heap_lock_tuple() on the ctid of each
+     * returned row.  We emit overlay rows through a virtual slot that carries
+     * no physical MAIN ctid, and a pure-delta row has no MAIN heap row at all,
+     * so that lock trips the ItemPointerIsValid assertion and aborts the
+     * backend.  A MAIN tuple lock is also meaningless inside a branch: branch
+     * writes land in the delta store and never touch MAIN rows.  Refuse with
+     * 0A000 at the exact point a BranchScan is initialised for a locked
+     * relation, mirroring the COPY / MERGE / data-modifying-CTE gates.  Only a
+     * real locking clause (strength != LCS_NONE) is refused; the
+     * ROW_MARK_REFERENCE entries the planner adds for the read side of
+     * UPDATE/DELETE/MERGE carry LCS_NONE and pass through untouched. */
+    if (estate->es_plannedstmt != NULL)
+    {
+        Index       lock_rti = cscan->scan.scanrelid;
+        ListCell   *rmc;
+
+        foreach(rmc, estate->es_plannedstmt->rowMarks)
+        {
+            PlanRowMark *prm = (PlanRowMark *) lfirst(rmc);
+
+            if (prm->rti == lock_rti && prm->strength != LCS_NONE)
+                ereport(ERROR,
+                        (errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+                         errmsg("overlay_branch does not support SELECT ... FOR UPDATE/SHARE inside a branch"),
+                         errhint("Row locking is only meaningful in Main; run the statement after use_branch(NULL), or drop the FOR UPDATE / FOR SHARE clause.")));
+        }
+    }
+
+    /* --- System-column guard ---
+     *
+     * Only `ctid` (the row's MAIN anchor) and `tableoid` (the relation OID)
+     * are served on a branch scan slot; the remaining system columns
+     * (xmin/xmax/cmin/cmax) describe a physical storage tuple, which a branch
+     * row never has.  Left ungated they either raise tts_virtual_getsysattr's
+     * generic "cannot retrieve a system column in this context" (plain SELECT)
+     * or silently return 0 (a heap-backed DML-target slot).  Reject them up
+     * front with an explicit 0A000 so a wrong answer never escapes.  The scan
+     * node produces these Vars, so they are always reachable in its own
+     * targetlist or qual (any upper node reads them through this scan). */
+    {
+        ObSyscolScanCtx sysctx;
+        const char *colname;
+
+        sysctx.scanrelid = cscan->scan.scanrelid;
+        sysctx.found_attnum = 0;
+
+        if (ob_expr_refs_unsupported_syscol((Node *) cscan->scan.plan.targetlist, &sysctx) ||
+            ob_expr_refs_unsupported_syscol((Node *) cscan->scan.plan.qual, &sysctx))
+        {
+            colname = (sysctx.found_attnum == MinTransactionIdAttributeNumber) ? "xmin" :
+                      (sysctx.found_attnum == MaxTransactionIdAttributeNumber) ? "xmax" :
+                      (sysctx.found_attnum == MinCommandIdAttributeNumber) ? "cmin" : "cmax";
+            ereport(ERROR,
+                    (errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+                     errmsg("overlay_branch does not support the \"%s\" system column inside a branch",
+                            colname),
+                     errhint("A branch row has no storage tuple of its own, so only ctid and tableoid are meaningful; read %s in Main instead.",
+                             colname)));
+        }
+    }
+
     /* P0 PK=Const fast-path unpacking (see doc/internals.md §2.6).
      * Protocol: cpriv[1]=Integer pkflag; cpriv[2]=String pk_where_sql;
      *       cpriv[3]=String pk_serialized_key.
@@ -2514,6 +2748,8 @@ ob_branchscan_exec(CustomScanState *node)
                                       ebs->general_where_sql,
                                       node->ss.ps.qual,
                                       node->ss.ps.ps_ExprContext,
+                                      contain_volatile_functions(
+                                          (Node *) node->ss.ps.plan->qual),
                                       ebs->dml_target,
                                       ebs->scan_cxt);
 
@@ -2559,10 +2795,31 @@ next_tuple:
         oldcxt = MemoryContextSwitchTo(node->ss.ps.state->es_query_cxt);
         htup = heap_form_tuple(dst->tts_tupleDescriptor,
                                src->tts_values, src->tts_isnull);
-        MemoryContextSwitchTo(oldcxt);
-        if (ItemPointerIsValid(&src->tts_tid))
+        if (ebs->scan->last_pure_delta_key != NULL)
+        {
+            /* ACC-1: pure-delta orphan -- no physical ctid.  Record its delta
+             * key and stamp a synthetic ctid encoding the 1-based index of
+             * that key, so write-redirect can resolve the row's delta identity
+             * and process it inline instead of skipping it
+             * (doc/internals.md §2.5). */
+            uint32      idx = (uint32) list_length(ebs->dml_synth_keys) + 1u;
+
+            if (idx > OB_SYNTH_MAX_IDX)
+                ereport(ERROR,
+                        (errcode(ERRCODE_PROGRAM_LIMIT_EXCEEDED),
+                         errmsg("overlay_branch: too many pure-delta rows for a single DML statement"),
+                         errdetail("A DML cannot target more than %u pure-delta rows in one statement.",
+                                   OB_SYNTH_MAX_IDX)));
+            ebs->dml_synth_keys = lappend(ebs->dml_synth_keys,
+                                          pstrdup(ebs->scan->last_pure_delta_key));
+            ob_make_synth_ctid(idx, &htup->t_self);
+        }
+        else if (ItemPointerIsValid(&src->tts_tid))
             htup->t_self = src->tts_tid;
+        MemoryContextSwitchTo(oldcxt);
         ExecStoreHeapTuple(htup, dst, true);
+        /* tableoid must name the relation (the ctid is carried in t_self). */
+        dst->tts_tableOid = RelationGetRelid(ebs->rel);
         /* De-form the heap tuple into tts_values/tts_isnull.  The scan-level
          * qual below (and any projection column Var) was compiled against a
          * VIRTUAL scan slot, so ExecComputeSlotInfo() elided the
@@ -2617,6 +2874,20 @@ next_tuple:
         MemoryContextSwitchTo(oldcxt);
         ExecStoreVirtualTuple(dst);
         dst->tts_nvalid = natts;
+
+        /* Surface the row's physical identity on the virtual scan slot so a
+         * plain system-column read is not silently wrong: `tableoid` must name
+         * the relation, and `ctid` must name the row's MAIN storage.  A branch
+         * row has no storage of its own, so ctid resolves to its MAIN anchor
+         * (src->tts_tid, set for a MAIN-origin or merged row); a pure-delta
+         * orphan has no MAIN row and keeps an invalid ctid, which makes a
+         * `WHERE ctid = ...` predicate a safe no-op (doc/internals.md §2.5).
+         * Without this, slot_getsysattr read tts_tableOid=0 and an invalid
+         * tts_tid -- e.g. `DELETE ... WHERE ctid IN (SELECT ctid FROM t)`
+         * silently matched nothing.  Set AFTER ExecStoreVirtualTuple: the
+         * virtual clear() resets both fields. */
+        dst->tts_tableOid = RelationGetRelid(ebs->rel);
+        dst->tts_tid = src->tts_tid;
     }
 
     econtext->ecxt_scantuple = dst;
@@ -2720,6 +2991,12 @@ ob_branchscan_rescan(CustomScanState *node)
         overlay_scan_close(ebs->scan);
         ebs->scan = NULL;
     }
+    /* ACC-1: drop the per-scan synthetic-ctid key log.  The rebuilt iterator
+     * restarts Pass 2 at index 1, so a stale log would keep growing across
+     * rescans (nested-loop DML) and eventually spuriously trip the
+     * OB_SYNTH_MAX_IDX guard.  The key strings themselves live in es_query_cxt
+     * and are reclaimed when the query ends. */
+    ebs->dml_synth_keys = NIL;
     MemoryContextReset(ebs->scan_cxt);
 }
 

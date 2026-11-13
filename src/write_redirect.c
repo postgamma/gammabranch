@@ -243,45 +243,6 @@ ob_slot_col_text(Relation rel, TupleTableSlot *slot, AttrNumber attno,
 }
 
 /* ----------------------------------------------------------------
- * ob_expr_has_ctid_var
- *
- *   True if the expression tree references the ctid system column
- *   (SelfItemPointerAttributeNumber) of any relation.
- *
- *   Used to keep the pure-delta write pass from evaluating a
- *   ctid-based DML predicate against reconstructed overlay rows.
- *   A pure-delta row has no physical ctid: its slot carries the
- *   invalid ItemPointer, and PG's slot_getsysattr() returns
- *   &slot->tts_tid for ctid unconditionally.  Evaluating e.g.
- *   `ctid = (SELECT ctid FROM t WHERE pk = 1)` would therefore
- *   match EVERY pure-delta row at once (data loss), and never a
- *   meaningful one.  ctid-addressed DML on pure-delta rows stays a
- *   documented no-op, symmetric with the ctid write path which
- *   skips them via slot_get_ctid_cstr() == NULL.
- * ----------------------------------------------------------------
- */
-static bool
-ob_ctid_var_walker(Node *node, void *context)
-{
-	if (node == NULL)
-		return false;
-	if (IsA(node, Var))
-	{
-		Var		   *var = (Var *) node;
-
-		if (var->varattno == SelfItemPointerAttributeNumber)
-			return true;
-	}
-	return expression_tree_walker(node, ob_ctid_var_walker, context);
-}
-
-static bool
-ob_expr_has_ctid_var(Node *node)
-{
-	return node != NULL && ob_ctid_var_walker(node, NULL);
-}
-
-/* ----------------------------------------------------------------
  * mt_state_result_rel: small helper that extracts the i-th
  * ResultRelInfo from a ModifyTableState.
  * ----------------------------------------------------------------
@@ -1102,8 +1063,15 @@ overlay_executor_run_intercept(QueryDesc *queryDesc,
 				 * would otherwise fail under -Wdeclaration-after-statement).
 				 * ============================================================= */
 				Bitmapset  *pk_attnums_set = NULL;
+				/* ACC-1: branch id + target relid, resolved once for the
+				 * redirect loop (both the MAIN-anchored and the pure-delta
+				 * branches key their delta lookups / inserts on them). */
+				int32		bid;
+				Oid			relid;
 
 				subplan = outerPlanState(mt);
+				bid = overlay_branch_get_current_id();
+				relid = RelationGetRelid(rel);
 
 				if (cmd == CMD_UPDATE)
 				{
@@ -1134,10 +1102,11 @@ overlay_executor_run_intercept(QueryDesc *queryDesc,
 					char	   *pk;
 					char	   *tdata;
 					char	   *oldver;
-					TupleTableSlot *main_row;
+					TupleTableSlot *main_row = NULL;
 					TupleTableSlot *overlay_slot;
 					TupleTableSlot *old_clean_slot;
-					char	   *ctid_cstr;
+					char	   *ctid_cstr = NULL;
+					char	   *pure_delta_key = NULL;
 					bool		delta_deleted;
 
 					CHECK_FOR_INTERRUPTS();
@@ -1152,97 +1121,153 @@ overlay_executor_run_intercept(QueryDesc *queryDesc,
 					if (ctid_cstr == NULL)
 					{
 						/* ACC-1: a row that lives only in the delta store (a
-						 * pure-delta INSERT) has no MAIN ctid; the DML-target
-						 * BranchScan leaves its t_self invalid.  Those rows are
-						 * NOT handled here -- the pure-delta ExecQual pass below
-						 * replays them.  The ctid loop and that pass are
-						 * disjoint by ctid presence (doc/internals.md §2.5), so
-						 * skipping here never drops a row. */
-						elog(DEBUG2,
-							 "overlay WR: skipping pure-delta row (no MAIN ctid); pure-delta pass handles it");
-						ExecClearTuple(junk_slot);
-						continue;
+						 * pure-delta INSERT) has no MAIN ctid.  A DML-target
+						 * BranchScan stamps such a row with a SYNTHETIC ctid
+						 * and records its delta key, so resolve the key here and
+						 * process the row INLINE (below), exactly like a
+						 * MAIN-anchored one: the executor has already applied
+						 * the statement's join/qual filtering to this subplan
+						 * output, so every row that reaches us is one the DML
+						 * actually targets (doc/internals.md §2.5). */
+						pure_delta_key = overlay_dml_target_pure_delta_key(subplan,
+																		   junk_slot);
+						if (pure_delta_key == NULL)
+						{
+							/* Invalid ctid and not a synthetic one: nothing to
+							 * redirect (defensive; a DML-target scan never
+							 * emits such a row). */
+							ExecClearTuple(junk_slot);
+							continue;
+						}
 					}
 
-					/* ACC-1: fetch the MAIN row.  It anchors both the row
-					 * identity (ctid) and the optimistic base-version token,
-					 * and is the overlay pre-image fallback when this branch
-					 * has no delta row for the key yet. */
-					main_row = fetch_tuple_by_ctid(rel, ctid_cstr,
-												   queryDesc->estate->es_query_cxt);
-					pfree(ctid_cstr);
-
-					/* ACC-1 pre-image = the OVERLAY row (MAIN (+) delta).  When
-					 * this branch already holds a delta row for the identity,
-					 * its serialized tuple_data IS the full post-image; using it
-					 * (instead of the bare MAIN row) is what makes a second
-					 * UPDATE in the same branch compound correctly:
-					 * value-dependent SET expressions (G1) and non-SET columns
-					 * (G3) then see earlier branch edits, and the DML subplan
-					 * evaluated WHERE/SET against the overlay row too (G2). */
-					overlay_slot = main_row;
-					delta_deleted = false;
+					if (ctid_cstr != NULL)
 					{
+						/* ---- MAIN-anchored row: fetch the MAIN heap row and
+						 * build the OVERLAY pre-image (MAIN (+) delta).  The
+						 * MAIN row anchors both the row identity (ctid) and the
+						 * optimistic base-version token, and is the pre-image
+						 * fallback when this branch has no delta row for the
+						 * key yet. ---- */
+						main_row = fetch_tuple_by_ctid(rel, ctid_cstr,
+													   queryDesc->estate->es_query_cxt);
+						pfree(ctid_cstr);
+						ctid_cstr = NULL;
+
+						/* ACC-1 pre-image = the OVERLAY row (MAIN (+) delta).
+						 * When this branch already holds a delta row for the
+						 * identity, its serialized tuple_data IS the full
+						 * post-image; using it (instead of the bare MAIN row)
+						 * is what makes a second UPDATE in the same branch
+						 * compound correctly: value-dependent SET expressions
+						 * (G1) and non-SET columns (G3) then see earlier branch
+						 * edits, and the DML subplan evaluated WHERE/SET against
+						 * the overlay row too (G2). */
+						overlay_slot = main_row;
+						delta_deleted = false;
+						{
+							DeltaTuple	dtu;
+							char	   *idkey;
+							bool		have_delta;
+
+							memset(&dtu, 0, sizeof(dtu));
+							idkey = overlay_serialize_identity(rel, main_row, op);
+							have_delta = (idkey != NULL &&
+										  overlay_delta_lookup(bid, relid,
+															   idkey, &dtu));
+							if (have_delta && dtu.op == DELTA_OP_DELETE)
+							{
+								/* BranchScan would not emit a row this branch has
+								 * already deleted; guard defensively. */
+								delta_deleted = true;
+							}
+							else if (have_delta &&
+									 (dtu.op == DELTA_OP_INSERT ||
+									  dtu.op == DELTA_OP_UPDATE) &&
+									 dtu.tuple_data != NULL)
+							{
+								TupleTableSlot *ov;
+
+								ov = reconstruct_slot_from_delta(rel, dtu.tuple_data,
+																 queryDesc->estate->es_query_cxt);
+								if (ov != NULL)
+								{
+									/* Keep the MAIN anchor ctid: the overlay row
+									 * has no physical ctid of its own. */
+									ov->tts_tid = main_row->tts_tid;
+									overlay_slot = ov;
+								}
+							}
+							if (idkey != NULL)
+								pfree(idkey);
+							/* overlay_delta_lookup() deep-copies key/old_version/
+							 * tuple_data into TopMemoryContext so they outlive its
+							 * SPI_finish(); release them now to stay allocation
+							 * neutral (MF-1). */
+							if (dtu.key != NULL)
+								pfree(dtu.key);
+							if (dtu.old_version != NULL)
+								pfree(dtu.old_version);
+							if (dtu.tuple_data != NULL)
+								pfree(dtu.tuple_data);
+						}
+
+						if (delta_deleted)
+						{
+							ExecDropSingleTupleTableSlot(main_row);
+							ExecClearTuple(junk_slot);
+							continue;
+						}
+
+						/* old_clean_slot = the pre-image the SET-merge mutates
+						 * and the serializer / token read.  It aliases main_row
+						 * unless a reconstructed overlay slot replaced it; both
+						 * are released at the end of the iteration. */
+						old_clean_slot = overlay_slot;
+						oldver = overlay_tuple_version(rel, main_row);
+					}
+					else
+					{
+						/* ---- pure-delta row: no MAIN baseline.  Reconstruct
+						 * the pre-image from the delta payload and reuse the
+						 * row's stored delta key as its identity. ---- */
 						DeltaTuple	dtu;
-						char	   *idkey;
 						bool		have_delta;
 
 						memset(&dtu, 0, sizeof(dtu));
-						idkey = overlay_serialize_identity(rel, main_row, op);
-						have_delta = (idkey != NULL &&
-									  overlay_delta_lookup(overlay_branch_get_current_id(),
-														   RelationGetRelid(rel),
-														   idkey, &dtu));
-						if (have_delta && dtu.op == DELTA_OP_DELETE)
+						have_delta = overlay_delta_lookup(bid, relid,
+														  pure_delta_key, &dtu);
+						if (!have_delta || dtu.op == DELTA_OP_DELETE ||
+							dtu.tuple_data == NULL)
 						{
-							/* BranchScan would not emit a row this branch has
-							 * already deleted; guard defensively. */
-							delta_deleted = true;
+							if (dtu.key != NULL)
+								pfree(dtu.key);
+							if (dtu.old_version != NULL)
+								pfree(dtu.old_version);
+							if (dtu.tuple_data != NULL)
+								pfree(dtu.tuple_data);
+							pfree(pure_delta_key);
+							ExecClearTuple(junk_slot);
+							continue;
 						}
-						else if (have_delta &&
-								 (dtu.op == DELTA_OP_INSERT ||
-								  dtu.op == DELTA_OP_UPDATE) &&
-								 dtu.tuple_data != NULL)
-						{
-							TupleTableSlot *ov;
-
-							ov = reconstruct_slot_from_delta(rel, dtu.tuple_data,
-															 queryDesc->estate->es_query_cxt);
-							if (ov != NULL)
-							{
-								/* Keep the MAIN anchor ctid: the overlay row has
-								 * no physical ctid of its own. */
-								ov->tts_tid = main_row->tts_tid;
-								overlay_slot = ov;
-							}
-						}
-						if (idkey != NULL)
-							pfree(idkey);
-						/* overlay_delta_lookup() deep-copies key/old_version/
-						 * tuple_data into TopMemoryContext so they outlive its
-						 * SPI_finish(); release them now to stay allocation
-						 * neutral (MF-1). */
+						overlay_slot = reconstruct_slot_from_delta(rel,
+																   dtu.tuple_data,
+																   queryDesc->estate->es_query_cxt);
 						if (dtu.key != NULL)
 							pfree(dtu.key);
 						if (dtu.old_version != NULL)
 							pfree(dtu.old_version);
 						if (dtu.tuple_data != NULL)
 							pfree(dtu.tuple_data);
+						if (overlay_slot == NULL)
+						{
+							pfree(pure_delta_key);
+							ExecClearTuple(junk_slot);
+							continue;
+						}
+						old_clean_slot = overlay_slot;
+						oldver = NULL;
 					}
-
-					if (delta_deleted)
-					{
-						ExecDropSingleTupleTableSlot(main_row);
-						ExecClearTuple(junk_slot);
-						continue;
-					}
-
-					/* old_clean_slot = the pre-image the SET-merge mutates and
-					 * the serializer / token read.  It aliases main_row unless a
-					 * reconstructed overlay slot replaced it; both are released
-					 * at the end of the iteration. */
-					old_clean_slot = overlay_slot;
-					oldver = overlay_tuple_version(rel, main_row);
 
 					if (cmd == CMD_UPDATE)
 					{
@@ -1357,11 +1382,16 @@ overlay_executor_run_intercept(QueryDesc *queryDesc,
 						tdata = NULL;
 					}
 
-					pk = overlay_serialize_identity(rel, old_clean_slot, op);
+					/* A pure-delta row keeps its stored delta key as identity
+					 * (its slot has no physical ctid to re-serialize); a
+					 * MAIN-anchored row (re)serializes from the merged
+					 * post-image. */
+					if (pure_delta_key != NULL)
+						pk = pstrdup(pure_delta_key);
+					else
+						pk = overlay_serialize_identity(rel, old_clean_slot, op);
 
-					overlay_delta_insert(overlay_branch_get_current_id(),
-										RelationGetRelid(rel), pk, op,
-										oldver, tdata);
+					overlay_delta_insert(bid, relid, pk, op, oldver, tdata);
 					ndone++;
 
 					/* P1 RETURNING: project the RETURNING list.
@@ -1409,790 +1439,14 @@ overlay_executor_run_intercept(QueryDesc *queryDesc,
 					if (tdata) pfree(tdata);
 					if (oldver) pfree(oldver);
 					/* ACC-1: release the pre-image and, when a reconstructed
-					 * overlay slot replaced it, the MAIN anchor row too. */
+					 * overlay slot replaced it, the MAIN anchor row too.  A
+					 * pure-delta iteration has no main_row. */
 					ExecDropSingleTupleTableSlot(old_clean_slot);
-					if (old_clean_slot != main_row)
+					if (main_row != NULL && old_clean_slot != main_row)
 						ExecDropSingleTupleTableSlot(main_row);
+					if (pure_delta_key != NULL)
+						pfree(pure_delta_key);
 					ExecClearTuple(junk_slot);
-				}
-
-				/* NOTE: rows that live ONLY in the delta store (pure-delta
-				 * INSERTs with no MAIN baseline) never enter the ctid loop
-				 * above: their BranchScan output carries an invalid ctid, so
-				 * they take the skip branch there.  They are instead replayed
-				 * by the ExecQual pass below.  A previous attempt to handle
-				 * them with a post-loop foreach over every INSERT delta row
-				 * caused a severe regression: the code emitted a DELETE
-				 * tombstone for *all* pure-delta INSERTs regardless of WHERE,
-				 * silently wiping out rows the user had just inserted and not
-				 * asked to delete (e.g. DELETE id=2 also wiped out
-				 * newly-INSERTed id=4).  Correctly applying WHERE predicates to
-				 * delta-only rows requires replaying the subplan qual against
-				 * reconstructed delta slots, which is exactly what the ExecQual
-				 * pass below does: for every pure-delta INSERT row still alive
-				 * in this branch it reconstructs a TupleTableSlot and runs it
-				 * through the plan's qual.  Qual-hits → write UPDATE/DELETE
-				 * delta.  This eliminates the earlier regression where a
-				 * no-qual foreach would tombstone ALL pure-delta rows. */
-				/* pure-delta UPDATE/DELETE ExecQual pass: for every
-				 * pure-delta INSERT row still alive in this branch,
-				 * reconstruct a TupleTableSlot and run it through
-				 * subplan->qual (ExecQual).  Qual-hits → write DELETE delta
-				 * (UPDATE pure-delta is out-of-scope for SET merge,
-				 * skipped, documented below).  This eliminates the earlier
-				 * regression where a no-qual foreach would tombstone ALL
-				 * pure-delta rows.
-				 *
-				 * TODO: for UPDATE, we must apply ModifyTable's SET
-				 * projection per reconstructed pure-delta row (via
-				 * ExecTargetList evaluation) instead of relying on
-				 * junk_slot which belongs to the last MAIN row.  Deferred.
-				 */
-
-				{
-					/* define early (cleanup block below uses it) */
-					struct WR_PDR1 { char *s; bytea *t; char *ov; };
-					struct WR_PDC1 { TupleTableSlot *slot; char *key; };
-					int32 bid = overlay_branch_get_current_id();
-					Oid relid = RelationGetRelid(rel);
-					StringInfoData spiq;
-					int ret2;
-					bool in_pure_delta = false;
-					List *raw_rows = NIL;
-					List *cand_inserts = NIL;
-
-
-					initStringInfo(&spiq);
-					appendStringInfo(&spiq,
-						"SELECT d.key, d.tuple_data, d.old_version FROM %s d "
-						"WHERE d.branch_id = %u AND d.relid = %u AND d.op IN (%s, %s)",
-						OBTABLE_DELTA, (unsigned) bid, (unsigned) relid,
-						quote_literal_cstr("I"),
-						quote_literal_cstr("U"));
-
-					overlay_overlay_helper_enter();
-					ret2 = ob_spi_one_shot(spiq.data, true, 0);
-					in_pure_delta = true;
-
-					pfree(spiq.data);
-
-					overlay_overlay_helper_exit();
-
-					if (ret2 == SPI_OK_SELECT && SPI_tuptable && SPI_tuptable->vals)
-					{
-						{
-							uint64 i;
-							MemoryContext oldmc;
-							/* Use executor's per-query context: CurrentMemoryContext
-							 * may have been switched to a child of the subplan's
-							 * per-tuple context which can disappear when subplan
-							 * finishes.  Per-query is long-lived for entire
-							 * query lifetime and always valid for raw_rows allocation. */
-							oldmc = MemoryContextSwitchTo(queryDesc->estate->es_query_cxt);
-							for (i = 0; i < SPI_processed; i++)
-							{
-								bool isn_td;
-								char *pkstr = SPI_getvalue(SPI_tuptable->vals[i],
-								                           SPI_tuptable->tupdesc, 1);
-								bytea *td = (bytea*) SPI_getbinval(
-									SPI_tuptable->vals[i],
-									SPI_tuptable->tupdesc, 2, &isn_td);
-								char *ov = SPI_getvalue(SPI_tuptable->vals[i],
-								                        SPI_tuptable->tupdesc, 3);
-								if (pkstr == NULL || isn_td || td == NULL)
-								{
-									if (pkstr) pfree(pkstr);
-									if (ov) pfree(ov);
-									continue;
-								}
-								{
-									struct WR_PDR1 *r;
-									int sz = VARSIZE_ANY(td);
-
-									r = (struct WR_PDR1*) palloc0(sizeof(struct WR_PDR1));
-									/* Hand the SPI_getvalue() strings straight to
-									 * the row (same es_query_cxt lifetime as the
-									 * pstrdup()s they replace) so no per-row
-									 * intermediate is left behind. */
-									r->s = pkstr;
-									r->ov = ov;
-									r->t = (bytea*) palloc(sz);
-									memcpy(r->t, td, sz);
-									raw_rows = lappend(raw_rows, r);
-								}
-							}
-							MemoryContextSwitchTo(oldmc);
-						}
-					}
-
-					if (in_pure_delta) SPI_finish();
-
-					if (raw_rows != NIL)
-					{
-						ListCell *lc;
-						List     *seen = NIL;
-						foreach(lc, raw_rows)
-						{
-							struct WR_PDR1 *r = (struct WR_PDR1*) lfirst(lc);
-							DeltaTuple dtu; bool rc;
-							ListCell *sl;
-							bool dup = false;
-							if (r->ov != NULL)
-								continue;
-							foreach(sl, seen)
-							{
-								if (strcmp((char*) lfirst(sl), r->s) == 0)
-								{ dup = true; break; }
-							}
-							if (dup)
-								continue;
-							seen = lappend(seen, r->s);
-							memset(&dtu, 0, sizeof(dtu));
-							rc = overlay_delta_lookup(bid, relid, r->s, &dtu);
-							if (rc && (dtu.op == DELTA_OP_INSERT ||
-							           dtu.op == DELTA_OP_UPDATE) &&
-							    dtu.tuple_data != NULL)
-							{
-								TupleTableSlot *ps = reconstruct_slot_from_delta(rel,
-								                                                 dtu.tuple_data,
-								                                                 queryDesc->estate->es_query_cxt);
-								if (ps)
-								{
-									struct WR_PDC1 *c1_ = (struct WR_PDC1 *) palloc0(sizeof(struct WR_PDC1));
-									c1_->slot = ps;
-									c1_->key = pstrdup(r->s);
-									cand_inserts = lappend(cand_inserts, c1_);
-								}
-							}
-							/* overlay_delta_lookup() deep-copies key /
-							 * old_version / tuple_data into TopMemoryContext so
-							 * they outlive its SPI_finish().  They are consumed
-							 * above (reconstruct_slot_from_delta copies what it
-							 * needs), so release them here — otherwise every
-							 * pure-delta rewritten row leaks its whole
-							 * serialized payload for the backend lifetime
-							 * (MF-1).  Mirrors ob_overlay_free_delta_list()
-							 * on the read path. */
-							if (rc)
-							{
-								if (dtu.key != NULL)
-									pfree(dtu.key);
-								if (dtu.old_version != NULL)
-									pfree(dtu.old_version);
-								if (dtu.tuple_data != NULL)
-									pfree(dtu.tuple_data);
-							}
-						}
-						list_free(seen);
-						foreach(lc, raw_rows)
-						{
-							struct WR_PDR1 *r = (struct WR_PDR1*) lfirst(lc);
-							if (r->s) pfree(r->s);
-							if (r->ov) pfree(r->ov);
-							if (r->t) pfree(r->t);
-							pfree(r);
-						}
-						list_free(raw_rows);
-						raw_rows = NIL;
-					}
-
-					if (cand_inserts != NIL)
-					{
-						PlanState *scan_ps;
-						ExprState *qual_scan;
-						ExprState *qual_extra;
-						ExprContext *econtext;
-						ListCell   *lc;
-						bool		pass_refs_ctid;
-						/* Walk down outerPlanState to the leaf scan node,
-						 * stopping early if we hit any level with a non-NULL
-						 * qual.  Nodes such as Result or ProjectSet wrap the
-						 * actual baserel scan without carrying qual, so we
-						 * have to descend. */
-						scan_ps = subplan;
-						while (outerPlanState(scan_ps) != NULL)
-						{
-							if (scan_ps->qual != NULL)
-								break;
-							scan_ps = outerPlanState(scan_ps);
-						}
-						/* Always grab the ScanState's own qual; most plan
-						 * types put the post-recheck restrictions here. */
-						qual_scan = scan_ps->qual;
-						qual_extra = NULL;
-						/* ACC-1 follow-up: a ctid-based DML predicate
-						 * cannot address a pure-delta row (no physical
-						 * ctid), so treat it as a no-op instead of
-						 * letting it match every reconstructed row whose
-						 * slot ctid is the invalid ItemPointer. */
-						pass_refs_ctid = ob_expr_has_ctid_var(
-							(Node *) scan_ps->plan->qual);
-						/* For index-based scans, PG pushes the original
-						 * restriction expressions into scan-type-specific
-						 * fields and leaves ScanState.qual NULL for the
-						 * index-reachable portion.  We must re-run those
-						 * original quals for pure-delta rows that never
-						 * entered the index. */
-						if (nodeTag(scan_ps) == T_IndexScanState)
-							qual_extra = ((IndexScanState *) scan_ps)->indexqualorig;
-						else if (nodeTag(scan_ps) == T_BitmapHeapScanState)
-							qual_extra = ((BitmapHeapScanState *) scan_ps)->bitmapqualorig;
-						else if (nodeTag(scan_ps) == T_IndexOnlyScanState)
-							qual_extra = ((IndexOnlyScanState *) scan_ps)->recheckqual;
-						econtext = scan_ps->ps_ExprContext;
-						foreach(lc, cand_inserts)
-						{
-							struct WR_PDC1 *c1_ = (struct WR_PDC1 *) lfirst(lc);
-							TupleTableSlot *slot = c1_->slot;
-							bool passes = true;
-							if (qual_scan != NULL || qual_extra != NULL)
-							{
-								MemoryContext oldcxt;
-								oldcxt = MemoryContextSwitchTo(
-									econtext->ecxt_per_tuple_memory);
-								if (econtext->ecxt_scantuple)
-									ExecClearTuple(econtext->ecxt_scantuple);
-								econtext->ecxt_scantuple = slot;
-								econtext->ecxt_outertuple = slot;
-								if (TTS_IS_VIRTUAL(slot))
-								{
-									TupleDesc	std = slot->tts_tupleDescriptor;
-									if (std && slot->tts_nvalid < std->natts)
-										slot->tts_nvalid = std->natts;
-								}
-								ResetExprContext(econtext);
-								if (qual_scan != NULL)
-								{
-									bool p1 = ExecQual(qual_scan, econtext);
-									if (!p1) passes = false;
-								}
-								if (passes && qual_extra != NULL)
-								{
-									bool p2 = ExecQual(qual_extra, econtext);
-									if (!p2) passes = false;
-								}
-								MemoryContextSwitchTo(oldcxt);
-							}
-							/* safety guard: only run pure-delta write path if
-							 * there is an explicit WHERE (scan qual OR scan-type
-							 * specific extra qual non-NULL).  Full-table DML
-							 * (DELETE FROM t / UPDATE t SET ...) is out-of-scope
-							 * for pure-delta rows; an unqualified DML has no quals
-							 * anywhere in the plan tree, so the naive pass would
-							 * tombstone every pure-delta INSERT causing silent
-							 * data loss. */
-							if (qual_scan == NULL && qual_extra == NULL) continue;
-							if (pass_refs_ctid) continue;
-							if (!passes) continue;
-							if (cmd == CMD_DELETE)
-							{
-								char *pk = pstrdup(c1_->key);
-								ndone++;
-								/* Run overlay_delta_insert on per-query context to
-								 * avoid UB: CurrentMemoryContext at this point may
-								 * belong to the now-drained subplan's per-tuple
-								 * context.  Force the allocations to live on
-								 * es_query_cxt which is guaranteed stable for
-								 * entire query lifetime. */
-								{
-									MemoryContext oldmcdi;
-									oldmcdi = MemoryContextSwitchTo(
-										queryDesc->estate->es_query_cxt);
-									overlay_delta_insert(bid, relid, pk,
-									                     DELTA_OP_DELETE, NULL, NULL);
-									MemoryContextSwitchTo(oldmcdi);
-								}
-								if (has_returning)
-								{
-									TupleTableSlot *rslot =
-										ob_project_returning(rri, slot, slot, rel);
-									if (rslot && !TupIsNull(rslot))
-									{
-										MemoryContext oldmcq;
-										oldmcq = MemoryContextSwitchTo(
-											queryDesc->estate->es_query_cxt);
-										if (nretslots >= nretslots_alloc)
-										{
-											int newsz = (nretslots_alloc == 0)
-												? 16 : nretslots_alloc * 2;
-											if (retslots == NULL)
-												retslots = palloc(
-													sizeof(TupleTableSlot*) * newsz);
-											else
-												retslots = repalloc(retslots,
-													sizeof(TupleTableSlot*) * newsz);
-											nretslots_alloc = newsz;
-										}
-										{
-											TupleTableSlot *cp;
-											TupleDesc td =
-												rslot->tts_tupleDescriptor;
-											cp = MakeSingleTupleTableSlot(td,
-												&TTSOpsHeapTuple);
-											ExecCopySlot(cp, rslot);
-											ExecMaterializeSlot(cp);
-											retslots[nretslots++] = cp;
-										}
-										MemoryContextSwitchTo(oldmcq);
-									}
-								}
-								pfree(pk);
-							}
-							else if (cmd == CMD_UPDATE)
-							{
-								TupleTableSlot *set_plan_slot;
-								TupleTableSlot *post_image;
-								TupleTableSlot *proj_slot;
-								ProjectionInfo *proj_info;
-								ExprContext *proj_ecxt;
-								char        *pk;
-								char        *tdata;
-								TupleDesc    reldesc;
-								TupleDesc    jdesc;
-								TupleTableSlot *save_scantuple;
-								TupleTableSlot *save_outertuple;
-								int			jnatts;
-								int			natts;
-								int			k;
-								int			r;
-								HeapTuple	post_htup;
-								PlanState  *subchild;
-								TupleDesc	in_desc;
-								TupleTableSlot *proj_input;
-								List		*child_tlist;
-								TargetEntry *cte;
-								int			i;
-
-								reldesc = RelationGetDescr(rel);
-								natts = reldesc->natts;
-
-								jdesc = CreateTupleDescCopy(
-									subplan->ps_ResultTupleSlot->tts_tupleDescriptor);
-								jnatts = jdesc->natts;
-
-								set_plan_slot = MakeSingleTupleTableSlot(jdesc,
-									&TTSOpsHeapTuple);
-
-								proj_info = subplan->ps_ProjInfo;
-								if (proj_info == NULL)
-								{
-									ExecClearTuple(set_plan_slot);
-									if (jnatts != natts)
-									{
-										ereport(WARNING,
-											(errmsg("overlay_branch: pure-delta UPDATE: no projection info and natts mismatch")));
-										ExecDropSingleTupleTableSlot(set_plan_slot);
-										FreeTupleDesc(jdesc);
-										continue;
-									}
-									for (k = 0; k < jnatts; k++)
-									{
-										Datum		d;
-										bool		isnull;
-										Form_pg_attribute patt;
-										if (TTS_IS_VIRTUAL(slot) &&
-										    slot->tts_nvalid < (AttrNumber)(k+1))
-											slot->tts_nvalid = natts;
-										d = slot->tts_values[k];
-										isnull = slot->tts_isnull[k];
-										patt = TupleDescAttr(jdesc, k);
-										if (!isnull)
-										{
-											int16 typlen;
-											bool  typbyval;
-											get_typlenbyval(patt->atttypid,
-												&typlen, &typbyval);
-											d = datumCopy(d, typbyval, typlen);
-										}
-										set_plan_slot->tts_values[k] = d;
-										set_plan_slot->tts_isnull[k] = isnull;
-									}
-									set_plan_slot->tts_nvalid = jnatts;
-								}
-								else
-								{
-									/* ACC-1: the DML subplan is typically a
-									 * Result node (planner B2) whose
-									 * projection consumes the SCAN output
-									 * (e.g. {num, ctid}), NOT the full
-									 * base-relation row.  Feeding the
-									 * reconstructed pre-image straight into
-									 * that projection read attribute
-									 * positions of the wrong layout and
-									 * segfaulted inside ExecProject().
-									 *
-									 * Synthesize a projection input shaped
-									 * like the child's output and fill it
-									 * from the pre-image.  The child's
-									 * output descriptor cannot be matched by
-									 * attribute NAME: a scan node's
-									 * targetlist TLEs carry resname == NULL,
-									 * so ExecTypeFromTL() yields empty
-									 * attnames.  Instead walk the child's
-									 * plan targetlist and resolve each
-									 * output position through its Var, which
-									 * still carries the base relation's
-									 * attnum. */
-									subchild = outerPlanState(subplan);
-									child_tlist = subchild != NULL
-										? subchild->plan->targetlist : NIL;
-									if (child_tlist != NIL &&
-										subchild->ps_ResultTupleSlot != NULL)
-										in_desc = subchild->ps_ResultTupleSlot->tts_tupleDescriptor;
-									else
-										in_desc = reldesc;
-
-									proj_input = MakeSingleTupleTableSlot(in_desc,
-										&TTSOpsVirtual);
-									for (i = 0; i < in_desc->natts; i++)
-									{
-										bool		found = false;
-
-										if (child_tlist == NIL)
-										{
-											/* Child passes the base relation
-											 * row through unchanged. */
-											if (i < natts)
-											{
-												Form_pg_attribute ratt =
-													TupleDescAttr(reldesc, i);
-
-												if (!ratt->attisdropped)
-												{
-													bool		isnull;
-													Datum		d;
-
-													d = slot_getattr(slot,
-														(AttrNumber) (i + 1),
-														&isnull);
-													if (!isnull)
-													{
-														int16	typlen;
-														bool	typbyval;
-
-														get_typlenbyval(
-															ratt->atttypid,
-															&typlen, &typbyval);
-														d = datumCopy(d, typbyval,
-															typlen);
-													}
-													proj_input->tts_values[i] = d;
-													proj_input->tts_isnull[i] = isnull;
-													found = true;
-												}
-											}
-										}
-										else if (i < list_length(child_tlist))
-										{
-											Node	   *cexpr;
-
-											cte = (TargetEntry *) list_nth(child_tlist, i);
-											cexpr = (Node *) cte->expr;
-											while (cexpr != NULL &&
-												   IsA(cexpr, RelabelType))
-												cexpr = (Node *) ((RelabelType *) cexpr)->arg;
-											if (cexpr != NULL && IsA(cexpr, Var))
-											{
-												Var		   *cv = (Var *) cexpr;
-
-												/* System columns (ctid, ...)
-												 * have varattno < 0 and are junk
-												 * for our purposes; leave them
-												 * NULL.  A positive varattno is
-												 * the base relation attnum of the
-												 * pre-image. */
-												if (cv->varattno > 0 &&
-													cv->varattno <= natts)
-												{
-													bool		isnull;
-													Datum		d;
-
-													d = slot_getattr(slot,
-														cv->varattno,
-														&isnull);
-													if (!isnull)
-													{
-														int16	typlen;
-														bool	typbyval;
-
-														get_typlenbyval(
-															TupleDescAttr(in_desc, i)->atttypid,
-															&typlen, &typbyval);
-														d = datumCopy(d, typbyval,
-															typlen);
-													}
-													proj_input->tts_values[i] = d;
-													proj_input->tts_isnull[i] = isnull;
-													found = true;
-												}
-											}
-										}
-										if (!found)
-										{
-											proj_input->tts_values[i] = (Datum) 0;
-											proj_input->tts_isnull[i] = true;
-										}
-									}
-									ExecStoreVirtualTuple(proj_input);
-
-									proj_ecxt = proj_info->pi_exprContext;
-									save_scantuple = proj_ecxt->ecxt_scantuple;
-									save_outertuple = proj_ecxt->ecxt_outertuple;
-									{
-										MemoryContext oldcxt;
-										oldcxt = MemoryContextSwitchTo(
-											proj_ecxt->ecxt_per_tuple_memory);
-										ResetExprContext(proj_ecxt);
-										proj_ecxt->ecxt_scantuple = proj_input;
-										proj_ecxt->ecxt_outertuple = proj_input;
-										proj_ecxt->ecxt_innertuple = NULL;
-										proj_slot = ExecProject(proj_info);
-										ExecClearTuple(set_plan_slot);
-										if (TTS_IS_VIRTUAL(proj_slot) &&
-										    proj_slot->tts_nvalid < jnatts)
-											proj_slot->tts_nvalid = jnatts;
-										for (k = 0; k < jnatts; k++)
-										{
-											Datum		d;
-											bool		isnull;
-											Form_pg_attribute patt;
-											d = proj_slot->tts_values[k];
-											isnull = proj_slot->tts_isnull[k];
-											patt = TupleDescAttr(jdesc, k);
-											if (!isnull)
-											{
-												int16 typlen;
-												bool  typbyval;
-												get_typlenbyval(patt->atttypid,
-													&typlen, &typbyval);
-												d = datumCopy(d, typbyval, typlen);
-											}
-											set_plan_slot->tts_values[k] = d;
-											set_plan_slot->tts_isnull[k] = isnull;
-										}
-										set_plan_slot->tts_nvalid = jnatts;
-										MemoryContextSwitchTo(oldcxt);
-									}
-									proj_ecxt->ecxt_scantuple = save_scantuple;
-									proj_ecxt->ecxt_outertuple = save_outertuple;
-									ExecDropSingleTupleTableSlot(proj_input);
-								}
-
-								post_image = MakeSingleTupleTableSlot(reldesc,
-									&TTSOpsHeapTuple);
-								{
-									MemoryContext oldmc;
-									/* The post-image copies are consumed by
-									 * heap_form_tuple() immediately below and only
-									 * need statement lifetime; TopMemoryContext
-									 * leaked one datum per pure-delta rewritten row
-									 * (MF-1). */
-									oldmc = MemoryContextSwitchTo(queryDesc->estate->es_query_cxt);
-									for (k = 0; k < natts; k++)
-									{
-										Datum		d;
-										bool		isnull;
-										Form_pg_attribute patt;
-										if (TTS_IS_VIRTUAL(slot) &&
-										    slot->tts_nvalid < (AttrNumber)(k+1))
-											slot->tts_nvalid = natts;
-										d = slot->tts_values[k];
-										isnull = slot->tts_isnull[k];
-										patt = TupleDescAttr(reldesc, k);
-										if (!isnull)
-										{
-											int16 typlen;
-											bool  typbyval;
-											get_typlenbyval(patt->atttypid,
-												&typlen, &typbyval);
-											d = datumCopy(d, typbyval, typlen);
-										}
-										post_image->tts_values[k] = d;
-										post_image->tts_isnull[k] = isnull;
-									}
-									post_image->tts_nvalid = natts;
-
-									for (r = 0; r < natts; r++)
-									{
-										Form_pg_attribute ratt =
-											TupleDescAttr(reldesc, r);
-										const char *rname = NameStr(ratt->attname);
-										int j;
-										if (ratt->attisdropped) continue;
-										for (j = 0; j < jnatts; j++)
-										{
-											Form_pg_attribute jatt =
-												TupleDescAttr(jdesc, j);
-											if (jatt->attisdropped) continue;
-											if (strcmp(NameStr(jatt->attname),
-											           rname) == 0)
-											{
-												bool jisnull;
-												Datum jvalue;
-												/* ===== REVIEW-260926 / R03
-												 * (pure-delta path) =====
-												 * Same PK-mutation guard as
-												 * MAIN-hit set-merge path: if
-												 * the SET target column is a
-												 * primary-key column, forbid
-												 * BEFORE any delta_insert.
-												 * Without this guard the
-												 * pure-delta post-image
-												 * would carry a DIFFERENT key
-												 * from the delta row's key
-												 * (the original INSERT key)
-												 * so live-view lookups and
-												 * apply both see desynced
-												 * keys. */
-												if (pk_attnums_set != NULL &&
-													bms_is_member(ratt->attnum - 1,
-																  pk_attnums_set))
-												{
-													ereport(ERROR,
-														(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
-														 errmsg("overlay_branch does not support UPDATE that modifies primary key columns on pure-delta rows (R03 pk-mutation blocked)"),
-														 errdetail("SET target column \"%s\" is part of the relation primary key.",
-														           rname),
-														 errhint("To change a PK on a pure-delta row, DELETE it, then INSERT a new row with the desired new primary key.  Both DELETE and INSERT DML are fully supported for pure-delta rows.")));
-												}
-												if (set_plan_slot->tts_nvalid <
-												    (AttrNumber)(j+1))
-													set_plan_slot->tts_nvalid =
-														jnatts;
-												jvalue = slot_getattr(
-													set_plan_slot,
-													(AttrNumber)(j+1), &jisnull);
-												if (!jisnull)
-												{
-													int16 typlen;
-													bool  typbyval;
-													get_typlenbyval(ratt->atttypid,
-														&typlen, &typbyval);
-													jvalue = datumCopy(jvalue,
-														typbyval, typlen);
-													post_image->tts_values[r] =
-														jvalue;
-													post_image->tts_isnull[r] =
-														false;
-												}
-												/* ===== REVIEW-260926 / R20
-												 * (pure-delta path) =====
-												 * When SET col = NULL on a
-												 * pure-delta row, write the
-												 * isnull flag.  The MAIN-hit
-												 * path already does this;
-												 * we mirror it here so both
-												 * code paths behave
-												 * identically for NULL
-												 * assignments. */
-												else
-												{
-													post_image->tts_values[r] = (Datum) 0;
-													post_image->tts_isnull[r] = true;
-												}
-												break;
-											}
-										}
-									}
-									MemoryContextSwitchTo(oldmc);
-								}
-
-								post_htup = heap_form_tuple(reldesc,
-									post_image->tts_values,
-									post_image->tts_isnull);
-								ExecClearTuple(post_image);
-								ExecStoreHeapTuple(post_htup, post_image, true);
-
-								/* Eager native NOT NULL + CHECK check on the
-								 * rewritten pure-delta post-image, mirroring
-								 * the MAIN-hit SET-merge path so both UPDATE
-								 * forms reject an invalid row identically. */
-								ob_validate_redirect_constraints(rri, rel,
-																 post_image,
-																 queryDesc->estate);
-
-								pk = pstrdup(c1_->key);
-								tdata = overlay_serialize_tuple(rel, post_image);
-
-								{
-									MemoryContext oldmcdi2;
-									oldmcdi2 = MemoryContextSwitchTo(
-										queryDesc->estate->es_query_cxt);
-									overlay_delta_insert(bid, relid, pk,
-									                     DELTA_OP_UPDATE, NULL, tdata);
-									MemoryContextSwitchTo(oldmcdi2);
-								}
-								ndone++;
-
-								if (has_returning)
-								{
-									TupleTableSlot *rslot;
-									rslot = ob_project_returning(rri,
-									                             post_image,
-									                             set_plan_slot,
-									                             rel);
-									if (rslot && !TupIsNull(rslot))
-									{
-										MemoryContext oldmcq;
-										oldmcq = MemoryContextSwitchTo(
-											queryDesc->estate->es_query_cxt);
-										if (nretslots >= nretslots_alloc)
-										{
-											int newsz = (nretslots_alloc == 0)
-												? 16 : nretslots_alloc * 2;
-											if (retslots == NULL)
-												retslots = palloc(
-													sizeof(TupleTableSlot*) * newsz);
-											else
-												retslots = repalloc(retslots,
-													sizeof(TupleTableSlot*) * newsz);
-											nretslots_alloc = newsz;
-										}
-										{
-											TupleTableSlot *cp;
-											TupleDesc td =
-												rslot->tts_tupleDescriptor;
-											cp = MakeSingleTupleTableSlot(td,
-												&TTSOpsHeapTuple);
-											ExecCopySlot(cp, rslot);
-											ExecMaterializeSlot(cp);
-											retslots[nretslots++] = cp;
-										}
-										MemoryContextSwitchTo(oldmcq);
-									}
-								}
-
-								pfree(pk);
-								if (tdata) pfree(tdata);
-								ExecDropSingleTupleTableSlot(post_image);
-								ExecDropSingleTupleTableSlot(set_plan_slot);
-								FreeTupleDesc(jdesc);
-							}
-						}
-						foreach(lc, cand_inserts)
-						{
-							struct WR_PDC1 *c1_ = (struct WR_PDC1 *) lfirst(lc);
-							if (c1_->slot) ExecDropSingleTupleTableSlot(c1_->slot);
-							if (c1_->key) pfree(c1_->key);
-							pfree(c1_);
-						}
-						list_free(cand_inserts);
-						cand_inserts = NIL;
-					}
-
-					if (raw_rows != NIL)
-					{
-						ListCell *lc;
-						foreach(lc, raw_rows)
-						{
-							struct WR_PDR1 *r = (struct WR_PDR1*) lfirst(lc);
-							if (r->s) pfree(r->s);
-							if (r->ov) pfree(r->ov);
-							if (r->t) pfree(r->t);
-							pfree(r);
-						}
-						list_free(raw_rows);
-					}
 				}
 
 				/* Replay collected RETURNING rows into dest.
