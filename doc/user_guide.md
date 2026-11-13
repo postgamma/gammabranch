@@ -862,6 +862,7 @@ Alternative: use top-level DML with `RETURNING` directly (see §6.2).
 | Non-deterministic (ICU) collation on a PK column | ❌ Rejected at `create_branch` — a text delta key cannot represent its equality classes (e.g. `'foo' = 'FOO'`); the same collation on a non-PK column is fine |
 | `citext` on a PK column (through any chain of domain / array wrappers, e.g. `citext[]`, a domain over `citext`, a domain over `citext[]`, or an array of such a domain) | ❌ Rejected at `create_branch` — case-insensitive equality cannot be represented by a text delta key (e.g. `'foo' = 'FOO'`); a `citext` non-PK column (scalar or array) is fine |
 | PRIMARY KEY declared `DEFERRABLE INITIALLY DEFERRED` | ❌ Rejected at `create_branch` — native checks a deferred PK only at `COMMIT` (a transient duplicate PK the transaction resolves is legal), but the delta identity key **is** the PK, so the branch cannot hold the transient duplicate; a `DEFERRABLE INITIALLY IMMEDIATE` PK is fine |
+| `EXCLUDE` constraint | ❌ Rejected at `create_branch` — native enforces it immediately (`23P01`), but the redirect's eager probe only models `UNIQUE` indexes, so a violating write would land silently in the delta and surface only at `apply_branch` |
 
 Handling suggestions for RESTRICTED items:
 
@@ -876,6 +877,8 @@ Handling suggestions for RESTRICTED items:
 | UPDATE pk | Change to `DELETE WHERE pk=old` + `INSERT VALUES (new_pk, ...)` |
 | Non-deterministic collation on a PK column | Use a deterministic collation for the PK column (a non-deterministic one remains fine on a non-PK column) |
 | `citext` on a PK column | Use a case-sensitive type (`text` / `varchar`) for the PK column (`citext` remains fine on a non-PK column) |
+| PRIMARY KEY declared `DEFERRABLE INITIALLY DEFERRED` | Declare the PK `NOT DEFERRABLE` or `DEFERRABLE INITIALLY IMMEDIATE` (both are checked eagerly and stay supported) |
+| `EXCLUDE` constraint | Keep the constraint in Main and run the conflicting writes there; a branch cannot reproduce an arbitrary exclusion operator |
 | FK cascade write | In the application layer, explicitly write the child table before the parent table |
 
 ---

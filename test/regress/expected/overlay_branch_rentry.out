@@ -1252,7 +1252,7 @@ DROP ROLE IF EXISTS regress_g02_bob;
 /* =====================================================================
  * Section G01: create_branch scope pre-flight guard (FAIL FAST)
  *
- * Overview (17 sub-cases, PASS labels prefix PASS:G01_SCOPE_*):
+ * Overview (18 sub-cases, PASS labels prefix PASS:G01_SCOPE_*):
  *   G01_A clean-schema create OK after cleanup
  *   G01_B FK-pk-side table rejects
  *   G01_C FK-fk-side table rejects
@@ -1273,6 +1273,9 @@ DROP ROLE IF EXISTS regress_g02_bob;
  *          multi-column) rejects -- the delta identity IS the PK and cannot
  *          hold a transient duplicate PK -- while an INITIALLY IMMEDIATE PK
  *          and a DEFERRABLE INITIALLY DEFERRED *non-PK* UNIQUE stay legal
+ *   G01_M EXCLUDE constraint rejects -- native enforces it immediately
+ *          (23P01) but the redirect's eager probe only models UNIQUE
+ *          indexes, so a violating write would land silently in the delta
  *
  * NOTE: Each sub-case uses DROP ... IF EXISTS / CREATE ... inside its
  * own block, and after assert it DROPs the offending object so the
@@ -1669,6 +1672,26 @@ SELECT discard_branch('br_g01_deferred_ok');
 (1 row)
 
 DROP TABLE public.defpk_ok_g01;
+/* ---- G01_M: EXCLUDE constraint reject.
+ *      Native enforces an exclusion constraint immediately (SQLSTATE
+ *      23P01 exclusion_violation on the offending statement), but the
+ *      redirect's eager probe only models UNIQUE indexes and cannot
+ *      replicate an arbitrary exclusion operator.  A violating write would
+ *      therefore be accepted silently into the delta and surface only at
+ *      apply_branch, so the table is refused up front. */
+CREATE TABLE public.excl_g01 (id int PRIMARY KEY, room int, EXCLUDE USING btree (room WITH =));
+DO $$ BEGIN
+  PERFORM public.create_branch('br_g01_should_fail_m');
+  RAISE EXCEPTION 'FAIL:G01_M not blocked';
+EXCEPTION WHEN feature_not_supported THEN NULL; END $$;
+SELECT 'PASS:G01_SCOPE_M_EXCLUDE_REJECTED' AS g01_m_label
+ WHERE NOT EXISTS (SELECT 1 FROM public.pg_branch WHERE branch_name='br_g01_should_fail_m');
+            g01_m_label            
+-----------------------------------
+ PASS:G01_SCOPE_M_EXCLUDE_REJECTED
+(1 row)
+
+DROP TABLE public.excl_g01;
 /* ---- G01_Z: FINAL clean-schema create OK AFTER all G01 blocks DROPPED.
  *      Sanity guard — ensures every sub-case above actually dropped
  *      its fixtures.  If any earlier DROP was missed, this last

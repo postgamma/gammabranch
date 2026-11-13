@@ -667,7 +667,7 @@ BPCHAR / NUMERIC / TIMESTAMPTZ stay correct (§2).
 ### 1.8 Scope & gating + ACL double-defense
 
 Unsupported objects are rejected at `create_branch` time (0A000/55000). The G01
-support matrix has ten categories, ordered "most user-harmful first" so the
+support matrix has eleven categories, ordered "most user-harmful first" so the
 first hit is reported: foreign keys; user triggers; partitioned / inherited
 tables; UNLOGGED tables; GENERATED STORED columns; any relkind other than
 ordinary table (`r`) / sequence (`S`) / btree index (`i`) (foreign tables,
@@ -676,12 +676,18 @@ column; a `citext` PRIMARY KEY column (reached through any chain of domain
 (`typbasetype`) and array (`typelem`) wrappers — e.g. `citext[]`, a domain over
 `citext`, a domain over `citext[]`, or an array of such a domain) — both of the
 last two because their equality classes cannot be
-represented by a text delta key (§1.5); and a PRIMARY KEY declared DEFERRABLE
-INITIALLY DEFERRED (single- or multi-column). The deferred PK is refused because
+represented by a text delta key (§1.5); a PRIMARY KEY declared DEFERRABLE
+INITIALLY DEFERRED (single- or multi-column); and an EXCLUDE constraint. The
+deferred PK is refused because
 the delta's identity key **is** the serialized PK, so the delta — being keyed on
 `(branch_id, relid, key)` — cannot hold the transient duplicate PK that native
 tolerates by deferring the uniqueness check to COMMIT; an INITIALLY IMMEDIATE PK
-is checked at end of statement and stays supported. The
+is checked at end of statement and stays supported. The EXCLUDE constraint is
+refused because native enforces it immediately (23P01 on the offending
+statement), but the redirect's eager probe only rebinds plain-column UNIQUE
+indexes to a text check and cannot model an arbitrary exclusion operator, so a
+violating write would land silently in the delta and surface only at
+`apply_branch`. The
 guard checks cheapest-first (relkind, `relispartition`, user
 triggers, foreign keys, then no-PK). The per-DML executor guard validates only
 the statement's DML **target** relations (the `ModifyTable` result relations):
