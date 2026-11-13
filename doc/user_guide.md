@@ -415,6 +415,14 @@ twice in one command — two rows proposing the same arbiter value, or a
 — raises `21000` `cardinality_violation` ("cannot affect row a second time")
 instead, and `DO NOTHING` keeps the first row.
 
+A `UNIQUE ... DEFERRABLE INITIALLY DEFERRED` index is the exception: Main checks
+it only at `COMMIT`, so a transaction may legally hold a transient duplicate it
+then resolves. Inside a branch such a write is accepted (the eager `23505` probe
+is skipped for that index); if the transaction never resolves the duplicate, Main's
+real constraint raises `23505` when the branch is applied. A `DEFERRABLE INITIALLY
+IMMEDIATE` or plain `NOT DEFERRABLE` index is checked at end of statement and
+stays eager, exactly as described above.
+
 ```sql
 SELECT use_branch('agent_workspace');
 UPDATE products SET price = NULL WHERE id = 1;
@@ -853,6 +861,7 @@ Alternative: use top-level DML with `RETURNING` directly (see §6.2).
 | DML on a no-PK table | ❌ Rejected by default; ✅ when `overlay_branch.keyless_tables=on` (experimental, see §6.8) |
 | Non-deterministic (ICU) collation on a PK column | ❌ Rejected at `create_branch` — a text delta key cannot represent its equality classes (e.g. `'foo' = 'FOO'`); the same collation on a non-PK column is fine |
 | `citext` on a PK column (through any chain of domain / array wrappers, e.g. `citext[]`, a domain over `citext`, a domain over `citext[]`, or an array of such a domain) | ❌ Rejected at `create_branch` — case-insensitive equality cannot be represented by a text delta key (e.g. `'foo' = 'FOO'`); a `citext` non-PK column (scalar or array) is fine |
+| PRIMARY KEY declared `DEFERRABLE INITIALLY DEFERRED` | ❌ Rejected at `create_branch` — native checks a deferred PK only at `COMMIT` (a transient duplicate PK the transaction resolves is legal), but the delta identity key **is** the PK, so the branch cannot hold the transient duplicate; a `DEFERRABLE INITIALLY IMMEDIATE` PK is fine |
 
 Handling suggestions for RESTRICTED items:
 

@@ -23,6 +23,7 @@
 #include "access/table.h"
 #include "catalog/index.h"
 #include "catalog/namespace.h"
+#include "catalog/pg_constraint.h"
 #include "catalog/pg_type.h"
 #include "executor/executor.h"
 #include "parser/parsetree.h"
@@ -34,6 +35,7 @@
 #include "nodes/nodeFuncs.h"
 #include "storage/lmgr.h"
 #include "utils/datum.h"
+#include "utils/fmgroids.h"
 #include "utils/lsyscache.h"
 #include "utils/memutils.h"
 #include "utils/rel.h"
@@ -923,6 +925,68 @@ ob_validate_redirect_constraints(ResultRelInfo *rri, Relation rel,
 }
 
 /* ----------------------------------------------------------------
+ * ob_index_is_deferred
+ *
+ *   True when `idxrel`'s uniqueness is DEFERRABLE INITIALLY DEFERRED,
+ *   i.e. native PostgreSQL does not check it until COMMIT.  A transient
+ *   duplicate that the rest of the transaction resolves (e.g. INSERT of
+ *   a new row followed by DELETE of the older row) is then perfectly
+ *   legal, so the write redirect must NOT enforce it eagerly.
+ *
+ *   `pg_index.indimmediate` is `!condeferrable`, so it is false for BOTH
+ *   `INITIALLY DEFERRED` and `INITIALLY IMMEDIATE` -- not enough on its
+ *   own.  Native still checks a DEFERRABLE INITIALLY IMMEDIATE index at
+ *   end of statement, which the eager per-row probe emulates correctly,
+ *   so only the INITIALLY DEFERRED case must be skipped.  The backing
+ *   constraint's declared mode is read from pg_constraint (there is no
+ *   runtime API for the current `SET CONSTRAINTS` state, so the declared
+ *   mode is the best static approximation of "native defers this").
+ *
+ *   The write redirect re-implements the eager probe with SPI (the
+ *   command counter does not advance between rows of one command, so the
+ *   delta is invisible to a plain index scan).  An UNRESOLVED duplicate
+ *   on a skipped index then surfaces at apply_branch against MAIN's real
+ *   constraint (a discarded branch exits silently) -- never a spurious
+ *   23505 at DML time.
+ * ----------------------------------------------------------------
+ */
+static bool
+ob_index_is_deferred(Relation idxrel)
+{
+	Oid			tbloid;
+	Relation	cong;
+	SysScanDesc scan;
+	ScanKeyData skey;
+	HeapTuple	tup;
+	bool		deferred = false;
+
+	/* NOT DEFERRABLE (indimmediate = true): native checks it per tuple. */
+	if (idxrel->rd_index->indimmediate)
+		return false;
+
+	tbloid = idxrel->rd_index->indrelid;
+	cong = table_open(ConstraintRelationId, AccessShareLock);
+	ScanKeyInit(&skey, Anum_pg_constraint_conrelid,
+				BTEqualStrategyNumber, F_OIDEQ, ObjectIdGetDatum(tbloid));
+	scan = systable_beginscan(cong, ConstraintRelidTypidNameIndexId, true,
+							  NULL, 1, &skey);
+	while (HeapTupleIsValid(tup = systable_getnext(scan)))
+	{
+		Form_pg_constraint con = (Form_pg_constraint) GETSTRUCT(tup);
+
+		if (con->conindid == RelationGetRelid(idxrel) && con->condeferred)
+		{
+			deferred = true;
+			break;
+		}
+	}
+	systable_endscan(scan);
+	table_close(cong, AccessShareLock);
+
+	return deferred;
+}
+
+/* ----------------------------------------------------------------
  * ob_unique_target_conflict
  *
  *   Probe the branch delta and MAIN for a row conflicting with the
@@ -1138,6 +1202,13 @@ ob_other_unique_conflict(Relation rel, TupleTableSlot *slot, int32 bid,
 			continue;
 
 		idxrel = index_open(idxoid, AccessShareLock);
+		if (ob_index_is_deferred(idxrel))
+		{
+			/* DEFERRABLE INITIALLY DEFERRED: native defers this check to
+			 * COMMIT, so the eager probe must not fire here. */
+			index_close(idxrel, AccessShareLock);
+			continue;
+		}
 		ii = BuildIndexInfo(idxrel);
 		n = ii->ii_NumIndexAttrs;
 		nnd = ii->ii_NullsNotDistinct;
@@ -1200,6 +1271,13 @@ ob_relation_has_resolvable_unique(Relation rel)
 			continue;
 
 		idxrel = index_open(idxoid, AccessShareLock);
+		if (ob_index_is_deferred(idxrel))
+		{
+			/* DEFERRABLE INITIALLY DEFERRED: not eagerly enforced, so it
+			 * needs no same-claim tracking. */
+			index_close(idxrel, AccessShareLock);
+			continue;
+		}
 		ii = BuildIndexInfo(idxrel);
 		ok = (ii->ii_Unique && ii->ii_NumIndexAttrs > 0 &&
 			  ii->ii_NumIndexAttrs <= INDEX_MAX_KEYS &&
@@ -1256,6 +1334,13 @@ ob_unique_claims_apply(Relation rel, TupleTableSlot *slot, HTAB *claimed,
 			continue;
 
 		idxrel = index_open(idxoid, AccessShareLock);
+		if (ob_index_is_deferred(idxrel))
+		{
+			/* DEFERRABLE INITIALLY DEFERRED: no eager same-statement
+			 * duplicate detection -- native defers it to COMMIT. */
+			index_close(idxrel, AccessShareLock);
+			continue;
+		}
 		ii = BuildIndexInfo(idxrel);
 		n = ii->ii_NumIndexAttrs;
 		nnd = ii->ii_NullsNotDistinct;

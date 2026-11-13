@@ -995,7 +995,7 @@ DROP ROLE IF EXISTS regress_g02_bob;
 /* =====================================================================
  * Section G01: create_branch scope pre-flight guard (FAIL FAST)
  *
- * Overview (16 sub-cases, PASS labels prefix PASS:G01_SCOPE_*):
+ * Overview (17 sub-cases, PASS labels prefix PASS:G01_SCOPE_*):
  *   G01_A clean-schema create OK after cleanup
  *   G01_B FK-pk-side table rejects
  *   G01_C FK-fk-side table rejects
@@ -1012,6 +1012,10 @@ DROP ROLE IF EXISTS regress_g02_bob;
  *          nested domain chain, a citext[] array, a domain over citext[],
  *          and an array of a domain over citext -- while a plain citext
  *          non-PK column (and a citext[] non-PK column) stays legal
+ *   G01_L PRIMARY KEY declared DEFERRABLE INITIALLY DEFERRED (single- and
+ *          multi-column) rejects -- the delta identity IS the PK and cannot
+ *          hold a transient duplicate PK -- while an INITIALLY IMMEDIATE PK
+ *          and a DEFERRABLE INITIALLY DEFERRED *non-PK* UNIQUE stay legal
  *
  * NOTE: Each sub-case uses DROP ... IF EXISTS / CREATE ... inside its
  * own block, and after assert it DROPs the offending object so the
@@ -1260,6 +1264,41 @@ SELECT CASE WHEN (SELECT create_branch('br_g01_citext_nonpk_ok') IS NOT NULL)
             ELSE 'FAIL:G01_K_NONPK' END AS g01_k_nonpk;
 SELECT discard_branch('br_g01_citext_nonpk_ok');
 DROP TABLE public.citext_ok_g01;
+
+/* ---- G01_L: PRIMARY KEY declared DEFERRABLE INITIALLY DEFERRED reject.
+ *      Native checks a deferred PK only at COMMIT, so a transient
+ *      duplicate PK the transaction resolves is legal; the branch delta's
+ *      identity key IS the serialized PK and cannot hold two rows with the
+ *      same PK, so such a table is refused at create_branch.  An INITIALLY
+ *      IMMEDIATE PK is checked at end of statement and stays accepted, and
+ *      a DEFERRABLE INITIALLY DEFERRED *non-PK* UNIQUE column is legal
+ *      (the delta keys on the PK, so it can hold the transient duplicate). */
+CREATE TABLE public.defpk_g01 (id int PRIMARY KEY DEFERRABLE INITIALLY DEFERRED, v text);
+DO $$ BEGIN
+  PERFORM public.create_branch('br_g01_should_fail_l');
+  RAISE EXCEPTION 'FAIL:G01_L not blocked';
+EXCEPTION WHEN feature_not_supported THEN NULL; END $$;
+SELECT 'PASS:G01_SCOPE_L_DEFERRED_PK_REJECTED' AS g01_l_label
+ WHERE NOT EXISTS (SELECT 1 FROM public.pg_branch WHERE branch_name='br_g01_should_fail_l');
+DROP TABLE public.defpk_g01;
+/*      Multi-column PK declared deferrable must be caught too. */
+CREATE TABLE public.defpk_g01 (a int, b int, v text, PRIMARY KEY (a,b) DEFERRABLE INITIALLY DEFERRED);
+DO $$ BEGIN
+  PERFORM public.create_branch('br_g01_should_fail_l2');
+  RAISE EXCEPTION 'FAIL:G01_L_COMPOSITE not blocked';
+EXCEPTION WHEN feature_not_supported THEN NULL; END $$;
+SELECT 'PASS:G01_SCOPE_L_DEFERRED_COMPOSITE_PK_REJECTED' AS g01_l_comp_label
+ WHERE NOT EXISTS (SELECT 1 FROM public.pg_branch WHERE branch_name='br_g01_should_fail_l2');
+DROP TABLE public.defpk_g01;
+/*      INITIALLY IMMEDIATE PK (eager) + DEFERRABLE INITIALLY DEFERRED
+ *      non-PK UNIQUE (skippable, delta keys on the PK) stay legal. */
+CREATE TABLE public.defpk_ok_g01 (id int PRIMARY KEY DEFERRABLE INITIALLY IMMEDIATE,
+                                 u int UNIQUE DEFERRABLE INITIALLY DEFERRED, v text);
+SELECT CASE WHEN (SELECT create_branch('br_g01_deferred_ok') IS NOT NULL)
+            THEN 'PASS:G01_SCOPE_L_IMMEDIATE_PK_AND_DEFERRED_UNIQUE_ALLOWED'
+            ELSE 'FAIL:G01_L_IMMEDIATE' END AS g01_l_ok;
+SELECT discard_branch('br_g01_deferred_ok');
+DROP TABLE public.defpk_ok_g01;
 
 /* ---- G01_Z: FINAL clean-schema create OK AFTER all G01 blocks DROPPED.
  *      Sanity guard — ensures every sub-case above actually dropped

@@ -174,8 +174,13 @@ ob_acl_check_lifecycle(ObLifecycleOp op, const char *branch_name)
  *     (deptype = 'e', refobjid = overlay_branch.oid), regardless of which
  *     namespace they live in.  This is critical because public.pg_branch
  *     VIEW and 12 public.* synonyms live in schema public.
- *   - 9 categories are ordered by "most user-harmful first" for fail-fast
- *     first-hit reporting.
+ *   - 10 categories are ordered by "most user-harmful first" for fail-fast
+ *     first-hit reporting.  Category 10 rejects a PRIMARY KEY declared
+ *     DEFERRABLE INITIALLY DEFERRED: native checks PK uniqueness only at
+ *     COMMIT (a transient duplicate PK the transaction resolves is legal),
+ *     but the branch delta's identity key IS the serialized PK, so it cannot
+ *     represent two rows bearing the same PK.  An INITIALLY IMMEDIATE PK is
+ *     checked at end of statement and is accepted.
  * ================================================================ */
 void
 ob_check_branch_scope(void)
@@ -342,6 +347,25 @@ ob_check_branch_scope(void)
 "                      AND d.deptype = 'e' "
 "                      AND d.classid = 'pg_class'::regclass "
 "                      AND d.objid = c.oid) "
+"  UNION ALL "
+"  SELECT 10, "
+"    'DEFERRABLE PK: ' || n.nspname || '.' || c.relname "
+"  FROM pg_index i "
+"  JOIN pg_class c ON c.oid = i.indrelid "
+"  JOIN pg_namespace n ON n.oid = c.relnamespace "
+"  JOIN pg_constraint con ON con.conindid = i.indexrelid "
+"  WHERE i.indisprimary "
+"    AND con.contype = 'p' "
+"    AND con.condeferred "
+"    AND c.relkind = 'r' "
+"    AND n.nspname NOT IN ('pg_catalog','information_schema','pg_toast') "
+"    AND n.oid <> (SELECT n.oid FROM pg_extension e JOIN pg_namespace n ON n.oid = e.extnamespace WHERE e.extname = 'overlay_branch') "
+"    AND NOT EXISTS (SELECT 1 FROM pg_depend d "
+"                    WHERE d.refclassid = 'pg_extension'::regclass "
+"                      AND d.refobjid = (SELECT oid FROM pg_extension WHERE extname='overlay_branch') "
+"                      AND d.deptype = 'e' "
+"                      AND d.classid = 'pg_class'::regclass "
+"                      AND d.objid = c.oid) "
 "  ORDER BY ord LIMIT 1 "
 ") cat;");
 
@@ -380,7 +404,7 @@ ob_check_branch_scope(void)
 				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
 				 errmsg("overlay branch cannot be created because this database contains at least one table in an unsupported category (G01 support matrix)"),
 				 errdetail("First unsupported relation: %s", detail),
-				 errhint("Remove or rename the relation, or exclude its schema from the overlay scope.  RESTRICTED categories: FKs, user triggers, partitions, table inheritance, UNLOGGED tables, GENERATED STORED columns, VIEWs/MATVIEWs/FDW tables, any relkind other than ordinary table ('r'), sequence ('S'), or btree index ('i'), and a PRIMARY KEY column whose '=' operator is coarser than its output text -- a non-deterministic (e.g. ICU case-insensitive) collation or a citext (case-insensitive text) column; such equality classes cannot be represented by a text key.")));
+				 errhint("Remove or rename the relation, or exclude its schema from the overlay scope.  RESTRICTED categories: FKs, user triggers, partitions, table inheritance, UNLOGGED tables, GENERATED STORED columns, VIEWs/MATVIEWs/FDW tables, any relkind other than ordinary table ('r'), sequence ('S'), or btree index ('i'), a PRIMARY KEY declared DEFERRABLE INITIALLY DEFERRED (the delta identity is the PK, so it cannot hold a transient duplicate PK), and a PRIMARY KEY column whose '=' operator is coarser than its output text -- a non-deterministic (e.g. ICU case-insensitive) collation or a citext (case-insensitive text) column; such equality classes cannot be represented by a text key.")));
 	}
 	pfree(sql.data);
 }

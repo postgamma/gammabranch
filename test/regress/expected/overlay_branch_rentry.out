@@ -1252,7 +1252,7 @@ DROP ROLE IF EXISTS regress_g02_bob;
 /* =====================================================================
  * Section G01: create_branch scope pre-flight guard (FAIL FAST)
  *
- * Overview (16 sub-cases, PASS labels prefix PASS:G01_SCOPE_*):
+ * Overview (17 sub-cases, PASS labels prefix PASS:G01_SCOPE_*):
  *   G01_A clean-schema create OK after cleanup
  *   G01_B FK-pk-side table rejects
  *   G01_C FK-fk-side table rejects
@@ -1269,6 +1269,10 @@ DROP ROLE IF EXISTS regress_g02_bob;
  *          nested domain chain, a citext[] array, a domain over citext[],
  *          and an array of a domain over citext -- while a plain citext
  *          non-PK column (and a citext[] non-PK column) stays legal
+ *   G01_L PRIMARY KEY declared DEFERRABLE INITIALLY DEFERRED (single- and
+ *          multi-column) rejects -- the delta identity IS the PK and cannot
+ *          hold a transient duplicate PK -- while an INITIALLY IMMEDIATE PK
+ *          and a DEFERRABLE INITIALLY DEFERRED *non-PK* UNIQUE stay legal
  *
  * NOTE: Each sub-case uses DROP ... IF EXISTS / CREATE ... inside its
  * own block, and after assert it DROPs the offending object so the
@@ -1611,6 +1615,60 @@ SELECT discard_branch('br_g01_citext_nonpk_ok');
 (1 row)
 
 DROP TABLE public.citext_ok_g01;
+/* ---- G01_L: PRIMARY KEY declared DEFERRABLE INITIALLY DEFERRED reject.
+ *      Native checks a deferred PK only at COMMIT, so a transient
+ *      duplicate PK the transaction resolves is legal; the branch delta's
+ *      identity key IS the serialized PK and cannot hold two rows with the
+ *      same PK, so such a table is refused at create_branch.  An INITIALLY
+ *      IMMEDIATE PK is checked at end of statement and stays accepted, and
+ *      a DEFERRABLE INITIALLY DEFERRED *non-PK* UNIQUE column is legal
+ *      (the delta keys on the PK, so it can hold the transient duplicate). */
+CREATE TABLE public.defpk_g01 (id int PRIMARY KEY DEFERRABLE INITIALLY DEFERRED, v text);
+DO $$ BEGIN
+  PERFORM public.create_branch('br_g01_should_fail_l');
+  RAISE EXCEPTION 'FAIL:G01_L not blocked';
+EXCEPTION WHEN feature_not_supported THEN NULL; END $$;
+SELECT 'PASS:G01_SCOPE_L_DEFERRED_PK_REJECTED' AS g01_l_label
+ WHERE NOT EXISTS (SELECT 1 FROM public.pg_branch WHERE branch_name='br_g01_should_fail_l');
+              g01_l_label              
+---------------------------------------
+ PASS:G01_SCOPE_L_DEFERRED_PK_REJECTED
+(1 row)
+
+DROP TABLE public.defpk_g01;
+/*      Multi-column PK declared deferrable must be caught too. */
+CREATE TABLE public.defpk_g01 (a int, b int, v text, PRIMARY KEY (a,b) DEFERRABLE INITIALLY DEFERRED);
+DO $$ BEGIN
+  PERFORM public.create_branch('br_g01_should_fail_l2');
+  RAISE EXCEPTION 'FAIL:G01_L_COMPOSITE not blocked';
+EXCEPTION WHEN feature_not_supported THEN NULL; END $$;
+SELECT 'PASS:G01_SCOPE_L_DEFERRED_COMPOSITE_PK_REJECTED' AS g01_l_comp_label
+ WHERE NOT EXISTS (SELECT 1 FROM public.pg_branch WHERE branch_name='br_g01_should_fail_l2');
+                g01_l_comp_label                 
+-------------------------------------------------
+ PASS:G01_SCOPE_L_DEFERRED_COMPOSITE_PK_REJECTED
+(1 row)
+
+DROP TABLE public.defpk_g01;
+/*      INITIALLY IMMEDIATE PK (eager) + DEFERRABLE INITIALLY DEFERRED
+ *      non-PK UNIQUE (skippable, delta keys on the PK) stay legal. */
+CREATE TABLE public.defpk_ok_g01 (id int PRIMARY KEY DEFERRABLE INITIALLY IMMEDIATE,
+                                 u int UNIQUE DEFERRABLE INITIALLY DEFERRED, v text);
+SELECT CASE WHEN (SELECT create_branch('br_g01_deferred_ok') IS NOT NULL)
+            THEN 'PASS:G01_SCOPE_L_IMMEDIATE_PK_AND_DEFERRED_UNIQUE_ALLOWED'
+            ELSE 'FAIL:G01_L_IMMEDIATE' END AS g01_l_ok;
+                         g01_l_ok                          
+-----------------------------------------------------------
+ PASS:G01_SCOPE_L_IMMEDIATE_PK_AND_DEFERRED_UNIQUE_ALLOWED
+(1 row)
+
+SELECT discard_branch('br_g01_deferred_ok');
+ discard_branch 
+----------------
+ 
+(1 row)
+
+DROP TABLE public.defpk_ok_g01;
 /* ---- G01_Z: FINAL clean-schema create OK AFTER all G01 blocks DROPPED.
  *      Sanity guard — ensures every sub-case above actually dropped
  *      its fixtures.  If any earlier DROP was missed, this last
@@ -1668,7 +1726,7 @@ INSERT INTO public.a7_orders (id, user_id, amount, note)
 SELECT create_branch('br_a7');
  create_branch 
 ---------------
-            13
+            14
 (1 row)
 
 SELECT use_branch('br_a7');
@@ -1791,7 +1849,7 @@ RESET overlay_branch.current;
 SELECT create_branch('br_a7_newtab');
  create_branch 
 ---------------
-            14
+            15
 (1 row)
 
 SELECT use_branch('br_a7_newtab');
@@ -1946,7 +2004,7 @@ SELECT CASE WHEN NOT EXISTS (
 SELECT create_branch('br_a7_v2');
  create_branch 
 ---------------
-            15
+            16
 (1 row)
 
 SELECT use_branch('br_a7_v2');
@@ -1984,7 +2042,7 @@ SELECT public.discard_branch('br_a7_v2');
 SELECT create_branch('br_a7_pk');
  create_branch 
 ---------------
-            16
+            17
 (1 row)
 
 SELECT use_branch('br_a7_pk');
@@ -2031,7 +2089,7 @@ SELECT public.discard_branch('br_a7_pk');
 SELECT create_branch('br_a7_ddl_inside');
  create_branch 
 ---------------
-            17
+            18
 (1 row)
 
 SELECT use_branch('br_a7_ddl_inside');
@@ -2143,7 +2201,7 @@ SELECT CASE
 SELECT create_branch('br_a7_z');
  create_branch 
 ---------------
-            18
+            19
 (1 row)
 
 SELECT use_branch('br_a7_z');
@@ -2614,7 +2672,7 @@ INSERT INTO public.t_r24 VALUES (1, 10, 'm1'), (2, 20, 'm2'), (3, 30, 'm3');
 SELECT overlay_branch.create_branch('br_r24');
  create_branch 
 ---------------
-            23
+            24
 (1 row)
 
 SELECT overlay_branch.use_branch('br_r24');
@@ -2880,7 +2938,7 @@ CREATE TABLE public.t_r25c (
 SELECT overlay_branch.create_branch('br_r25');
  create_branch 
 ---------------
-            24
+            25
 (1 row)
 
 SELECT overlay_branch.use_branch('br_r25');
@@ -3104,7 +3162,7 @@ CREATE TABLE public.t_r26p (
 SELECT overlay_branch.create_branch('br_r26');
  create_branch 
 ---------------
-            25
+            26
 (1 row)
 
 SELECT overlay_branch.use_branch('br_r26');
@@ -3288,7 +3346,7 @@ CREATE TABLE public.t_r27f (k d_r27_tz_arr PRIMARY KEY, v text);
 SELECT overlay_branch.create_branch('br_r27');
  create_branch 
 ---------------
-            26
+            27
 (1 row)
 
 SELECT overlay_branch.use_branch('br_r27');
@@ -3510,7 +3568,7 @@ CREATE TABLE public.t_r28c (k bpchar[] PRIMARY KEY, v text);
 SELECT overlay_branch.create_branch('br_r28');
  create_branch 
 ---------------
-            27
+            28
 (1 row)
 
 SELECT overlay_branch.use_branch('br_r28');
@@ -3719,7 +3777,7 @@ CREATE TABLE public.t_r29c (k public.d_r29_iv PRIMARY KEY, v text);
 SELECT overlay_branch.create_branch('br_r29');
  create_branch 
 ---------------
-            28
+            29
 (1 row)
 
 SELECT overlay_branch.use_branch('br_r29');
@@ -3905,7 +3963,7 @@ CREATE TABLE public.t_r30tm (k tsmultirange PRIMARY KEY, v text);
 SELECT overlay_branch.create_branch('br_r30');
  create_branch 
 ---------------
-            29
+            30
 (1 row)
 
 SELECT overlay_branch.use_branch('br_r30');
@@ -4231,7 +4289,7 @@ CREATE TABLE public.t_r31e (id int PRIMARY KEY, m money);
 SELECT overlay_branch.create_branch('br_r31');
  create_branch 
 ---------------
-            30
+            31
 (1 row)
 
 SELECT overlay_branch.use_branch('br_r31');
@@ -4366,7 +4424,7 @@ CREATE TABLE public.t_r32p (k jsonb PRIMARY KEY, v text);
 SELECT overlay_branch.create_branch('br_r32');
  create_branch 
 ---------------
-            31
+            32
 (1 row)
 
 SELECT overlay_branch.use_branch('br_r32');
@@ -4509,7 +4567,7 @@ CREATE TABLE public.t_r33u (id int PRIMARY KEY, ju jsonb UNIQUE);
 SELECT overlay_branch.create_branch('br_r33');
  create_branch 
 ---------------
-            32
+            33
 (1 row)
 
 SELECT overlay_branch.use_branch('br_r33');

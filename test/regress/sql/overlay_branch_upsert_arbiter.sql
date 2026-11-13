@@ -43,6 +43,14 @@
  *   AG.3  neither refused statement wrote a delta row (overlay == MAIN)
  *   AG.4  distinct arbiter keys in one multi-row DO UPDATE still apply
  *   AG.5  MAIN pristine after leaving; apply materializes AG.4
+ *   AH.1  DEFERRABLE INITIALLY DEFERRED: a resolved in-xact swap
+ *         (INSERT a new row + DELETE the older one) is NOT rejected
+ *         eagerly -- native defers the check to COMMIT
+ *   AH.2  MAIN pristine after leaving; apply materializes the swap
+ *   AH.3  INITIALLY DEFERRED unresolved duplicate -> accepted at DML,
+ *         rejected 23505 by MAIN's real constraint at apply
+ *   AH.4  DEFERRABLE INITIALLY IMMEDIATE is still eager -> 23505 at DML
+ *   AH.5  NOT DEFERRABLE UNIQUE is still eager -> 23505 at DML
  *
  * Dependencies:
  *   none (standalone; creates and drops its own tables/branch).
@@ -68,6 +76,10 @@ DROP TABLE IF EXISTS public.bs_AE_plain;
 DROP TABLE IF EXISTS public.bs_AF_up;
 DROP TABLE IF EXISTS public.bs_AF_dn;
 DROP TABLE IF EXISTS public.bs_AG_up;
+DROP TABLE IF EXISTS public.bs_AH_def;
+DROP TABLE IF EXISTS public.bs_AH_confl;
+DROP TABLE IF EXISTS public.bs_AH_ii;
+DROP TABLE IF EXISTS public.bs_AH_nd;
 DROP EXTENSION IF EXISTS overlay_branch CASCADE;
 RESET client_min_messages;
 
@@ -436,3 +448,98 @@ FROM public.bs_AG_up;
 
 RESET client_min_messages;
 DROP TABLE public.bs_AG_up;
+
+/* =========================================================== Section AH */
+-- AH.* DEFERRABLE non-PK UNIQUE constraints.  Native PostgreSQL does not
+--      check a `UNIQUE ... DEFERRABLE INITIALLY DEFERRED` index until
+--      COMMIT, so a transient duplicate that the transaction resolves
+--      (INSERT a new row, DELETE the older one) is legal and must not be
+--      rejected by the eager write-redirect probe.  A DEFERRABLE
+--      INITIALLY IMMEDIATE or NOT DEFERRABLE index, by contrast, is
+--      checked at end of statement and stays eager.
+SET client_min_messages = warning;
+
+-- AH.1/AH.2 INITIALLY DEFERRED: insert a second row holding the same
+--        unique value, then delete the older row -> resolved in the xact.
+CREATE TABLE public.bs_AH_def (id INT4 PRIMARY KEY, u INT4 UNIQUE DEFERRABLE INITIALLY DEFERRED, v TEXT);
+INSERT INTO public.bs_AH_def VALUES (1,100,'m1');
+SELECT overlay_branch.create_branch('bs_AH_def_br');
+SELECT overlay_branch.use_branch('bs_AH_def_br');
+BEGIN;
+INSERT INTO public.bs_AH_def VALUES (2,100,'new');
+DELETE FROM public.bs_AH_def WHERE id = 1;
+COMMIT;
+SELECT CASE WHEN string_agg(id||':'||u||':'||v, ',' ORDER BY id) = '2:100:new'
+            THEN 'PASS:AH1_DEFERRED_SWAP'
+            ELSE 'FAIL:'||coalesce(string_agg(id||':'||u||':'||v, ',' ORDER BY id),'empty') END AS ah1
+FROM overlay_branch.overlay_main_plus_delta('public.bs_AH_def') AS t(id int, u int, v text);
+
+-- AH.2 MAIN pristine after leaving; apply materializes the swap
+SELECT overlay_branch.use_branch(NULL);
+RESET overlay_branch.current;
+SET overlay_branch.current = '';
+SELECT CASE WHEN string_agg(id||':'||u||':'||v, ',' ORDER BY id) = '1:100:m1'
+            THEN 'PASS:AH2_MAIN_PRISTINE'
+            ELSE 'FAIL:'||coalesce(string_agg(id||':'||u||':'||v, ',' ORDER BY id),'empty') END AS ah2
+FROM public.bs_AH_def;
+SELECT overlay_branch.apply_branch('bs_AH_def_br');
+SELECT CASE WHEN string_agg(id||':'||u||':'||v, ',' ORDER BY id) = '2:100:new'
+            THEN 'PASS:AH2_APPLIED'
+            ELSE 'FAIL:'||coalesce(string_agg(id||':'||u||':'||v, ',' ORDER BY id),'empty') END AS ah2b
+FROM public.bs_AH_def;
+
+-- AH.3 INITIALLY DEFERRED: an UNRESOLVED duplicate is accepted at DML
+--        time and only rejected by MAIN's real constraint at apply.
+CREATE TABLE public.bs_AH_confl (id INT4 PRIMARY KEY, u INT4 UNIQUE DEFERRABLE INITIALLY DEFERRED, v TEXT);
+INSERT INTO public.bs_AH_confl VALUES (1,100,'m1');
+SELECT overlay_branch.create_branch('bs_AH_confl_br');
+SELECT overlay_branch.use_branch('bs_AH_confl_br');
+INSERT INTO public.bs_AH_confl VALUES (2,100,'dup');
+SELECT CASE WHEN string_agg(id||':'||u||':'||v, ',' ORDER BY id) = '1:100:m1,2:100:dup'
+            THEN 'PASS:AH3_UNRESOLVED_ACCEPTED'
+            ELSE 'FAIL:'||coalesce(string_agg(id||':'||u||':'||v, ',' ORDER BY id),'empty') END AS ah3
+FROM overlay_branch.overlay_main_plus_delta('public.bs_AH_confl') AS t(id int, u int, v text);
+SELECT overlay_branch.use_branch(NULL);
+-- apply materializes the delta; MAIN's real (still INITIALLY DEFERRED)
+-- constraint fires when the statement commits -> ERROR 23505.
+SELECT overlay_branch.apply_branch('bs_AH_confl_br');
+SELECT overlay_branch.discard_branch('bs_AH_confl_br');
+
+-- AH.4 DEFERRABLE INITIALLY IMMEDIATE is checked at end of statement, so
+--        a bump into a duplicate is still rejected eagerly at DML time.
+CREATE TABLE public.bs_AH_ii (id INT4 PRIMARY KEY, u INT4 UNIQUE DEFERRABLE INITIALLY IMMEDIATE, v TEXT);
+INSERT INTO public.bs_AH_ii VALUES (1,100,'m1');
+SELECT overlay_branch.create_branch('bs_AH_ii_br');
+SELECT overlay_branch.use_branch('bs_AH_ii_br');
+DO $$
+BEGIN
+  BEGIN
+    INSERT INTO public.bs_AH_ii VALUES (2,100,'dup');
+    RAISE EXCEPTION 'FAIL_AH4_NO_ERROR';
+  EXCEPTION WHEN unique_violation THEN NULL;
+  END;
+END $$;
+SELECT overlay_branch.use_branch(NULL);
+SELECT overlay_branch.discard_branch('bs_AH_ii_br');
+
+-- AH.5 NOT DEFERRABLE UNIQUE stays eager (regression guard for the skip).
+CREATE TABLE public.bs_AH_nd (id INT4 PRIMARY KEY, u INT4 UNIQUE, v TEXT);
+INSERT INTO public.bs_AH_nd VALUES (1,100,'m1');
+SELECT overlay_branch.create_branch('bs_AH_nd_br');
+SELECT overlay_branch.use_branch('bs_AH_nd_br');
+DO $$
+BEGIN
+  BEGIN
+    INSERT INTO public.bs_AH_nd VALUES (2,100,'dup');
+    RAISE EXCEPTION 'FAIL_AH5_NO_ERROR';
+  EXCEPTION WHEN unique_violation THEN NULL;
+  END;
+END $$;
+SELECT overlay_branch.use_branch(NULL);
+SELECT overlay_branch.discard_branch('bs_AH_nd_br');
+
+RESET client_min_messages;
+DROP TABLE public.bs_AH_def;
+DROP TABLE public.bs_AH_confl;
+DROP TABLE public.bs_AH_ii;
+DROP TABLE public.bs_AH_nd;

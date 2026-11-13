@@ -544,6 +544,22 @@ values) or its pre-existing delta row (the PRE-image) would match and raise a
 spurious `23505`. An UPSERT `DO UPDATE` post-image is enforced identically, with
 the conflicted source row excluded the same way.
 
+**DEFERRABLE INITIALLY DEFERRED indexes are not eagerly enforced.** An index
+declared `UNIQUE ... DEFERRABLE INITIALLY DEFERRED` is checked by native
+PostgreSQL only at COMMIT, so a transaction may legally hold a transient
+duplicate it then resolves (INSERT a second row carrying the value, DELETE the
+older one). The redirect's eager `23505` probes — the plain-INSERT/UPDATE
+pre-checks and the arbiter residual scan — are suppressed for such an index, so
+the branch write is accepted and the duplicate, if the transaction never
+resolves it, is rejected by MAIN's real constraint at `apply_branch` instead.
+The skip must read the *runtime* mode: `pg_index.indimmediate` alone is
+`!condeferrable`, so it is `false` for both INITIALLY DEFERRED and INITIALLY
+IMMEDIATE; the redirect therefore looks up `pg_constraint.condeferred` for the
+index's constraint and skips only when it is `true`. A `DEFERRABLE INITIALLY
+IMMEDIATE` or `NOT DEFERRABLE` index is checked at end of statement and stays
+eager (PostgreSQL exposes no runtime API to observe a `SET CONSTRAINTS`
+override, so the declared mode is what the redirect models).
+
 **Arbiter selection and the eager residual check.** `ON CONFLICT (target)`
 resolves to exactly one arbiter index. A **PK arbiter** keeps the fast
 `d.key` / PK-ctid probe; a **non-primary UNIQUE arbiter** (keyed or keyless)
@@ -651,16 +667,21 @@ BPCHAR / NUMERIC / TIMESTAMPTZ stay correct (§2).
 ### 1.8 Scope & gating + ACL double-defense
 
 Unsupported objects are rejected at `create_branch` time (0A000/55000). The G01
-support matrix has nine categories, ordered "most user-harmful first" so the
+support matrix has ten categories, ordered "most user-harmful first" so the
 first hit is reported: foreign keys; user triggers; partitioned / inherited
 tables; UNLOGGED tables; GENERATED STORED columns; any relkind other than
 ordinary table (`r`) / sequence (`S`) / btree index (`i`) (foreign tables,
 views, matviews, …); a non-deterministic (ICU) collation on a PRIMARY KEY
-column; and a `citext` PRIMARY KEY column (reached through any chain of domain
+column; a `citext` PRIMARY KEY column (reached through any chain of domain
 (`typbasetype`) and array (`typelem`) wrappers — e.g. `citext[]`, a domain over
 `citext`, a domain over `citext[]`, or an array of such a domain) — both of the
 last two because their equality classes cannot be
-represented by a text delta key (§1.5). The
+represented by a text delta key (§1.5); and a PRIMARY KEY declared DEFERRABLE
+INITIALLY DEFERRED (single- or multi-column). The deferred PK is refused because
+the delta's identity key **is** the serialized PK, so the delta — being keyed on
+`(branch_id, relid, key)` — cannot hold the transient duplicate PK that native
+tolerates by deferring the uniqueness check to COMMIT; an INITIALLY IMMEDIATE PK
+is checked at end of statement and stays supported. The
 guard checks cheapest-first (relkind, `relispartition`, user
 triggers, foreign keys, then no-PK). The per-DML executor guard validates only
 the statement's DML **target** relations (the `ModifyTable` result relations):
