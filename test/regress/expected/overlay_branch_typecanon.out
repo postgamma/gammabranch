@@ -1,0 +1,956 @@
+/*
+ * overlay_branch_typecanon.sql — eager non-PK UNIQUE probe and PK-identity canonicalization.
+ *
+ * Purpose:  a branch-local write must reject, at write time, a value that
+ *           duplicates a non-PK UNIQUE column (delta U MAIN U same-command
+ *           claims), and two '='-equal PK values whose text rendering differs
+ *           (NUMERIC display scale, GUC-sensitive output functions, DOMAIN
+ *           chains) must fold to ONE delta identity key.
+ *
+ * Coverage: R24 eager non-PK UNIQUE enforcement (23505) across MAIN/delta/
+ *               same-command, NULLS DISTINCT, UPDATE self-exclusion;
+ *           R25 NUMERIC identity canonicalization (1.0 vs 1.00);
+ *           R26 GUC-sensitive output functions in a PK identity;
+ *           R27 DOMAIN over GUC-sensitive base types in a PK.
+ *
+ * Dependencies: none beyond overlay_branch.
+ */
+-- ===== 0. Prerequisite guard (same as the other regression files) =====
+DO $$
+DECLARE
+  _s text := current_setting('shared_preload_libraries', true);
+BEGIN
+  IF _s NOT LIKE '%overlay_branch%' THEN
+    RAISE EXCEPTION 'Postmaster started WITHOUT shared_preload_libraries=''overlay_branch''';
+  END IF;
+END $$;
+-- ===== Idempotent cleanup =====
+SET client_min_messages = warning;
+DROP TABLE IF EXISTS public.t_r24 CASCADE;
+DROP TABLE IF EXISTS public.t_r25 CASCADE;
+DROP TABLE IF EXISTS public.t_r25u CASCADE;
+DROP TABLE IF EXISTS public.t_r25c CASCADE;
+DROP TABLE IF EXISTS public.t_r26a CASCADE;
+DROP TABLE IF EXISTS public.t_r26b CASCADE;
+DROP TABLE IF EXISTS public.t_r26c CASCADE;
+DROP TABLE IF EXISTS public.t_r26p CASCADE;
+DROP TABLE IF EXISTS public.t_r27a CASCADE;
+DROP TABLE IF EXISTS public.t_r27b CASCADE;
+DROP TABLE IF EXISTS public.t_r27c CASCADE;
+DROP TABLE IF EXISTS public.t_r27d CASCADE;
+DROP TABLE IF EXISTS public.t_r27e CASCADE;
+DROP TABLE IF EXISTS public.t_r27f CASCADE;
+DROP DOMAIN IF EXISTS public.d_r27_tz CASCADE;
+DROP DOMAIN IF EXISTS public.d_r27_ts CASCADE;
+DROP DOMAIN IF EXISTS public.d_r27_iv CASCADE;
+DROP DOMAIN IF EXISTS public.d_r27_num CASCADE;
+DROP DOMAIN IF EXISTS public.d_r27_f8 CASCADE;
+DROP DOMAIN IF EXISTS public.d_r27_tz_arr CASCADE;
+DROP EXTENSION IF EXISTS overlay_branch CASCADE;
+RESET client_min_messages;
+CREATE EXTENSION IF NOT EXISTS overlay_branch;
+SET client_min_messages = WARNING;
+-- =====================================================================
+-- Section R24 : Eager non-PK UNIQUE enforcement on branch-local writes.
+--
+--   A branch-managed table may carry a UNIQUE index that is not the PK.
+--   The write-redirect must reject a branch-local INSERT / UPDATE / UPSERT
+--   that would duplicate such a value with the native SQLSTATE (23505) at
+--   write time, instead of silently storing an unappliable delta row whose
+--   conflict would surface only at apply_branch.  The probe spans the
+--   branch delta (live op I/U rows), the shadow-aware MAIN side, and — as
+--   the command counter does not advance between rows of one command — a
+--   per-statement same-command claim set.  The UPDATE / UPSERT source row
+--   is excluded by its MAIN anchor ctid and its delta key, so rewriting a
+--   row without moving its UNIQUE value never raises a false positive.
+--
+-- COVERAGE:
+--   R24_A : plain INSERT collides with a MAIN row's UNIQUE value    -> 23505
+--   R24_B : two rows of ONE INSERT propose the same UNIQUE value    -> 23505
+--   R24_C : MAIN-anchored UPDATE moves the UNIQUE value onto a peer -> 23505
+--   R24_D : MAIN-anchored UPDATE leaves the UNIQUE value untouched  -> OK
+--   R24_E : one UPDATE sets two rows to the same UNIQUE value       -> 23505
+--   R24_F : NULLS DISTINCT — several NULLs coexist                  -> OK
+--   R24_G : UPSERT (arbiter=PK) DO UPDATE collides on peer UNIQUE   -> 23505
+--   R24_H : targetless DO NOTHING on a peer-UNIQUE conflict         -> skip
+--   R24_I : pure-delta UPDATE moves onto a live MAIN value          -> 23505
+--   R24_J : legal INSERT / UPDATE still succeed (no false positive)
+--   R24_K : MAIN pristine after leaving the branch; apply materializes
+-- =====================================================================
+SET client_min_messages = WARNING;
+CREATE TABLE public.t_r24 (
+    id  integer PRIMARY KEY,
+    u   integer UNIQUE,
+    v   text
+);
+INSERT INTO public.t_r24 VALUES (1, 10, 'm1'), (2, 20, 'm2'), (3, 30, 'm3');
+SELECT overlay_branch.create_branch('br_r24');
+ create_branch 
+---------------
+             1
+(1 row)
+
+SELECT overlay_branch.use_branch('br_r24');
+ use_branch 
+------------
+ 
+(1 row)
+
+-- R24_A: a plain INSERT whose UNIQUE value collides with a MAIN row.
+DO $$
+BEGIN
+    BEGIN
+        INSERT INTO public.t_r24 VALUES (9, 10, 'dup_main');
+        RAISE EXCEPTION 'FAIL_R24_A_NO_ERROR';
+    EXCEPTION WHEN OTHERS THEN
+        IF SQLSTATE <> '23505' THEN
+            RAISE EXCEPTION 'FAIL_R24_A: expected 23505 got %: %', SQLSTATE, SQLERRM;
+        END IF;
+    END;
+END $$;
+SELECT CASE WHEN count(*) = 0 THEN 'PASS:R24_A_INSERT_DUP_UNIQUE_23505'
+            ELSE 'FAIL:R24_A delta_rows=' || count(*) END AS r24_a
+  FROM overlay_branch.pg_branch_delta d
+  JOIN overlay_branch.pg_branch b USING (branch_id)
+ WHERE b.branch_name = 'br_r24';
+               r24_a                
+------------------------------------
+ PASS:R24_A_INSERT_DUP_UNIQUE_23505
+(1 row)
+
+-- R24_B: one INSERT, two rows, same UNIQUE value in the SAME command
+--        (the command counter does not advance, so the delta probe cannot
+--        see the sibling row — the same-command claim set must catch it).
+DO $$
+BEGIN
+    BEGIN
+        INSERT INTO public.t_r24 VALUES (7, 11, 'b1'), (8, 11, 'b2');
+        RAISE EXCEPTION 'FAIL_R24_B_NO_ERROR';
+    EXCEPTION WHEN OTHERS THEN
+        IF SQLSTATE <> '23505' THEN
+            RAISE EXCEPTION 'FAIL_R24_B: expected 23505 got %: %', SQLSTATE, SQLERRM;
+        END IF;
+    END;
+END $$;
+SELECT CASE WHEN count(*) = 0 THEN 'PASS:R24_B_SAME_STMT_INSERT_23505'
+            ELSE 'FAIL:R24_B delta_rows=' || count(*) END AS r24_b
+  FROM overlay_branch.pg_branch_delta d
+  JOIN overlay_branch.pg_branch b USING (branch_id)
+ WHERE b.branch_name = 'br_r24';
+               r24_b               
+-----------------------------------
+ PASS:R24_B_SAME_STMT_INSERT_23505
+(1 row)
+
+-- R24_C: a MAIN-anchored UPDATE that moves u onto a peer's live value.
+DO $$
+BEGIN
+    BEGIN
+        UPDATE public.t_r24 SET u = 20 WHERE id = 1;
+        RAISE EXCEPTION 'FAIL_R24_C_NO_ERROR';
+    EXCEPTION WHEN OTHERS THEN
+        IF SQLSTATE <> '23505' THEN
+            RAISE EXCEPTION 'FAIL_R24_C: expected 23505 got %: %', SQLSTATE, SQLERRM;
+        END IF;
+    END;
+END $$;
+SELECT CASE WHEN u = 10 THEN 'PASS:R24_C_UPDATE_DUP_UNIQUE_23505'
+            ELSE 'FAIL:R24_C u=' || u END AS r24_c
+  FROM public.t_r24 WHERE id = 1;
+               r24_c                
+------------------------------------
+ PASS:R24_C_UPDATE_DUP_UNIQUE_23505
+(1 row)
+
+-- R24_D: a MAIN-anchored UPDATE that leaves u untouched is legal (the row
+--        must not be counted as a conflict against itself).
+UPDATE public.t_r24 SET v = 'm1b' WHERE id = 1;
+SELECT CASE WHEN v = 'm1b' AND u = 10 THEN 'PASS:R24_D_UPDATE_SELF_OK'
+            ELSE 'FAIL:R24_D v=' || v || ' u=' || u END AS r24_d
+  FROM public.t_r24 WHERE id = 1;
+           r24_d           
+---------------------------
+ PASS:R24_D_UPDATE_SELF_OK
+(1 row)
+
+-- R24_E: one UPDATE setting two rows' u to the same value.
+DO $$
+BEGIN
+    BEGIN
+        UPDATE public.t_r24 SET u = 99 WHERE id IN (1, 2);
+        RAISE EXCEPTION 'FAIL_R24_E_NO_ERROR';
+    EXCEPTION WHEN OTHERS THEN
+        IF SQLSTATE <> '23505' THEN
+            RAISE EXCEPTION 'FAIL_R24_E: expected 23505 got %: %', SQLSTATE, SQLERRM;
+        END IF;
+    END;
+END $$;
+SELECT CASE WHEN count(*) = 2 THEN 'PASS:R24_E_SAME_STMT_UPDATE_23505'
+            ELSE 'FAIL:R24_E cnt=' || count(*) END AS r24_e
+  FROM public.t_r24 WHERE id IN (1, 2) AND u IN (10, 20);
+               r24_e               
+-----------------------------------
+ PASS:R24_E_SAME_STMT_UPDATE_23505
+(1 row)
+
+-- R24_F: NULLS DISTINCT — many NULL UNIQUE values coexist.
+INSERT INTO public.t_r24 VALUES (11, NULL, 'n1'), (12, NULL, 'n2');
+SELECT CASE WHEN count(*) = 2 THEN 'PASS:R24_F_NULLS_DISTINCT_OK'
+            ELSE 'FAIL:R24_F null_cnt=' || count(*) END AS r24_f
+  FROM public.t_r24 WHERE id IN (11, 12) AND u IS NULL;
+            r24_f             
+------------------------------
+ PASS:R24_F_NULLS_DISTINCT_OK
+(1 row)
+
+-- R24_G: UPSERT (arbiter=PK) DO UPDATE whose SET collides on the peer UNIQUE.
+DO $$
+BEGIN
+    BEGIN
+        INSERT INTO public.t_r24 VALUES (3, 10, 'g')
+            ON CONFLICT (id) DO UPDATE SET u = EXCLUDED.u;
+        RAISE EXCEPTION 'FAIL_R24_G_NO_ERROR';
+    EXCEPTION WHEN OTHERS THEN
+        IF SQLSTATE <> '23505' THEN
+            RAISE EXCEPTION 'FAIL_R24_G: expected 23505 got %: %', SQLSTATE, SQLERRM;
+        END IF;
+    END;
+END $$;
+SELECT CASE WHEN u = 30 THEN 'PASS:R24_G_UPSERT_DOUPDATE_23505'
+            ELSE 'FAIL:R24_G u=' || u END AS r24_g
+  FROM public.t_r24 WHERE id = 3;
+              r24_g               
+----------------------------------
+ PASS:R24_G_UPSERT_DOUPDATE_23505
+(1 row)
+
+-- R24_H: targetless DO NOTHING against a peer-UNIQUE conflict skips silently.
+INSERT INTO public.t_r24 VALUES (9, 10, 'h') ON CONFLICT DO NOTHING;
+SELECT CASE WHEN count(*) = 0 THEN 'PASS:R24_H_TARGETLESS_DONOTHING_SKIP'
+            ELSE 'FAIL:R24_H inserted=' || count(*) END AS r24_h
+  FROM public.t_r24 WHERE id = 9;
+                r24_h                 
+--------------------------------------
+ PASS:R24_H_TARGETLESS_DONOTHING_SKIP
+(1 row)
+
+-- R24_I: a pure-delta row's UPDATE moving u onto a live MAIN value.
+INSERT INTO public.t_r24 VALUES (14, 14, 'i1');
+DO $$
+BEGIN
+    BEGIN
+        UPDATE public.t_r24 SET u = 10 WHERE id = 14;
+        RAISE EXCEPTION 'FAIL_R24_I_NO_ERROR';
+    EXCEPTION WHEN OTHERS THEN
+        IF SQLSTATE <> '23505' THEN
+            RAISE EXCEPTION 'FAIL_R24_I: expected 23505 got %: %', SQLSTATE, SQLERRM;
+        END IF;
+    END;
+END $$;
+SELECT CASE WHEN u = 14 THEN 'PASS:R24_I_PUREDELTA_UPDATE_23505'
+            ELSE 'FAIL:R24_I u=' || u END AS r24_i
+  FROM public.t_r24 WHERE id = 14;
+               r24_i               
+-----------------------------------
+ PASS:R24_I_PUREDELTA_UPDATE_23505
+(1 row)
+
+-- R24_J: legal INSERT / UPDATE must still succeed (no false positive).
+INSERT INTO public.t_r24 VALUES (15, 15, 'j1');
+UPDATE public.t_r24 SET u = 16 WHERE id = 2;
+SELECT CASE WHEN count(*) = 1 THEN 'PASS:R24_J_LEGAL_INSERT_OK'
+            ELSE 'FAIL:R24_J cnt=' || count(*) END AS r24_j
+  FROM public.t_r24 WHERE id = 15 AND u = 15;
+           r24_j            
+----------------------------
+ PASS:R24_J_LEGAL_INSERT_OK
+(1 row)
+
+SELECT CASE WHEN u = 16 THEN 'PASS:R24_J_LEGAL_UPDATE_OK'
+            ELSE 'FAIL:R24_J u=' || u END AS r24_j2
+  FROM public.t_r24 WHERE id = 2;
+           r24_j2           
+----------------------------
+ PASS:R24_J_LEGAL_UPDATE_OK
+(1 row)
+
+-- R24_K: MAIN pristine until apply; apply materializes the delta.
+SELECT overlay_branch.use_branch(NULL);
+ use_branch 
+------------
+ 
+(1 row)
+
+RESET overlay_branch.current;
+SET overlay_branch.current = '';
+SELECT CASE WHEN count(*) = 3 THEN 'PASS:R24_K_MAIN_PRISTINE'
+            ELSE 'FAIL:R24_K main_cnt=' || count(*) END AS r24_k
+  FROM public.t_r24;
+          r24_k           
+--------------------------
+ PASS:R24_K_MAIN_PRISTINE
+(1 row)
+
+SELECT overlay_branch.apply_branch('br_r24');
+ apply_branch 
+--------------
+ 
+(1 row)
+
+SELECT CASE WHEN count(*) = 7 THEN 'PASS:R24_K_APPLY_MATERIALIZED'
+            ELSE 'FAIL:R24_K applied_cnt=' || count(*) END AS r24_k2
+  FROM public.t_r24;
+            r24_k2             
+-------------------------------
+ PASS:R24_K_APPLY_MATERIALIZED
+(1 row)
+
+-- R24 teardown (the branch is left in the terminal 'applied' state, like the
+-- other apply-based sections; only the table is dropped).
+RESET client_min_messages;
+DROP TABLE public.t_r24;
+RESET client_min_messages;
+-- =====================================================================
+-- Section R25 : NUMERIC identity canonicalization on branch writes.
+--
+--   The delta row identity is the serialized PK text stored in
+--   pg_branch_delta(branch_id, relid, key).  On a NUMERIC PK *without* a
+--   column typmod, two values that are '='-equal can print with a different
+--   display scale (1.0 vs 1.00).  Both the slot serializer and the
+--   literal serializer must canonicalize them to ONE identity key; if they
+--   do not, the delta would hold two rows for one logical row and every
+--   text-key probe (the R21 delta pre-check, the UPSERT Phase I probe and
+--   the O(1) delta lookup) would miss the shadowing row.  A branch INSERT
+--   of an '='-equal PK would then silently succeed instead of raising the
+--   native 23505, and a UPSERT DO NOTHING would duplicate the row.
+--
+-- COVERAGE:
+--   R25_A : cross-statement INSERT, numeric PK 1.0 then 1.00          -> 23505
+--   R25_B : same-statement INSERT of 2.0 / 2.00 (one command)         -> 23505
+--   R25_C : UPSERT DO UPDATE with a different scale updates in place   -> 1 row
+--   R25_D : UPSERT DO NOTHING with a different scale skips             -> 1 row
+--   R25_E : const-based O(1) delta lookup (UPDATE/DELETE WHERE pk=x.00)
+--   R25_F : peer UNIQUE(numeric) cross-statement duplicate             -> 23505
+--   R25_G : composite PK (numeric,int) cross-statement duplicate       -> 23505
+--   R25_H : MAIN pristine; apply materializes the canonical rows
+-- =====================================================================
+SET client_min_messages = WARNING;
+CREATE TABLE public.t_r25 (
+    id  numeric PRIMARY KEY,
+    v   text
+);
+CREATE TABLE public.t_r25u (
+    id  integer PRIMARY KEY,
+    u   numeric UNIQUE,
+    v   text
+);
+CREATE TABLE public.t_r25c (
+    a   numeric,
+    b   integer,
+    v   text,
+    PRIMARY KEY (a, b)
+);
+SELECT overlay_branch.create_branch('br_r25');
+ create_branch 
+---------------
+             2
+(1 row)
+
+SELECT overlay_branch.use_branch('br_r25');
+ use_branch 
+------------
+ 
+(1 row)
+
+-- R25_A: cross-statement INSERT of '='-equal numeric PKs -> 23505.
+INSERT INTO public.t_r25 VALUES (1.0, 'a');
+DO $$
+BEGIN
+    BEGIN
+        INSERT INTO public.t_r25 VALUES (1.00, 'b');
+        RAISE EXCEPTION 'FAIL_R25_A_NO_ERROR';
+    EXCEPTION WHEN OTHERS THEN
+        IF SQLSTATE <> '23505' THEN
+            RAISE EXCEPTION 'FAIL_R25_A: expected 23505 got %: %', SQLSTATE, SQLERRM;
+        END IF;
+    END;
+END $$;
+SELECT CASE WHEN count(*) = 1 THEN 'PASS:R25_A_CROSS_STMT_23505'
+            ELSE 'FAIL:R25_A rows=' || count(*) END AS r25_a
+  FROM public.t_r25 WHERE id = 1;
+            r25_a            
+-----------------------------
+ PASS:R25_A_CROSS_STMT_23505
+(1 row)
+
+-- R25_B: same-statement INSERT of 2.0 and 2.00 -> 23505.
+DO $$
+BEGIN
+    BEGIN
+        INSERT INTO public.t_r25 VALUES (2.0, 'x'), (2.00, 'y');
+        RAISE EXCEPTION 'FAIL_R25_B_NO_ERROR';
+    EXCEPTION WHEN OTHERS THEN
+        IF SQLSTATE <> '23505' THEN
+            RAISE EXCEPTION 'FAIL_R25_B: expected 23505 got %: %', SQLSTATE, SQLERRM;
+        END IF;
+    END;
+END $$;
+SELECT CASE WHEN count(*) = 0 THEN 'PASS:R25_B_SAME_STMT_23505'
+            ELSE 'FAIL:R25_B rows=' || count(*) END AS r25_b
+  FROM public.t_r25 WHERE id = 2;
+           r25_b            
+----------------------------
+ PASS:R25_B_SAME_STMT_23505
+(1 row)
+
+-- R25_C: UPSERT (arbiter=PK) DO UPDATE with a different scale adopts the
+--        EXCLUDED post-image without creating a second delta row.
+INSERT INTO public.t_r25 VALUES (3.0, 'first');
+INSERT INTO public.t_r25 VALUES (3.00, 'second') ON CONFLICT (id) DO UPDATE SET v = EXCLUDED.v;
+SELECT CASE WHEN count(*) = 1 AND min(v) = 'second'
+            THEN 'PASS:R25_C_UPSERT_DOUPDATE_ONE_ROW'
+            ELSE 'FAIL:R25_C rows=' || count(*) || ' v=' || min(v) END AS r25_c
+  FROM public.t_r25 WHERE id = 3;
+               r25_c                
+------------------------------------
+ PASS:R25_C_UPSERT_DOUPDATE_ONE_ROW
+(1 row)
+
+-- R25_D: UPSERT DO NOTHING with a different scale skips (no duplicate).
+INSERT INTO public.t_r25 VALUES (4.0, 'keep');
+INSERT INTO public.t_r25 VALUES (4.00, 'drop') ON CONFLICT (id) DO NOTHING;
+SELECT CASE WHEN count(*) = 1 AND min(v) = 'keep'
+            THEN 'PASS:R25_D_UPSERT_DONOTHING_ONE_ROW'
+            ELSE 'FAIL:R25_D rows=' || count(*) || ' v=' || min(v) END AS r25_d
+  FROM public.t_r25 WHERE id = 4;
+                r25_d                
+-------------------------------------
+ PASS:R25_D_UPSERT_DONOTHING_ONE_ROW
+(1 row)
+
+-- R25_E: const-based O(1) delta lookup — a differently scaled literal must
+--        find the branch row (id = 1.00 hits the row inserted as 1.0).
+UPDATE public.t_r25 SET v = 'upd' WHERE id = 1.00;
+SELECT CASE WHEN v = 'upd' THEN 'PASS:R25_E_CONST_LOOKUP_UPDATE'
+            ELSE 'FAIL:R25_E v=' || v END AS r25_e
+  FROM public.t_r25 WHERE id = 1;
+             r25_e              
+--------------------------------
+ PASS:R25_E_CONST_LOOKUP_UPDATE
+(1 row)
+
+INSERT INTO public.t_r25 VALUES (5.0, 'five');
+DELETE FROM public.t_r25 WHERE id = 5.000;
+SELECT CASE WHEN count(*) = 0 THEN 'PASS:R25_E_CONST_LOOKUP_DELETE'
+            ELSE 'FAIL:R25_E rows=' || count(*) END AS r25_e2
+  FROM public.t_r25 WHERE id = 5;
+             r25_e2             
+--------------------------------
+ PASS:R25_E_CONST_LOOKUP_DELETE
+(1 row)
+
+-- R25_F: peer UNIQUE(numeric) — cross-statement duplicate -> 23505.
+INSERT INTO public.t_r25u VALUES (1, 10.0, 'u1');
+DO $$
+BEGIN
+    BEGIN
+        INSERT INTO public.t_r25u VALUES (2, 10.00, 'u2');
+        RAISE EXCEPTION 'FAIL_R25_F_NO_ERROR';
+    EXCEPTION WHEN OTHERS THEN
+        IF SQLSTATE <> '23505' THEN
+            RAISE EXCEPTION 'FAIL_R25_F: expected 23505 got %: %', SQLSTATE, SQLERRM;
+        END IF;
+    END;
+END $$;
+SELECT CASE WHEN count(*) = 1 THEN 'PASS:R25_F_PEER_UNIQUE_23505'
+            ELSE 'FAIL:R25_F rows=' || count(*) END AS r25_f
+  FROM public.t_r25u;
+            r25_f             
+------------------------------
+ PASS:R25_F_PEER_UNIQUE_23505
+(1 row)
+
+-- R25_G: composite PK with a numeric component — cross-statement dup -> 23505.
+INSERT INTO public.t_r25c VALUES (7.0, 1, 'g1');
+DO $$
+BEGIN
+    BEGIN
+        INSERT INTO public.t_r25c VALUES (7.00, 1, 'g2');
+        RAISE EXCEPTION 'FAIL_R25_G_NO_ERROR';
+    EXCEPTION WHEN OTHERS THEN
+        IF SQLSTATE <> '23505' THEN
+            RAISE EXCEPTION 'FAIL_R25_G: expected 23505 got %: %', SQLSTATE, SQLERRM;
+        END IF;
+    END;
+END $$;
+SELECT CASE WHEN count(*) = 1 THEN 'PASS:R25_G_COMPOSITE_PK_23505'
+            ELSE 'FAIL:R25_G rows=' || count(*) END AS r25_g
+  FROM public.t_r25c;
+             r25_g             
+-------------------------------
+ PASS:R25_G_COMPOSITE_PK_23505
+(1 row)
+
+-- R25_H: MAIN pristine until apply; apply materializes the canonical rows.
+SELECT overlay_branch.use_branch(NULL);
+ use_branch 
+------------
+ 
+(1 row)
+
+RESET overlay_branch.current;
+SET overlay_branch.current = '';
+SELECT CASE WHEN count(*) = 0 THEN 'PASS:R25_H_MAIN_PRISTINE'
+            ELSE 'FAIL:R25_H main_rows=' || count(*) END AS r25_h
+  FROM public.t_r25;
+          r25_h           
+--------------------------
+ PASS:R25_H_MAIN_PRISTINE
+(1 row)
+
+SELECT overlay_branch.apply_branch('br_r25');
+ apply_branch 
+--------------
+ 
+(1 row)
+
+SELECT CASE WHEN count(*) = 3 AND count(DISTINCT id) = 3
+            THEN 'PASS:R25_H_APPLY_MATERIALIZED'
+            ELSE 'FAIL:R25_H applied_rows=' || count(*) END AS r25_h2
+  FROM public.t_r25;
+            r25_h2             
+-------------------------------
+ PASS:R25_H_APPLY_MATERIALIZED
+(1 row)
+
+-- R25 teardown (branch left in the terminal 'applied' state).
+DROP TABLE public.t_r25;
+DROP TABLE public.t_r25u;
+DROP TABLE public.t_r25c;
+RESET client_min_messages;
+-- =====================================================================
+-- Section R26 : GUC-dependent output functions vs. branch identity/payload.
+--
+--   A delta row is stored as TEXT: the identity key under
+--   pg_branch_delta(branch_id, relid, key) and the row image under
+--   tuple_data.  Both are produced through the column type's OUTPUT
+--   function and consumed by a *different* session's INPUT function.  A
+--   handful of output functions read session GUCs (TimeZone/DateStyle for
+--   the date-time family, IntervalStyle for interval, extra_float_digits
+--   for float, bytea_output for bytea).  If the serializer honours the
+--   writing session's settings, two sessions disagree: '='-equal PKs
+--   render to different identity texts (two delta rows, every text-key
+--   probe misses -> a duplicate INSERT silently succeeds) and the payload
+--   re-parses into a DIFFERENT value (silent corruption).  The serializer
+--   must pin the canonical output GUCs; the constant-probe path must do
+--   the same.  float8 +/-0.0 are '='-equal (float8eq) yet print "-0"/"0"
+--   and must collapse to one key.
+--
+-- COVERAGE:
+--   R26_A : timestamptz PK, same instant under TimeZone UTC / Asia/Shanghai -> 23505
+--   R26_B : float8 PK, -0.0 and +0.0                                        -> 23505
+--   R26_C : bytea PK, hex vs escape spelling of the same bytes              -> 23505
+--   R26_D : payload round-trip under SQL,DMY / sql_standard / ef=0
+--           (timestamp + timestamptz + interval + float8)              -> value preserved
+--   R26_E : MAIN pristine; apply materializes the canonical rows
+-- =====================================================================
+SET client_min_messages = WARNING;
+CREATE TABLE public.t_r26a (
+    k   timestamptz PRIMARY KEY,
+    v   text
+);
+CREATE TABLE public.t_r26b (
+    k   float8 PRIMARY KEY,
+    v   text
+);
+CREATE TABLE public.t_r26c (
+    k   bytea PRIMARY KEY,
+    v   text
+);
+CREATE TABLE public.t_r26p (
+    id  integer PRIMARY KEY,
+    ts  timestamp,
+    tz  timestamptz,
+    iv  interval,
+    f   float8
+);
+SELECT overlay_branch.create_branch('br_r26');
+ create_branch 
+---------------
+             3
+(1 row)
+
+SELECT overlay_branch.use_branch('br_r26');
+ use_branch 
+------------
+ 
+(1 row)
+
+-- R26_A: timestamptz PK — the SAME instant written under two TimeZone
+--        settings must fold to one canonical identity key -> 23505.
+SET TimeZone = 'UTC';
+INSERT INTO public.t_r26a VALUES ('2024-06-01 00:00:00+00', 'a');
+SET TimeZone = 'Asia/Shanghai';
+DO $$
+BEGIN
+    BEGIN
+        INSERT INTO public.t_r26a VALUES ('2024-06-01 08:00:00+08', 'b');
+        RAISE EXCEPTION 'FAIL_R26_A_NO_ERROR';
+    EXCEPTION WHEN OTHERS THEN
+        IF SQLSTATE <> '23505' THEN
+            RAISE EXCEPTION 'FAIL_R26_A: expected 23505 got %: %', SQLSTATE, SQLERRM;
+        END IF;
+    END;
+END $$;
+SELECT CASE WHEN count(*) = 1 THEN 'PASS:R26_A_TSTZ_IDENTITY_23505'
+            ELSE 'FAIL:R26_A rows=' || count(*) END AS r26_a
+  FROM public.t_r26a WHERE k = '2024-06-01 00:00:00+00'::timestamptz;
+             r26_a              
+--------------------------------
+ PASS:R26_A_TSTZ_IDENTITY_23505
+(1 row)
+
+RESET TimeZone;
+-- R26_B: float8 PK — -0.0 and +0.0 are '='-equal -> one identity key.
+INSERT INTO public.t_r26b VALUES ('-0'::float8, 'neg');
+DO $$
+BEGIN
+    BEGIN
+        INSERT INTO public.t_r26b VALUES ('0'::float8, 'pos');
+        RAISE EXCEPTION 'FAIL_R26_B_NO_ERROR';
+    EXCEPTION WHEN OTHERS THEN
+        IF SQLSTATE <> '23505' THEN
+            RAISE EXCEPTION 'FAIL_R26_B: expected 23505 got %: %', SQLSTATE, SQLERRM;
+        END IF;
+    END;
+END $$;
+SELECT CASE WHEN count(*) = 1 AND min(v) = 'neg'
+            THEN 'PASS:R26_B_FLOAT_NEGZERO_23505'
+            ELSE 'FAIL:R26_B rows=' || count(*) || ' v=' || min(v) END AS r26_b
+  FROM public.t_r26b WHERE k = 0;
+             r26_b              
+--------------------------------
+ PASS:R26_B_FLOAT_NEGZERO_23505
+(1 row)
+
+-- R26_C: bytea PK — hex and escape spellings of the same bytes -> one key.
+SET bytea_output = 'hex';
+INSERT INTO public.t_r26c VALUES ('\x00'::bytea, 'h');
+SET bytea_output = 'escape';
+DO $$
+BEGIN
+    BEGIN
+        INSERT INTO public.t_r26c VALUES ('\x00'::bytea, 'e');
+        RAISE EXCEPTION 'FAIL_R26_C_NO_ERROR';
+    EXCEPTION WHEN OTHERS THEN
+        IF SQLSTATE <> '23505' THEN
+            RAISE EXCEPTION 'FAIL_R26_C: expected 23505 got %: %', SQLSTATE, SQLERRM;
+        END IF;
+    END;
+END $$;
+SELECT CASE WHEN count(*) = 1 AND min(v) = 'h'
+            THEN 'PASS:R26_C_BYTEA_IDENTITY_23505'
+            ELSE 'FAIL:R26_C rows=' || count(*) || ' v=' || min(v) END AS r26_c
+  FROM public.t_r26c WHERE k = '\x00'::bytea;
+              r26_c              
+---------------------------------
+ PASS:R26_C_BYTEA_IDENTITY_23505
+(1 row)
+
+RESET bytea_output;
+-- R26_D: payload written under SQL,DMY + sql_standard + extra_float_digits=0
+--        must read back unchanged once the reader's GUCs differ.
+SET TimeZone = 'Asia/Shanghai';
+SET DateStyle = 'SQL, DMY';
+SET IntervalStyle = 'sql_standard';
+SET extra_float_digits = 0;
+INSERT INTO public.t_r26p
+     VALUES (1, timestamp '2024-02-01 05:06:07', timestamptz '2024-02-01 05:06:07+00',
+             interval '1 year 2 mons 3 days', 0.30000000000000004);
+RESET TimeZone;
+RESET DateStyle;
+RESET IntervalStyle;
+RESET extra_float_digits;
+SELECT CASE WHEN ts = timestamp '2024-02-01 05:06:07'
+             AND tz = timestamptz '2024-02-01 05:06:07+00'
+             AND iv = interval '1 year 2 mons 3 days'
+             AND f = 0.30000000000000004
+            THEN 'PASS:R26_D_PAYLOAD_ROUNDTRIP'
+            ELSE 'FAIL:R26_D ts=' || ts::text || ' tz=' || tz::text
+                 || ' iv=' || iv::text || ' f=' || f::text END AS r26_d
+  FROM public.t_r26p WHERE id = 1;
+            r26_d             
+------------------------------
+ PASS:R26_D_PAYLOAD_ROUNDTRIP
+(1 row)
+
+-- R26_E: MAIN pristine until apply; apply materializes the canonical rows.
+SELECT overlay_branch.use_branch(NULL);
+ use_branch 
+------------
+ 
+(1 row)
+
+RESET overlay_branch.current;
+SET overlay_branch.current = '';
+SELECT CASE WHEN count(*) = 0 THEN 'PASS:R26_E_MAIN_PRISTINE'
+            ELSE 'FAIL:R26_E rows=' || count(*) END AS r26_e
+  FROM public.t_r26a;
+          r26_e           
+--------------------------
+ PASS:R26_E_MAIN_PRISTINE
+(1 row)
+
+SELECT overlay_branch.apply_branch('br_r26');
+ apply_branch 
+--------------
+ 
+(1 row)
+
+SELECT CASE WHEN count(*) = 1 AND min(v) = 'a'
+            THEN 'PASS:R26_E_APPLY_MATERIALIZED'
+            ELSE 'FAIL:R26_E rows=' || count(*) END AS r26_e2
+  FROM public.t_r26a;
+            r26_e2             
+-------------------------------
+ PASS:R26_E_APPLY_MATERIALIZED
+(1 row)
+
+-- R26 teardown (branch left in the terminal 'applied' state).
+DROP TABLE public.t_r26a;
+DROP TABLE public.t_r26b;
+DROP TABLE public.t_r26c;
+DROP TABLE public.t_r26p;
+RESET client_min_messages;
+-- =====================================================================
+-- Section R27 : DOMAIN types over GUC-sensitive / normalization-needing
+--               base types.
+--
+--   A column declared with a DOMAIN has its own pg_type OID, so a bare
+--   `typid == TIMESTAMPTZOID` test never fires and `get_element_type()`
+--   returns InvalidOid for the domain itself.  The serializer must peel
+--   the domain with getBaseType() before deciding (a) whether the output
+--   function is GUC-sensitive and (b) whether the value needs the
+--   scale/±0/r-trim normalization.  Otherwise an '='-equal PK splits into
+--   two identity keys (a duplicate INSERT silently succeeds) and a
+--   GUC-rendered payload re-parses into a different value.  Arrays of a
+--   domain and domains over an array must both be handled.
+--
+-- COVERAGE:
+--   R27_A : timestamptz domain PK, same instant under two TimeZones   -> 23505
+--   R27_B : numeric domain PK, 1.00 vs 1.0                            -> 23505
+--   R27_C : float8 domain PK, -0.0 vs +0.0                            -> 23505
+--   R27_D : timestamp/interval domain payload under SQL,DMY/sql_standard -> preserved
+--   R27_E : array-of-domain PK, same instant under two TimeZones      -> 23505
+--   R27_F : domain-over-array PK, same instant under two TimeZones    -> 23505
+--   R27_G : apply materializes the canonical domain rows
+-- =====================================================================
+SET client_min_messages = WARNING;
+CREATE DOMAIN d_r27_tz     AS timestamptz;
+CREATE DOMAIN d_r27_ts     AS timestamp;
+CREATE DOMAIN d_r27_iv     AS interval;
+CREATE DOMAIN d_r27_num    AS numeric;
+CREATE DOMAIN d_r27_f8     AS float8;
+CREATE DOMAIN d_r27_tz_arr AS timestamptz[];
+CREATE TABLE public.t_r27a (k d_r27_tz PRIMARY KEY, v text);
+CREATE TABLE public.t_r27b (id integer PRIMARY KEY, ts d_r27_ts, iv d_r27_iv);
+CREATE TABLE public.t_r27c (k d_r27_tz[] PRIMARY KEY, v text);
+CREATE TABLE public.t_r27d (k d_r27_num PRIMARY KEY, v text);
+CREATE TABLE public.t_r27e (k d_r27_f8 PRIMARY KEY, v text);
+CREATE TABLE public.t_r27f (k d_r27_tz_arr PRIMARY KEY, v text);
+SELECT overlay_branch.create_branch('br_r27');
+ create_branch 
+---------------
+             4
+(1 row)
+
+SELECT overlay_branch.use_branch('br_r27');
+ use_branch 
+------------
+ 
+(1 row)
+
+-- R27_A: timestamptz DOMAIN PK — same instant, two TimeZone settings -> 23505.
+SET TimeZone = 'UTC';
+INSERT INTO public.t_r27a VALUES ('2024-06-01 00:00:00+00', 'a');
+SET TimeZone = 'Asia/Shanghai';
+DO $$
+BEGIN
+    BEGIN
+        INSERT INTO public.t_r27a VALUES ('2024-06-01 08:00:00+08', 'b');
+        RAISE EXCEPTION 'FAIL_R27_A_NO_ERROR';
+    EXCEPTION WHEN OTHERS THEN
+        IF SQLSTATE <> '23505' THEN
+            RAISE EXCEPTION 'FAIL_R27_A: expected 23505 got %: %', SQLSTATE, SQLERRM;
+        END IF;
+    END;
+END $$;
+SELECT CASE WHEN count(*) = 1 THEN 'PASS:R27_A_DOMAIN_TSTZ_IDENTITY_23505'
+            ELSE 'FAIL:R27_A rows=' || count(*) END AS r27_a
+  FROM public.t_r27a WHERE k = '2024-06-01 00:00:00+00'::timestamptz;
+                 r27_a                 
+---------------------------------------
+ PASS:R27_A_DOMAIN_TSTZ_IDENTITY_23505
+(1 row)
+
+RESET TimeZone;
+-- R27_B: numeric DOMAIN PK — 1.00 and 1.0 are '='-equal -> one identity key.
+INSERT INTO public.t_r27d VALUES (1.00, 'a');
+DO $$
+BEGIN
+    BEGIN
+        INSERT INTO public.t_r27d VALUES (1.0, 'b');
+        RAISE EXCEPTION 'FAIL_R27_B_NO_ERROR';
+    EXCEPTION WHEN OTHERS THEN
+        IF SQLSTATE <> '23505' THEN
+            RAISE EXCEPTION 'FAIL_R27_B: expected 23505 got %: %', SQLSTATE, SQLERRM;
+        END IF;
+    END;
+END $$;
+SELECT CASE WHEN count(*) = 1 THEN 'PASS:R27_B_DOMAIN_NUMERIC_IDENTITY_23505'
+            ELSE 'FAIL:R27_B rows=' || count(*) END AS r27_b
+  FROM public.t_r27d WHERE k = 1.0;
+                  r27_b                   
+------------------------------------------
+ PASS:R27_B_DOMAIN_NUMERIC_IDENTITY_23505
+(1 row)
+
+-- R27_C: float8 DOMAIN PK — -0.0 and +0.0 are '='-equal -> one identity key.
+INSERT INTO public.t_r27e VALUES ('-0'::float8, 'neg');
+DO $$
+BEGIN
+    BEGIN
+        INSERT INTO public.t_r27e VALUES ('0'::float8, 'pos');
+        RAISE EXCEPTION 'FAIL_R27_C_NO_ERROR';
+    EXCEPTION WHEN OTHERS THEN
+        IF SQLSTATE <> '23505' THEN
+            RAISE EXCEPTION 'FAIL_R27_C: expected 23505 got %: %', SQLSTATE, SQLERRM;
+        END IF;
+    END;
+END $$;
+SELECT CASE WHEN count(*) = 1 AND min(v) = 'neg'
+            THEN 'PASS:R27_C_DOMAIN_FLOAT_NEGZERO_23505'
+            ELSE 'FAIL:R27_C rows=' || count(*) || ' v=' || min(v) END AS r27_c
+  FROM public.t_r27e WHERE k = 0;
+                 r27_c                 
+---------------------------------------
+ PASS:R27_C_DOMAIN_FLOAT_NEGZERO_23505
+(1 row)
+
+-- R27_D: timestamp/interval DOMAIN payload written under non-default GUCs
+--        must read back unchanged.
+SET TimeZone = 'Asia/Shanghai';
+SET DateStyle = 'SQL, DMY';
+SET IntervalStyle = 'sql_standard';
+INSERT INTO public.t_r27b
+     VALUES (1, timestamp '2024-02-01 05:06:07',
+             interval '1 year 2 mons 3 days');
+RESET TimeZone;
+RESET DateStyle;
+RESET IntervalStyle;
+SELECT CASE WHEN ts = timestamp '2024-02-01 05:06:07'
+             AND iv = interval '1 year 2 mons 3 days'
+            THEN 'PASS:R27_D_DOMAIN_PAYLOAD_ROUNDTRIP'
+            ELSE 'FAIL:R27_D ts=' || ts::text || ' iv=' || iv::text END AS r27_d
+  FROM public.t_r27b WHERE id = 1;
+                r27_d                
+-------------------------------------
+ PASS:R27_D_DOMAIN_PAYLOAD_ROUNDTRIP
+(1 row)
+
+-- R27_E: array-of-domain PK — same instant, two TimeZone settings -> 23505.
+SET TimeZone = 'UTC';
+INSERT INTO public.t_r27c VALUES (ARRAY['2024-06-01 00:00:00+00'::d_r27_tz], 'a');
+SET TimeZone = 'Asia/Shanghai';
+DO $$
+BEGIN
+    BEGIN
+        INSERT INTO public.t_r27c
+             VALUES (ARRAY['2024-06-01 08:00:00+08'::d_r27_tz], 'b');
+        RAISE EXCEPTION 'FAIL_R27_E_NO_ERROR';
+    EXCEPTION WHEN OTHERS THEN
+        IF SQLSTATE <> '23505' THEN
+            RAISE EXCEPTION 'FAIL_R27_E: expected 23505 got %: %', SQLSTATE, SQLERRM;
+        END IF;
+    END;
+END $$;
+SELECT CASE WHEN count(*) = 1 THEN 'PASS:R27_E_DOMAIN_ARRAY_IDENTITY_23505'
+            ELSE 'FAIL:R27_E rows=' || count(*) END AS r27_e
+  FROM public.t_r27c
+ WHERE k = ARRAY['2024-06-01 00:00:00+00'::d_r27_tz];
+                 r27_e                  
+----------------------------------------
+ PASS:R27_E_DOMAIN_ARRAY_IDENTITY_23505
+(1 row)
+
+RESET TimeZone;
+-- R27_F: domain-over-array PK — same instant, two TimeZone settings -> 23505.
+SET TimeZone = 'UTC';
+INSERT INTO public.t_r27f VALUES ('{2024-06-01 00:00:00+00}'::d_r27_tz_arr, 'a');
+SET TimeZone = 'Asia/Shanghai';
+DO $$
+BEGIN
+    BEGIN
+        INSERT INTO public.t_r27f VALUES ('{2024-06-01 08:00:00+08}'::d_r27_tz_arr, 'b');
+        RAISE EXCEPTION 'FAIL_R27_F_NO_ERROR';
+    EXCEPTION WHEN OTHERS THEN
+        IF SQLSTATE <> '23505' THEN
+            RAISE EXCEPTION 'FAIL_R27_F: expected 23505 got %: %', SQLSTATE, SQLERRM;
+        END IF;
+    END;
+END $$;
+SELECT CASE WHEN count(*) = 1 THEN 'PASS:R27_F_DOMAIN_OVER_ARRAY_23505'
+            ELSE 'FAIL:R27_F rows=' || count(*) END AS r27_f
+  FROM public.t_r27f WHERE k = '{2024-06-01 00:00:00+00}'::d_r27_tz_arr;
+               r27_f                
+------------------------------------
+ PASS:R27_F_DOMAIN_OVER_ARRAY_23505
+(1 row)
+
+RESET TimeZone;
+-- R27_G: MAIN pristine until apply; apply materializes the canonical rows.
+SELECT overlay_branch.use_branch(NULL);
+ use_branch 
+------------
+ 
+(1 row)
+
+RESET overlay_branch.current;
+SET overlay_branch.current = '';
+SELECT CASE WHEN count(*) = 0 THEN 'PASS:R27_G_MAIN_PRISTINE'
+            ELSE 'FAIL:R27_G rows=' || count(*) END AS r27_g
+  FROM public.t_r27a;
+          r27_g           
+--------------------------
+ PASS:R27_G_MAIN_PRISTINE
+(1 row)
+
+SELECT overlay_branch.apply_branch('br_r27');
+ apply_branch 
+--------------
+ 
+(1 row)
+
+SELECT CASE WHEN count(*) = 1 AND min(v) = 'a'
+            THEN 'PASS:R27_G_APPLY_MATERIALIZED'
+            ELSE 'FAIL:R27_G rows=' || count(*) END AS r27_g2
+  FROM public.t_r27a;
+            r27_g2             
+-------------------------------
+ PASS:R27_G_APPLY_MATERIALIZED
+(1 row)
+
+-- R27 teardown: drop the tables then the domains (branch left 'applied').
+DROP TABLE public.t_r27a;
+DROP TABLE public.t_r27b;
+DROP TABLE public.t_r27c;
+DROP TABLE public.t_r27d;
+DROP TABLE public.t_r27e;
+DROP TABLE public.t_r27f;
+DROP DOMAIN d_r27_tz;
+DROP DOMAIN d_r27_ts;
+DROP DOMAIN d_r27_iv;
+DROP DOMAIN d_r27_num;
+DROP DOMAIN d_r27_f8;
+DROP DOMAIN d_r27_tz_arr;
+RESET client_min_messages;

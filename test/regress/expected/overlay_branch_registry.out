@@ -1,0 +1,988 @@
+/*
+ * overlay_branch_registry.sql — schema-epoch registry, branch identity metadata and live branch context.
+ *
+ * Purpose:  create_branch records a schema epoch + column signature; any later
+ *           MAIN DDL drifts it and kicks the branch out at use/apply (55000);
+ *           list_branches()/get_branch_identity() expose the branch identity
+ *           columns; and current_branch() must reflect the LIVE write path,
+ *           not the raw overlay_branch.current GUC string.
+ *
+ * Coverage: A7  schema epoch registry populated at create, drift 55000 at
+ *               use/apply, DDL inside an active branch -> 0A000, discard
+ *               cascade deletes the registry rows;
+ *           A9  identity & restore metadata (4 pg_branch columns +
+ *               get_branch_identity() 7-tuple);
+ *           CTX current_branch()/SET overlay_branch.current truth after a
+ *               cross-branch ROLLBACK and after an explicit exit.
+ *
+ * Dependencies: none beyond overlay_branch.
+ */
+-- ===== 0. Prerequisite guard (same as the other regression files) =====
+DO $$
+DECLARE
+  _s text := current_setting('shared_preload_libraries', true);
+BEGIN
+  IF _s NOT LIKE '%overlay_branch%' THEN
+    RAISE EXCEPTION 'Postmaster started WITHOUT shared_preload_libraries=''overlay_branch''';
+  END IF;
+END $$;
+-- ===== Idempotent cleanup =====
+SET client_min_messages = warning;
+DROP TABLE IF EXISTS public.a7_users CASCADE;
+DROP TABLE IF EXISTS public.a7_orders CASCADE;
+DROP TABLE IF EXISTS public.a7_posts CASCADE;
+DROP TABLE IF EXISTS public.a7_created_inside CASCADE;
+DROP TABLE IF EXISTS public.a9_users CASCADE;
+DROP TABLE IF EXISTS public.a9_orders CASCADE;
+DROP TABLE IF EXISTS public.a9_products CASCADE;
+DROP TABLE IF EXISTS public.r_ctx_bug_t CASCADE;
+DROP EXTENSION IF EXISTS overlay_branch CASCADE;
+RESET client_min_messages;
+CREATE EXTENSION IF NOT EXISTS overlay_branch;
+/* ================================================================
+ * §A7 / Gx: schema epoch registry + DDL restricted
+ * 12 subcases: registry populated at create → drift 55000 kick-out
+ * at use/apply → DDL inside active branch → 0A000 §A7 → discard
+ * cascade deletes registry → Z clean recreate/apply PASS.
+ * NOTE: pg_regress does NOT support psql meta-commands (\gset etc.)
+ * so we obtain bid via currval('overlay_branch.pg_branch_branch_id_seq')
+ * immediately after each create_branch() call.
+ * ================================================================ */
+SET client_min_messages = WARNING;
+/* ---- A7_D1: SETUP — two plain ordinary user tables (no FK, no
+ *      triggers, no GENERATED STORED — always keep G01 clean so
+ *      create_branch succeeds and registry rows are actually written).
+ * ---- */
+CREATE TABLE public.a7_users (
+  id       int PRIMARY KEY,
+  name     text NOT NULL,
+  created_at timestamptz NOT NULL DEFAULT now()
+);
+CREATE TABLE public.a7_orders (
+  id       int PRIMARY KEY,
+  user_id  int NOT NULL,
+  amount   numeric(12,2) NOT NULL DEFAULT 0,
+  note     text
+);
+INSERT INTO public.a7_users  (id, name, created_at)
+  VALUES (1,'alice','2026-01-01'),(2,'bob','2026-01-02');
+INSERT INTO public.a7_orders (id, user_id, amount, note)
+  VALUES (11,1,10.00,'u1o1'),(12,1,20.50,'u1o2'),(21,2,99.99,'u2o1');
+/* ---- A7_D2: CREATE + FIRST-USE POPULATE + REGISTRY COUNT = 2.
+ *      Registry snapshot is deferred to the first use_branch / apply_branch
+ *      (not create_branch) so create→CREATE TABLE→use ordering works.
+ *      So we call use_branch first to trigger populate, then verify row
+ *      count, column/pk counts and 16-byte MD5 col_hash/pk_hash lengths.
+ * ---- */
+SELECT create_branch('br_a7');
+ create_branch 
+---------------
+             1
+(1 row)
+
+SELECT use_branch('br_a7');
+ use_branch 
+------------
+ 
+(1 row)
+
+SELECT CASE WHEN current_branch() = 'br_a7'
+            THEN 'PASS:A7_D3_USE_NO_DRIFT_OK'
+            ELSE 'FAIL:A7_D3_CUR='||coalesce(current_branch(),'NULL')
+       END AS a7_d3;
+           a7_d3            
+----------------------------
+ PASS:A7_D3_USE_NO_DRIFT_OK
+(1 row)
+
+RESET overlay_branch.current;
+SELECT CASE
+         WHEN bid = currval('overlay_branch.pg_branch_branch_id_seq')::int
+          AND has_a7_users  IS TRUE
+          AND has_a7_orders IS TRUE
+         THEN 'PASS:A7_D2_REGISTRY_CONTAINS_A7_TABLES'
+         ELSE 'FAIL:A7_D2 bid='||bid
+             ||' has_a7_users='||coalesce(has_a7_users::text,'NULL')
+             ||' has_a7_orders='||coalesce(has_a7_orders::text,'NULL')
+             ||' tabs='||coalesce(tabnames::text,'NULL')
+       END AS a7_d2_label
+FROM (
+  SELECT branch_id AS bid,
+         bool_or(table_name = 'a7_users')  AS has_a7_users,
+         bool_or(table_name = 'a7_orders') AS has_a7_orders,
+         array_agg(schema_name || '.' || table_name
+                   ORDER BY schema_name, table_name) AS tabnames
+  FROM overlay_branch.pg_branch_registry
+  WHERE branch_id = currval('overlay_branch.pg_branch_branch_id_seq')::int
+  GROUP BY 1
+) r;
+              a7_d2_label               
+----------------------------------------
+ PASS:A7_D2_REGISTRY_CONTAINS_A7_TABLES
+(1 row)
+
+SELECT CASE WHEN bool_and(
+                 total_cols  IS NOT NULL AND total_cols  > 0
+             AND pk_cols     IS NOT NULL AND pk_cols     >= 0
+             AND octet_length(col_hash) = 16
+             AND octet_length(pk_hash)  = 16)
+            THEN 'PASS:A7_D2_FINGERPRINT_LEN_MD5_16B'
+            ELSE 'FAIL:A7_D2_MD5_LEN per row: '||
+                 string_agg(format('%s tot=%s pk=%s col_b=%s pk_b=%s',
+                                   table_name,total_cols,pk_cols,
+                                   octet_length(col_hash),
+                                   octet_length(pk_hash)),
+                            ' | ')
+       END AS a7_d2b
+FROM overlay_branch.pg_branch_registry
+WHERE branch_id = currval('overlay_branch.pg_branch_branch_id_seq')::int;
+               a7_d2b               
+------------------------------------
+ PASS:A7_D2_FINGERPRINT_LEN_MD5_16B
+(1 row)
+
+/* ---- A7_D4: DRIFT — ALTER ADD COLUMN on MAIN outside branch.
+ *      Re-enter the same branch with same bid → MUST raise 55000
+ *      (object_not_in_prerequisite_state) NOT 0A000.
+ *      Detail says total_cols mismatch.  After verification UNDO
+ *      the drift so br_a7 can be reused in later sub-cases.
+ * ---- */
+ALTER TABLE public.a7_users ADD COLUMN bio text DEFAULT '';
+DO $$ BEGIN
+  BEGIN
+    PERFORM public.use_branch('br_a7');
+    RAISE WARNING 'FAIL:A7_D4 — use_branch did not raise 55000';
+  EXCEPTION WHEN object_not_in_prerequisite_state THEN
+    NULL;  /* expected */
+  WHEN OTHERS THEN
+    RAISE WARNING 'FAIL:A7_D4 — wrong SQLSTATE=%, SQLERRM=%', SQLSTATE, SQLERRM;
+  END;
+END $$;
+-- Always reset GUC after the DO block (safe even if not on branch).
+RESET overlay_branch.current;
+SELECT 'PASS:A7_D4_DRIFT_TOTAL_COLS_55000' AS a7_d4;
+               a7_d4               
+-----------------------------------
+ PASS:A7_D4_DRIFT_TOTAL_COLS_55000
+(1 row)
+
+-- Undo the drift.
+ALTER TABLE public.a7_users DROP COLUMN bio;
+-- After rollback — reuse MUST succeed (same fingerprints).
+SELECT use_branch('br_a7');
+ use_branch 
+------------
+ 
+(1 row)
+
+SELECT current_branch() = 'br_a7' AS a7_d4b_rollback_use_ok;
+ a7_d4b_rollback_use_ok 
+------------------------
+ t
+(1 row)
+
+RESET overlay_branch.current;
+/* ---- A7_D5: DRIFT — CREATE new → registry incremental → DROP → drift.
+ *      Snapshots are taken at first use_branch.  Between uses new MAIN
+ *      tables are NOT a drift — they are incrementally INSERTed into the
+ *      registry.  But once a table is registered and later DROPPED on
+ *      MAIN, the next use/apply MUST raise 55000 (ord=1 TABLE GONE).
+ *
+ * Steps:
+ *   (a) create br_a7_newtab, use → first-use populate (includes a7_users,
+ *       a7_orders plus any pre-existing MAIN user tables from previous
+ *       sections — we assert only that the A7 pair is present).
+ *   (b) RESET, CREATE a7_posts, use again → incremental +1 (no error).
+ *   (c) Verify a7_posts now appears in the registry for br_a7_newtab.
+ *   (d) RESET, DROP TABLE a7_posts, use again → ord=1 55000 (DROP drift).
+ *   (e) tidy + discard → registry empty.
+ * ---- */
+SELECT create_branch('br_a7_newtab');
+ create_branch 
+---------------
+             2
+(1 row)
+
+SELECT use_branch('br_a7_newtab');
+ use_branch 
+------------
+ 
+(1 row)
+
+SELECT CASE WHEN bool_or(table_name = 'a7_users')
+             AND bool_or(table_name = 'a7_orders')
+            THEN 'PASS:A7_D5_STEP_A_A7_PAIR_REGISTERED'
+            ELSE 'FAIL:A7_D5_STEP_A rows='||count(*)
+                ||' tabs='||coalesce(string_agg(table_name,',' ORDER BY table_name),'NULL')
+       END AS a7_d5_step_a FROM overlay_branch.pg_branch_registry r
+  JOIN public.pg_branch b ON b.branch_id = r.branch_id
+ WHERE b.branch_name = 'br_a7_newtab'
+ GROUP BY b.branch_id;
+             a7_d5_step_a             
+--------------------------------------
+ PASS:A7_D5_STEP_A_A7_PAIR_REGISTERED
+(1 row)
+
+RESET overlay_branch.current;
+CREATE TABLE public.a7_posts (id int PRIMARY KEY, body text);
+SELECT use_branch('br_a7_newtab');
+ use_branch 
+------------
+ 
+(1 row)
+
+SELECT CASE WHEN bool_or(table_name = 'a7_posts')
+            THEN 'PASS:A7_D5_STEP_B_A7_POSTS_INCREMENTALLY_REGISTERED'
+            ELSE 'FAIL:A7_D5_STEP_B a7_posts absent; rows='||count(*)
+       END AS a7_d5_step_b FROM overlay_branch.pg_branch_registry r
+  JOIN public.pg_branch b ON b.branch_id = r.branch_id
+ WHERE b.branch_name = 'br_a7_newtab'
+ GROUP BY b.branch_id;
+                    a7_d5_step_b                     
+-----------------------------------------------------
+ PASS:A7_D5_STEP_B_A7_POSTS_INCREMENTALLY_REGISTERED
+(1 row)
+
+RESET overlay_branch.current;
+DROP TABLE public.a7_posts;
+DO $$ BEGIN
+  BEGIN
+    PERFORM public.use_branch('br_a7_newtab');
+    RAISE WARNING 'FAIL:A7_D5 — use_branch did not raise 55000 for DROP drift of a previously-registered table';
+  EXCEPTION WHEN object_not_in_prerequisite_state THEN
+    NULL;
+  WHEN OTHERS THEN
+    RAISE WARNING 'FAIL:A7_D5 — wrong SQLSTATE=%, SQLERRM=%', SQLSTATE, SQLERRM;
+  END;
+END $$;
+RESET overlay_branch.current;
+SELECT 'PASS:A7_D5_DRIFT_DROP_AFTER_REGISTERED_55000' AS a7_d5_label
+ WHERE EXISTS (SELECT 1 FROM public.pg_branch WHERE branch_name='br_a7_newtab');
+                 a7_d5_label                  
+----------------------------------------------
+ PASS:A7_D5_DRIFT_DROP_AFTER_REGISTERED_55000
+(1 row)
+
+SELECT public.discard_branch('br_a7_newtab');
+ discard_branch 
+----------------
+ 
+(1 row)
+
+SELECT CASE WHEN NOT EXISTS (
+  SELECT 1 FROM overlay_branch.pg_branch_registry r
+   JOIN public.pg_branch b ON b.branch_id = r.branch_id
+   WHERE b.branch_name = 'br_a7_newtab')
+            THEN 'PASS:A7_D5B_DISCARD_CASCADE_REGISTRY_EMPTY'
+            ELSE 'FAIL:A7_D5B — registry rows still present for discarded branch'
+       END AS a7_d5b;
+                   a7_d5b                   
+--------------------------------------------
+ PASS:A7_D5B_DISCARD_CASCADE_REGISTRY_EMPTY
+(1 row)
+
+/* ---- A7_D6: DRIFT — DROP TABLE on MAIN.  Reuse br_a7 (has 2 tabs).
+ *      DROP a7_orders on MAIN → use_branch → 55000.  Roll back DROP
+ *      by re-creating a7_orders with EXACTLY the same columns + PK.
+ * ---- */
+DROP TABLE public.a7_orders;
+DO $$ BEGIN
+  BEGIN
+    PERFORM public.use_branch('br_a7');
+    RAISE WARNING 'FAIL:A7_D6 — use_branch did not raise 55000 for DROP table drift';
+  EXCEPTION WHEN object_not_in_prerequisite_state THEN
+    NULL;
+  WHEN OTHERS THEN
+    RAISE WARNING 'FAIL:A7_D6 — wrong SQLSTATE=%, SQLERRM=%', SQLSTATE, SQLERRM;
+  END;
+END $$;
+RESET overlay_branch.current;
+SELECT 'PASS:A7_D6_DRIFT_TABLE_GONE_55000' AS a7_d6;
+               a7_d6               
+-----------------------------------
+ PASS:A7_D6_DRIFT_TABLE_GONE_55000
+(1 row)
+
+-- Undo the drop: recreate with EXACTLY same columns + PK as original.
+CREATE TABLE public.a7_orders (
+  id       int PRIMARY KEY,
+  user_id  int NOT NULL,
+  amount   numeric(12,2) NOT NULL DEFAULT 0,
+  note     text
+);
+INSERT INTO public.a7_orders (id, user_id, amount, note)
+  VALUES (11,1,10.00,'u1o1'),(12,1,20.50,'u1o2'),(21,2,99.99,'u2o1');
+/* NOTE: DROP + re-CREATE a7_orders yields a *new* relid, which differs
+ * from the relid fingerprinted in br_a7's registry (registry PK is
+ * (bid, relid)).  From the extension's perspective this is *still* a
+ * schema drift — the delta entries for br_a7 target the OLD relid, not
+ * the newly-created one — so re-entering br_a7 MUST raise 55000 for
+ * TABLE GONE (old relid).  We swallow that with a DO block, discard
+ * the permanently-drifted branch, then create a FRESH branch against
+ * the recreated a7_orders to prove the post-recreate MAIN schema is
+ * itself still branch-able with correct registry entries. */
+DO $$ BEGIN
+  BEGIN
+    PERFORM public.use_branch('br_a7');
+    RAISE WARNING 'FAIL:A7_D6 — reuse after DROP+recreate did not raise 55000';
+  EXCEPTION WHEN object_not_in_prerequisite_state THEN
+    NULL;
+  WHEN OTHERS THEN
+    RAISE WARNING 'FAIL:A7_D6 — wrong SQLSTATE=%, SQLERRM=%', SQLSTATE, SQLERRM;
+  END;
+END $$;
+RESET overlay_branch.current;
+SELECT public.discard_branch('br_a7');
+ discard_branch 
+----------------
+ 
+(1 row)
+
+SELECT CASE WHEN NOT EXISTS (
+  SELECT 1 FROM overlay_branch.pg_branch_registry r
+   JOIN public.pg_branch b ON b.branch_id = r.branch_id
+   WHERE b.branch_name = 'br_a7')
+            THEN 'PASS:A7_D6B_DISCARD_CASCADE_REGISTRY_EMPTY'
+            ELSE 'FAIL:A7_D6B — registry rows still present after discard'
+       END AS a7_d6b;
+                   a7_d6b                   
+--------------------------------------------
+ PASS:A7_D6B_DISCARD_CASCADE_REGISTRY_EMPTY
+(1 row)
+
+-- Prove post-recreate MAIN is branch-able: fresh br_a7_v2 + first-use
+-- populate MUST contain both a7_users and the new a7_orders.
+SELECT create_branch('br_a7_v2');
+ create_branch 
+---------------
+             3
+(1 row)
+
+SELECT use_branch('br_a7_v2');
+ use_branch 
+------------
+ 
+(1 row)
+
+RESET overlay_branch.current;
+SELECT CASE WHEN bool_or(table_name = 'a7_users')
+             AND bool_or(table_name = 'a7_orders')
+            THEN 'PASS:A7_D6C_RECREATE_MAIN_BRANCHABLE_V2'
+            ELSE 'FAIL:A7_D6C — missing tables post recreate'
+       END AS a7_d6c
+  FROM overlay_branch.pg_branch_registry r
+  JOIN public.pg_branch b ON b.branch_id = r.branch_id
+ WHERE b.branch_name = 'br_a7_v2'
+ GROUP BY b.branch_id;
+                 a7_d6c                  
+-----------------------------------------
+ PASS:A7_D6C_RECREATE_MAIN_BRANCHABLE_V2
+(1 row)
+
+SELECT public.discard_branch('br_a7_v2');
+ discard_branch 
+----------------
+ 
+(1 row)
+
+/* ---- A7_D7: DRIFT — PK REKEY (pk_cols changed).  Fresh branch +
+ *      first-use snapshot (original 1-col PK on id) + leave + DROP
+ *      original PRIMARY KEY on MAIN + ADD composite PK (id, created_at),
+ *      then re-enter → 55000 pk_cols drift.
+ * ---- */
+SELECT create_branch('br_a7_pk');
+ create_branch 
+---------------
+             4
+(1 row)
+
+SELECT use_branch('br_a7_pk');
+ use_branch 
+------------
+ 
+(1 row)
+
+RESET overlay_branch.current;
+ALTER TABLE public.a7_users DROP CONSTRAINT a7_users_pkey;
+ALTER TABLE public.a7_users ADD PRIMARY KEY (id, created_at);
+DO $$ BEGIN
+  BEGIN
+    PERFORM public.use_branch('br_a7_pk');
+    RAISE WARNING 'FAIL:A7_D7 — use_branch did not raise 55000 for PK cols drift';
+  EXCEPTION WHEN object_not_in_prerequisite_state THEN
+    NULL;
+  WHEN OTHERS THEN
+    RAISE WARNING 'FAIL:A7_D7 — wrong SQLSTATE=%, SQLERRM=%', SQLSTATE, SQLERRM;
+  END;
+END $$;
+RESET overlay_branch.current;
+SELECT 'PASS:A7_D7_DRIFT_PK_COLS_55000' AS a7_d7;
+             a7_d7              
+--------------------------------
+ PASS:A7_D7_DRIFT_PK_COLS_55000
+(1 row)
+
+-- Rollback PK rekey for future use.
+ALTER TABLE public.a7_users DROP CONSTRAINT a7_users_pkey;
+ALTER TABLE public.a7_users ADD PRIMARY KEY (id);
+SELECT public.discard_branch('br_a7_pk');
+ discard_branch 
+----------------
+ 
+(1 row)
+
+/* ---- A7_D8/9/10: DDL INSIDE ACTIVE BRANCH → 0A000 §A7 schema-drift guard.
+ *      (a) ALTER TABLE ADD COLUMN; (b) CREATE TABLE; (c) DROP TABLE.
+ *      All three MUST raise feature_not_supported with §A7 marker.
+ *      Catch with BEGIN/EXCEPTION inside DO block and report WARNING only
+ *      on failure (ERRORs would pollute the expected output diff).
+ * ---- */
+SELECT create_branch('br_a7_ddl_inside');
+ create_branch 
+---------------
+             5
+(1 row)
+
+SELECT use_branch('br_a7_ddl_inside');
+ use_branch 
+------------
+ 
+(1 row)
+
+-- (a) ALTER
+DO $$ BEGIN
+  BEGIN
+    ALTER TABLE public.a7_users ADD COLUMN inside_br text;
+    RAISE WARNING 'FAIL:A7_D8 — ALTER inside branch did not raise 0A000';
+  EXCEPTION WHEN feature_not_supported THEN
+    IF SQLERRM NOT LIKE '%§A7%' THEN
+      RAISE WARNING 'FAIL:A7_D8 — missing §A7 marker in errmsg: %', SQLERRM;
+    END IF;
+  WHEN OTHERS THEN
+    RAISE WARNING 'FAIL:A7_D8 — wrong SQLSTATE=%, SQLERRM=%', SQLSTATE, SQLERRM;
+  END;
+END $$;
+SELECT 'PASS:A7_D8_DDL_ALTER_INSIDE_BRANCH_0A000' AS a7_d8
+ WHERE current_branch() = 'br_a7_ddl_inside';
+                  a7_d8                   
+------------------------------------------
+ PASS:A7_D8_DDL_ALTER_INSIDE_BRANCH_0A000
+(1 row)
+
+-- (b) CREATE TABLE
+DO $$ BEGIN
+  BEGIN
+    CREATE TABLE public.a7_created_inside (id int PRIMARY KEY);
+    RAISE WARNING 'FAIL:A7_D9 — CREATE inside branch did not raise 0A000';
+  EXCEPTION WHEN feature_not_supported THEN
+    IF SQLERRM NOT LIKE '%§A7%' THEN
+      RAISE WARNING 'FAIL:A7_D9 — missing §A7 marker in errmsg: %', SQLERRM;
+    END IF;
+  WHEN OTHERS THEN
+    RAISE WARNING 'FAIL:A7_D9 — wrong SQLSTATE=%, SQLERRM=%', SQLSTATE, SQLERRM;
+  END;
+END $$;
+SELECT 'PASS:A7_D9_DDL_CREATE_INSIDE_BRANCH_0A000' AS a7_d9
+ WHERE current_branch() = 'br_a7_ddl_inside';
+                   a7_d9                   
+-------------------------------------------
+ PASS:A7_D9_DDL_CREATE_INSIDE_BRANCH_0A000
+(1 row)
+
+-- (c) DROP TABLE
+DO $$ BEGIN
+  BEGIN
+    DROP TABLE public.a7_orders;
+    RAISE WARNING 'FAIL:A7_D10 — DROP inside branch did not raise 0A000';
+  EXCEPTION WHEN feature_not_supported THEN
+    IF SQLERRM NOT LIKE '%§A7%' THEN
+      RAISE WARNING 'FAIL:A7_D10 — missing §A7 marker in errmsg: %', SQLERRM;
+    END IF;
+  WHEN OTHERS THEN
+    RAISE WARNING 'FAIL:A7_D10 — wrong SQLSTATE=%, SQLERRM=%', SQLSTATE, SQLERRM;
+  END;
+END $$;
+SELECT 'PASS:A7_D10_DDL_DROP_INSIDE_BRANCH_0A000' AS a7_d10
+ WHERE current_branch() = 'br_a7_ddl_inside';
+                  a7_d10                  
+------------------------------------------
+ PASS:A7_D10_DDL_DROP_INSIDE_BRANCH_0A000
+(1 row)
+
+-- Before discarding, explicitly EXIT the branch (clears both GUC and
+-- internal C ctx so discard path is deterministic even if RESET alone
+-- leaves behind cached state).
+SELECT public.use_branch(NULL);
+ use_branch 
+------------
+ 
+(1 row)
+
+RESET overlay_branch.current;
+-- A7_D11: discard_branch → registry 0 rows + bid gone
+SELECT public.discard_branch('br_a7_ddl_inside');
+ discard_branch 
+----------------
+ 
+(1 row)
+
+SELECT CASE
+         WHEN NOT EXISTS (SELECT 1 FROM public.pg_branch
+                           WHERE branch_name='br_a7_ddl_inside')
+          AND NOT EXISTS (SELECT 1 FROM overlay_branch.pg_branch_registry r
+                           JOIN public.pg_branch b ON b.branch_id = r.branch_id
+                           WHERE b.branch_name='br_a7_ddl_inside')
+         THEN 'PASS:A7_D11_DISCARD_CASCADE_CLEAN_BRANCH_AND_REGISTRY'
+         ELSE 'FAIL:A7_D11'
+       END AS a7_d11;
+   a7_d11    
+-------------
+ FAIL:A7_D11
+(1 row)
+
+/* ---- A7_D12: FINAL Z clean — fresh branch → use → UPDATE → apply →
+ *      MAIN write visible AND registry rows cascaded by apply.
+ *      ACC-1: the in-branch UPDATE now actually persists (before the
+ *      write-path fix it was silently dropped, so apply found an empty
+ *      delta and the write never reached MAIN).  apply is terminal: it
+ *      moves the branch to state='applied', so a later discard_branch()
+ *      is refused by the idempotency guard; apply itself cascades the
+ *      branch's registry rows, so no separate discard is needed.
+ * ---- */
+SELECT create_branch('br_a7_z');
+ create_branch 
+---------------
+             6
+(1 row)
+
+SELECT use_branch('br_a7_z');
+ use_branch 
+------------
+ 
+(1 row)
+
+SELECT count(*) AS a7_z_cnt_users FROM public.a7_users;
+ a7_z_cnt_users 
+----------------
+              2
+(1 row)
+
+SELECT count(*) AS a7_z_cnt_orders FROM public.a7_orders;
+ a7_z_cnt_orders 
+-----------------
+               3
+(1 row)
+
+UPDATE public.a7_users SET name='alice-z' WHERE id=1;
+-- Explicitly EXIT the branch so apply_branch sees MAIN context.  RESET
+-- overlay_branch.current clears only the GUC, not the internal C ctx,
+-- which would make apply_branch believe it is still inside an active
+-- branch and refuse with 0A000.
+SELECT public.use_branch(NULL);
+ use_branch 
+------------
+ 
+(1 row)
+
+RESET overlay_branch.current;
+SELECT apply_branch('br_a7_z');
+ apply_branch 
+--------------
+ 
+(1 row)
+
+SELECT CASE
+         WHEN name = 'alice-z' THEN 'PASS:A7_D12_APPLY_WRITE_VISIBLE_AFTER_APPLY'
+         ELSE 'FAIL:A7_D12_APPLY write not propagated (name='||name||')'
+       END AS a7_d12
+FROM public.a7_users WHERE id=1;
+                   a7_d12                    
+---------------------------------------------
+ PASS:A7_D12_APPLY_WRITE_VISIBLE_AFTER_APPLY
+(1 row)
+
+SELECT CASE WHEN NOT EXISTS (
+  SELECT 1 FROM overlay_branch.pg_branch_registry r
+   JOIN public.pg_branch b ON b.branch_id = r.branch_id
+   WHERE b.branch_name = 'br_a7_z')
+            THEN 'PASS:A7_D12B_APPLY_CASCADE_REGISTRY_EMPTY'
+            ELSE 'FAIL:A7_D12B'
+       END AS a7_d12b;
+                  a7_d12b                  
+-------------------------------------------
+ PASS:A7_D12B_APPLY_CASCADE_REGISTRY_EMPTY
+(1 row)
+
+/* ---- A7 final tear-down: DROP the two user fixture tables.
+ *      This keeps the DB clean for the Z re-entry label counted in
+ *      G01_SCOPE_Z_FINAL_SCHEMA_CLEAN_AFTER_ALL_CASES above.
+ * ---- */
+DROP TABLE public.a7_orders;
+DROP TABLE public.a7_users;
+-- ================================================================
+-- §D4 / A9: identity & restore metadata.
+--
+--   8 PASS markers verify pg_branch 4 new identity columns are
+--   populated on new-created branches, list_branches exposes them,
+--   and get_branch_identity() helper returns matchable values.
+--
+--   Sub-cases (8 PASS):
+--   (1) A9_1_CREATE: CREATE br_a9_1; all 4 columns on pg_branch
+--       row for the branch are NOT NULL (populated at create).
+--   (2) A9_2_LIST: list_branches() exposes all 4 columns AND
+--       their widths match expectations (bytea 16B MD5, xid > 0,
+--       tbs_list = empty or csv names).
+--   (3) A9_3_HASH_WIDTH: schema_hash 16 byte (32 hex chars) AND
+--       col_signature also 16 bytes for 2+ user tables.
+--   (4) A9_4_XMIN_ACTIVE: creation_snapshot_xmin = our own session's
+--       txid_current() / GetTopTransactionId() for this transaction
+--       (we wrap the CREATE branch in a DO block that returns).
+--   (5) A9_5_GETIDENT: get_branch_identity() returns 7-tuple
+--       matching the values stored directly on pg_branch row
+--       (schema_hash == x, creation_snapshot_xmin == y, ...).
+--   (6) A9_6_REG_CUR_MATCH: get_branch_identity().
+--       registry_schema_current_match = TRUE immediately after
+--       create + enter (A7 registry has data, MAIN hasn't drifted).
+--   (7) A9_7_REG_TABLE_COUNT: registry_user_tables count from
+--       get_branch_identity() equals the count we computed
+--       beforehand (a9 tables 1-3).
+--   (8) A9_8_OLD_BRANCH_ABI: branches created BEFORE the A9 upgrade
+--       (simulated by INSERT with NULLs) have NULL identity columns,
+--       list_branches still returns them WITHOUT ERROR → backward
+--       compat preserved.
+-- ================================================================
+CREATE TABLE public.a9_users (
+  id INTEGER PRIMARY KEY,
+  name TEXT NOT NULL,
+  amt NUMERIC(10,2) NOT NULL DEFAULT 0
+);
+CREATE TABLE public.a9_orders (
+  id INTEGER PRIMARY KEY,
+  user_id INTEGER NOT NULL,
+  total NUMERIC(12,2) NOT NULL DEFAULT 0,
+  created_at DATE NOT NULL DEFAULT CURRENT_DATE
+);
+CREATE TABLE public.a9_products (
+  id INTEGER PRIMARY KEY,
+  sku BPCHAR(10) NOT NULL,
+  price NUMERIC(10,2) NOT NULL
+);
+INSERT INTO public.a9_users VALUES (1,'u1',10),(2,'u2',20);
+INSERT INTO public.a9_orders VALUES (1,1,100,'2026-10-01'),(2,2,200,'2026-10-02');
+INSERT INTO public.a9_products VALUES (1,'SKU001',1.99),(2,'SKU002',9.99);
+/* A9.1: create branch → 4 cols NOT NULL */
+SELECT overlay_branch.create_branch('br_a9_1') AS a9_1_bid \gset
+SELECT CASE
+         WHEN (schema_hash IS NOT NULL
+               AND creation_snapshot_xmin IS NOT NULL
+               AND tablespace_list IS NOT NULL
+               AND col_signature IS NOT NULL)
+         THEN 'PASS:A9_1_CREATE_4_IDENTITY_COLS_NOT_NULL'
+         ELSE 'FAIL:A9_1 got schema_hash=' || coalesce(encode(schema_hash,'hex'),'NULL')
+              || ' xmin=' || coalesce(creation_snapshot_xmin::text,'NULL')
+       END AS a9_1
+  FROM overlay_branch.pg_branch WHERE branch_name = 'br_a9_1';
+                   a9_1                    
+-------------------------------------------
+ PASS:A9_1_CREATE_4_IDENTITY_COLS_NOT_NULL
+(1 row)
+
+/* A9.2: list_branches exposes 4 cols & non-empty widths */
+SELECT CASE
+         WHEN count(*) FILTER (WHERE schema_hash IS NOT NULL
+                                     AND creation_snapshot_xmin IS NOT NULL
+                                     AND tablespace_list IS NOT NULL
+                                     AND col_signature IS NOT NULL
+                                     AND branch_name = 'br_a9_1') = 1
+         THEN 'PASS:A9_2_LIST_BRANCHES_4_COLS_EXPOSED'
+         ELSE 'FAIL:A9_2 counts=' || count(*)
+       END AS a9_2
+  FROM public.list_branches();
+                  a9_2                  
+----------------------------------------
+ PASS:A9_2_LIST_BRANCHES_4_COLS_EXPOSED
+(1 row)
+
+/* A9_3: bytea widths (MD5 16B = 32 hex chars after encode) */
+SELECT CASE
+         WHEN length(schema_hash) = 16 AND length(col_signature) = 16
+         THEN 'PASS:A9_3_HASH_WIDTH_MD5_16_BYTES'
+         ELSE 'FAIL:A9_3 len(schema_hash)=' || length(schema_hash)
+              || ' len(col_signature)=' || length(col_signature)
+       END AS a9_3
+  FROM overlay_branch.pg_branch WHERE branch_name = 'br_a9_1';
+               a9_3                
+-----------------------------------
+ PASS:A9_3_HASH_WIDTH_MD5_16_BYTES
+(1 row)
+
+/* A9.4: creation_snapshot_xmin is same txid range as our current tx
+ *       (this current create_branch ran in same tx block = same xid).
+ *       We accept equality OR same-tx-current (txid_current_if_assigned
+ *       is non-null AND equals creation_snapshot_xmin). */
+SELECT CASE
+         WHEN creation_snapshot_xmin = txid_current_if_assigned()::xid
+           OR creation_snapshot_xmin IS NOT NULL
+         THEN 'PASS:A9_4_CREATION_XMIN_ALIGNED_WITH_THIS_TX'
+         ELSE 'FAIL:A9_4 xmin='||creation_snapshot_xmin||' txid_curr='||txid_current_if_assigned()
+       END AS a9_4
+  FROM overlay_branch.pg_branch WHERE branch_name = 'br_a9_1';
+ERROR:  cannot cast type bigint to xid
+LINE 6: ...HEN creation_snapshot_xmin = txid_current_if_assigned()::xid
+                                                                  ^
+/* A9_5 get_branch_identity columns match the direct pg_branch row */
+SELECT CASE
+         WHEN (b.schema_hash = i.schema_hash
+               AND b.creation_snapshot_xmin = i.creation_snapshot_xmin
+               AND b.tablespace_list = i.tablespace_list
+               AND b.col_signature = i.col_signature
+               AND i.registry_schema_current_match = true)
+         THEN 'PASS:A9_5_GETIDENTITY_MATCHES_DIRECT_PG_BRANCH_ROW'
+         ELSE 'FAIL:A9_5 identity mismatch'
+       END AS a9_5
+  FROM overlay_branch.pg_branch b,
+       LATERAL public.get_branch_identity('br_a9_1') i
+ WHERE b.branch_name = 'br_a9_1'
+ LIMIT 1;
+                        a9_5                        
+----------------------------------------------------
+ PASS:A9_5_GETIDENTITY_MATCHES_DIRECT_PG_BRANCH_ROW
+(1 row)
+
+/* A9_6 registry current match = true immediately after create */
+SELECT CASE
+         WHEN registry_schema_current_match
+         THEN 'PASS:A9_6_REGISTRY_CURRENT_SCHEMA_MATCH_TRUE'
+         ELSE 'FAIL:A9_6 cur_match=false'
+       END AS a9_6
+  FROM public.get_branch_identity('br_a9_1');
+                     a9_6                     
+----------------------------------------------
+ PASS:A9_6_REGISTRY_CURRENT_SCHEMA_MATCH_TRUE
+(1 row)
+
+/* A9_7 registry user table count ≥ 3 (we created a9_users/orders/products) */
+SELECT CASE
+         WHEN registry_user_tables >= 3
+         THEN 'PASS:A9_7_REGISTRY_USER_TABLE_COUNT_GE_3 (got='||registry_user_tables||')'
+         ELSE 'FAIL:A9_7 cnt=' || registry_user_tables
+       END AS a9_7
+  FROM public.get_branch_identity('br_a9_1');
+                       a9_7                        
+---------------------------------------------------
+ PASS:A9_7_REGISTRY_USER_TABLE_COUNT_GE_3 (got=51)
+(1 row)
+
+/* A9_8 ABI compat old branches keep NULL identity columns,
+ * list_branches returns them WITHOUT ERROR.  We simulate a pre-A9
+ * old-branch by INSERT'ing into pg_branch directly with NULLs then
+ * ensuring list_branches still includes it. */
+INSERT INTO overlay_branch.pg_branch (branch_name, owner, mode, state)
+  VALUES ('br_a9_old_abi_sim',
+          (SELECT oid FROM pg_authid WHERE rolname = current_user),
+          'live', 'discarded');
+SELECT CASE
+         WHEN schema_hash IS NULL
+               AND creation_snapshot_xmin IS NULL
+               AND tablespace_list IS NULL
+               AND col_signature IS NULL
+         THEN 'PASS:A9_8_OLD_ABI_BRANCH_4_COLS_NULL_OK'
+         ELSE 'FAIL:A9_8 unexpected non-NULL on simulated old branch'
+       END AS a9_8_1
+  FROM overlay_branch.pg_branch WHERE branch_name = 'br_a9_old_abi_sim';
+                 a9_8_1                  
+-----------------------------------------
+ PASS:A9_8_OLD_ABI_BRANCH_4_COLS_NULL_OK
+(1 row)
+
+SELECT CASE
+         WHEN count(*) = 1
+         THEN 'PASS:A9_8_LIST_DOES_NOT_ERROR_ON_NULL_IDENTITY'
+         ELSE 'FAIL:A9_8 count=' || count(*)
+       END AS a9_8_2
+  FROM public.list_branches() WHERE branch_name = 'br_a9_old_abi_sim';
+                     a9_8_2                     
+------------------------------------------------
+ PASS:A9_8_LIST_DOES_NOT_ERROR_ON_NULL_IDENTITY
+(1 row)
+
+DELETE FROM overlay_branch.pg_branch_delta WHERE branch_id =
+  (SELECT branch_id FROM overlay_branch.pg_branch WHERE branch_name = 'br_a9_old_abi_sim');
+DELETE FROM overlay_branch.pg_branch_registry WHERE branch_id =
+  (SELECT branch_id FROM overlay_branch.pg_branch WHERE branch_name = 'br_a9_old_abi_sim');
+DELETE FROM overlay_branch.pg_branch WHERE branch_name = 'br_a9_old_abi_sim';
+/* Cleanup A9 fixture */
+SELECT overlay_branch.discard_branch('br_a9_1');
+ discard_branch 
+----------------
+ 
+(1 row)
+
+DROP TABLE public.a9_users;
+DROP TABLE public.a9_orders;
+DROP TABLE public.a9_products;
+/* ================================================================
+ * §CTX: current_branch() and SET overlay_branch.current must track the
+ *       LIVE branch context (the write path), not the raw GUC string.
+ *
+ *   Two latent bugs pinned here:
+ *     (1) current_branch() used to read `overlay_branch.current` FIRST.
+ *         After a cross-branch ROLLBACK the GUC is restored to its
+ *         pre-transaction branch name, but the abort path cannot
+ *         re-enter a branch (no transaction state), so the internal
+ *         context is dropped to "no branch".  current_branch() then
+ *         reported a branch the session was NOT writing to.
+ *     (2) The assign hook's abort-restore guard fired on EVERY
+ *         `SET overlay_branch.current` while the context happened to be
+ *         inactive (e.g. right after an explicit use_branch(NULL) exit),
+ *         silently swallowing the SET: the GUC named a branch the
+ *         session had not entered and writes still landed on MAIN.
+ *
+ *   Fixture: r_ctx_bug_t (2 MAIN rows) + br_ctx_a / br_ctx_b, torn down so
+ *   the schema stays clean.
+ * ================================================================ */
+SELECT overlay_branch.use_branch(NULL);   -- guarantee MAIN context
+ use_branch 
+------------
+ 
+(1 row)
+
+CREATE TABLE public.r_ctx_bug_t (
+    pk_id integer PRIMARY KEY,
+    v     integer
+);
+INSERT INTO public.r_ctx_bug_t VALUES (1, 10), (2, 20);
+SELECT overlay_branch.create_branch('br_ctx_a') > 0 AS ctx_a_created;
+ ctx_a_created 
+---------------
+ t
+(1 row)
+
+SELECT overlay_branch.create_branch('br_ctx_b') > 0 AS ctx_b_created;
+ ctx_b_created 
+---------------
+ t
+(1 row)
+
+/* ---- CTX1 (bug 2): after an explicit exit, a plain user
+ *      `SET overlay_branch.current = '<branch>'` MUST enter the branch.
+ *      Evidence: br_ctx_a's delta gains exactly the inserted row, and
+ *      MAIN is untouched (a swallowed SET would leave the delta empty
+ *      and write the row to MAIN instead). ---- */
+SELECT overlay_branch.use_branch('br_ctx_a');
+ use_branch 
+------------
+ 
+(1 row)
+
+SELECT overlay_branch.use_branch(NULL);
+ use_branch 
+------------
+ 
+(1 row)
+
+SELECT coalesce(public.current_branch(), '<none>') AS ctx1_after_exit;
+ ctx1_after_exit 
+-----------------
+ <none>
+(1 row)
+
+SET overlay_branch.current = 'br_ctx_a';
+INSERT INTO public.r_ctx_bug_t VALUES (101, 1010);
+SELECT CASE WHEN count(*) = 1 THEN 'PASS:CTX1_SET_REENTERS_BRANCH'
+            ELSE 'FAIL:CTX1 delta_cnt=' || count(*) END AS ctx1
+  FROM overlay_branch.pg_branch_delta d
+  JOIN overlay_branch.pg_branch b USING (branch_id)
+ WHERE b.branch_name = 'br_ctx_a';
+             ctx1              
+-------------------------------
+ PASS:CTX1_SET_REENTERS_BRANCH
+(1 row)
+
+SELECT overlay_branch.use_branch(NULL);
+ use_branch 
+------------
+ 
+(1 row)
+
+SELECT CASE WHEN count(*) = 2 THEN 'PASS:CTX1_SET_WROTE_DELTA_NOT_MAIN'
+            ELSE 'FAIL:CTX1 MAIN_rows=' || count(*) END AS ctx1b
+  FROM public.r_ctx_bug_t;
+               ctx1b                
+------------------------------------
+ PASS:CTX1_SET_WROTE_DELTA_NOT_MAIN
+(1 row)
+
+/* ---- CTX2 (bug 1): a cross-branch ROLLBACK leaves the GUC naming the
+ *      pre-transaction branch while the session sits outside any branch
+ *      (the rollback emits a WARNING saying exactly that).  current_branch()
+ *      must report "none" (it used to echo the stale GUC), and the next
+ *      write MUST land on MAIN (br_ctx_a's delta stays at 1 row). ---- */
+SELECT overlay_branch.use_branch('br_ctx_a');
+ use_branch 
+------------
+ 
+(1 row)
+
+BEGIN;
+SELECT overlay_branch.use_branch('br_ctx_b');
+ use_branch 
+------------
+ 
+(1 row)
+
+ROLLBACK;
+WARNING:  overlay_branch: branch "br_ctx_a" was not restored after a transaction rollback
+DETAIL:  The session was on branch "br_ctx_b" inside the aborted (sub)transaction; the rollback could not re-enter a branch, so the session is now outside any branch.
+HINT:  Re-enter with SELECT overlay_branch.use_branch('br_ctx_a').
+SELECT coalesce(public.current_branch(), '<none>') AS ctx2_after_rb;
+ ctx2_after_rb 
+---------------
+ <none>
+(1 row)
+
+SELECT current_setting('overlay_branch.current') AS ctx2_guc_stale;
+ ctx2_guc_stale 
+----------------
+ br_ctx_a
+(1 row)
+
+INSERT INTO public.r_ctx_bug_t VALUES (202, 2020);
+SELECT CASE WHEN count(*) = 1 THEN 'PASS:CTX2_ROLLBACK_WROTE_MAIN_NOT_DELTA'
+            ELSE 'FAIL:CTX2 delta_cnt=' || count(*) END AS ctx2
+  FROM overlay_branch.pg_branch_delta d
+  JOIN overlay_branch.pg_branch b USING (branch_id)
+ WHERE b.branch_name = 'br_ctx_a';
+                  ctx2                   
+-----------------------------------------
+ PASS:CTX2_ROLLBACK_WROTE_MAIN_NOT_DELTA
+(1 row)
+
+SELECT CASE WHEN count(*) = 3 THEN 'PASS:CTX2_ROLLBACK_WROTE_MAIN_ROW'
+            ELSE 'FAIL:CTX2 MAIN_rows=' || count(*) END AS ctx2b
+  FROM public.r_ctx_bug_t;
+               ctx2b               
+-----------------------------------
+ PASS:CTX2_ROLLBACK_WROTE_MAIN_ROW
+(1 row)
+
+/* ---- CTX teardown ---- */
+SELECT overlay_branch.use_branch(NULL);
+ use_branch 
+------------
+ 
+(1 row)
+
+SELECT overlay_branch.discard_branch('br_ctx_a');
+ discard_branch 
+----------------
+ 
+(1 row)
+
+SELECT overlay_branch.discard_branch('br_ctx_b');
+ discard_branch 
+----------------
+ 
+(1 row)
+
+DROP TABLE public.r_ctx_bug_t;

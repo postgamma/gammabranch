@@ -1,0 +1,350 @@
+/*
+ * overlay_branch_basic_scan.sql — BranchScan transparent MAIN⊕delta merge, plus the
+ *                                 write-redirect RETURNING / EXPLAIN / rebirth parts.
+ *
+ * Purpose:  the second half of overlay_branch_basic, split at the extension-reinstall
+ *           boundary: the CustomScan merge of MAIN⊕delta for a plain SELECT, the
+ *           RETURNING replay through the DestReceiver lifecycle, the root-node
+ *           instrumentation under EXPLAIN ANALYZE, and DELETE → re-INSERT (rebirth)
+ *           applying as UPDATE.
+ *
+ * Coverage: Part 6  BranchScan — plan shapes (IndexScan wins in MAIN / CustomScan in
+ *                   a branch), 4-tuple SRF-vs-BranchScan equivalence, MAIN zero
+ *                   pollution;
+ *           Part G  write-redirect RETURNING replay — the DestReceiver lifecycle
+ *                   drives output for INSERT/UPDATE/DELETE ... RETURNING;
+ *           Part H  EXPLAIN ANALYZE drives the ModifyTable root node (no "(never
+ *                   executed)");
+ *           Part I  DELETE → re-INSERT of the same PK (rebirth) applies as UPDATE.
+ *
+ * Dependencies: none beyond overlay_branch (the body reinstalls it).
+ */
+
+-- ===== 0. Prerequisite guard (same as the other regression files) =====
+DO $$
+DECLARE
+  _s text := current_setting('shared_preload_libraries', true);
+BEGIN
+  IF _s NOT LIKE '%overlay_branch%' THEN
+    RAISE EXCEPTION 'Postmaster started WITHOUT shared_preload_libraries=''overlay_branch''';
+  END IF;
+END $$;
+
+-- ===== Idempotent cleanup =====
+SET client_min_messages = warning;
+DROP TABLE IF EXISTS public.bs_basic CASCADE;
+DROP TABLE IF EXISTS public.ob_ret CASCADE;
+DROP TABLE IF EXISTS public.ob_expl CASCADE;
+DROP TABLE IF EXISTS public.ob_rebirth CASCADE;
+DROP EXTENSION IF EXISTS overlay_branch CASCADE;
+RESET client_min_messages;
+
+CREATE EXTENSION IF NOT EXISTS overlay_branch;
+SET client_min_messages = WARNING;
+-- =====================================================================
+-- ========== Part 6: BranchScan (CustomScan transparently merges
+-- ========== MAIN⊕delta for plain SELECT).
+-- =====================================================================
+
+-- 6.0 Teardown / reinstall extension so the Part 6 fixture table
+--     `public.bs_basic` cannot possibly collide with Part C's public.t,
+--     Step 5's guard_part tables, or Part 7 Step4's tables.
+DROP EXTENSION overlay_branch CASCADE;
+CREATE EXTENSION overlay_branch;
+
+CREATE TABLE public.bs_basic (
+  id   INT4 PRIMARY KEY,
+  amt  NUMERIC(10,2),
+  tag  TEXT
+);
+INSERT INTO public.bs_basic VALUES
+  (1,  10.50, 'alpha'),
+  (2,  20.00, 'beta'),
+  (3,  30.75, 'gamma'),
+  (7,  70.00, 'eta');
+
+-- 6.1 MAIN mode: sanity — plain IndexScan wins, no CustomScan.
+RESET overlay_branch.current;
+EXPLAIN (COSTS OFF, SUMMARY OFF) SELECT * FROM public.bs_basic WHERE id = 1;
+SELECT count(*) AS bs_baseline_main_count FROM public.bs_basic;
+
+-- 6.2 Open a dedicated branch and inject exactly the 4 representative
+--     mutations (I/U/D + no-op).
+SELECT create_branch('bs_basic_b1') AS bs_id_b1;
+SELECT use_branch('bs_basic_b1');
+
+DELETE FROM public.bs_basic WHERE id = 3;
+UPDATE public.bs_basic SET amt = 99.99, tag = 'BETA!' WHERE id = 2;
+INSERT INTO public.bs_basic VALUES (9, 900.00, 'inserted-niner');
+-- id=1 and id=7 intentionally NOT touched (purely-MAIN passthrough).
+
+-- 6.3 MAIN-heap zero-pollution check (run in MAIN mode).
+RESET overlay_branch.current;
+SELECT CASE
+         WHEN string_agg(id::text, ',' ORDER BY id) = '1,2,3,7'
+              AND string_agg(amt::text, ',' ORDER BY id) = '10.50,20.00,30.75,70.00'
+         THEN 'PASS:BS_MAIN_ZERO_POLLUTION'
+         ELSE 'FAIL:'||COALESCE(string_agg(id::text||':'||amt::text, ',' ORDER BY id),'NULL')
+       END AS bs63_main_pollution
+FROM public.bs_basic;
+
+-- 6.4 Delta physics pre-check (3 rows: 2U/3D/9I).
+SELECT use_branch('bs_basic_b1');
+SELECT count(*) AS bs64_delta_count
+FROM public.pg_branch_delta
+WHERE branch_id = (SELECT branch_id FROM public.pg_branch WHERE branch_name='bs_basic_b1')
+  AND relid = 'public.bs_basic'::regclass;
+
+-- 6.5 Core equivalence: SRF (proven-correct) vs. transparent BranchScan.
+WITH srf AS (
+  SELECT string_agg((r).id::text||':'||(r).amt::text||':'||COALESCE((r).tag,'NULL'), '|' ORDER BY (r).id) AS pic
+  FROM overlay_branch.overlay_main_plus_delta('public.bs_basic')
+    AS r(id int4, amt numeric, tag text)
+), cs AS (
+  SELECT string_agg(id::text||':'||amt::text||':'||COALESCE(tag,'NULL'), '|' ORDER BY id) AS pic
+  FROM public.bs_basic
+)
+SELECT CASE
+         WHEN srf.pic = cs.pic THEN 'PASS:BS_EQUIV_SRF_BRANCHSCAN'
+         ELSE 'FAIL_SRF<>'||COALESCE(cs.pic,'NULL')||' BASE='||COALESCE(srf.pic,'NULL')
+       END AS bs65_equiv,
+       srf.pic AS srf_pic,
+       cs.pic  AS cs_pic
+FROM srf, cs;
+
+-- 6.6 Plan shapes for 4 representative SELECT shapes.
+EXPLAIN (COSTS OFF, SUMMARY OFF) SELECT * FROM public.bs_basic;                     -- plain CustomScan
+EXPLAIN (COSTS OFF, SUMMARY OFF) SELECT count(*) FROM public.bs_basic;               -- Aggregate + CustomScan
+EXPLAIN (COSTS OFF, SUMMARY OFF) SELECT * FROM public.bs_basic WHERE id = 2;         -- Filter + CustomScan (qual NOT pushed)
+EXPLAIN (COSTS OFF, SUMMARY OFF) SELECT * FROM public.bs_basic ORDER BY amt DESC;   -- Sort + CustomScan (no IndexScan leak)
+
+-- 6.7 Row-level spot checks against the 4 expected tuples:
+--      (1, 10.50, alpha)        — untouched MAIN passthrough
+--      (2, 99.99, BETA!)        — UPDATE override
+--      (7, 70.00, eta)          — untouched MAIN passthrough
+--      (9, 900.00, inserted-niner) — pure-delta INSERT
+--      id=3 COMPLETELY GONE (DELETE tombstone)
+
+SELECT CASE WHEN count(*) = 4 THEN 'PASS:BS_4_TUPLES' ELSE 'FAIL:'||count(*) END AS bs67_n
+FROM public.bs_basic;
+
+SELECT CASE WHEN EXISTS(SELECT 1 FROM public.bs_basic WHERE id = 3)
+            THEN 'FAIL:ID3_STILL_PRESENT'
+            ELSE 'PASS:ID3_TOMBSTONE_SKIPPED' END AS bs67_tombstone;
+
+SELECT id, amt, tag FROM public.bs_basic ORDER BY id;
+
+-- 6.8 Re-verify MAIN (BranchScan is per-transient active-branch, must be
+--     completely gone after RESET so the same SELECT id=3 in MAIN mode
+--     returns the original tuple — zero pollution).
+RESET overlay_branch.current;
+SELECT CASE WHEN tag = 'gamma' THEN 'PASS:ID3_BACK_IN_MAIN'
+            ELSE 'FAIL:'||COALESCE(tag,'NULL') END AS bs68_id3_main_back
+FROM public.bs_basic WHERE id = 3;
+
+-- ========== Part G: Write-redirect RETURNING replay (DestReceiver lifecycle) ==
+-- The write path short-circuits standard_ExecutorRun(), so it must drive the
+-- DestReceiver lifecycle (rStartup/rShutdown) itself.  SPI's DestSPI allocates
+-- its SPITupleTable in rStartup; when that call was skipped, plpgsql
+-- "DML ... RETURNING ... INTO" aborted with "improper call to spi_printtup".
+-- G.1..G.5 pin the positive replay for UPDATE/DELETE/INSERT/UPSERT plus the
+-- zero-row UPDATE path (which also drives SPI's _SPI_checktuples); G.6 pins
+-- that the replayed tuple is the branch overlay post-image, not MAIN.
+CREATE TABLE public.ob_ret (id int PRIMARY KEY, v text);
+INSERT INTO public.ob_ret SELECT g, 'm' || g FROM generate_series(1, 5) g;
+SELECT create_branch('ob_ret_b1');
+SELECT use_branch('ob_ret_b1');
+
+-- G.1 UPDATE ... RETURNING ... INTO (single row) inside plpgsql.
+DO $$
+DECLARE rid int; rv text;
+BEGIN
+  UPDATE public.ob_ret SET v = 'u' || id WHERE id = 1 RETURNING id, v INTO rid, rv;
+  IF rid = 1 AND rv = 'u1' THEN
+    RAISE NOTICE 'PASS:RET_UPDATE_INTO';
+  ELSE
+    RAISE NOTICE 'FAIL:RET_UPDATE_INTO rid=% rv=%', rid, rv;
+  END IF;
+END $$;
+
+-- G.2 Zero-row UPDATE ... RETURNING ... INTO: rStartup must still run so SPI's
+--     tuple-table exists (otherwise _SPI_checktuples reports a bad count).
+DO $$
+DECLARE rid int; rv text;
+BEGIN
+  UPDATE public.ob_ret SET v = 'noop' WHERE id = -1 RETURNING id, v INTO rid, rv;
+  IF rid IS NULL AND rv IS NULL THEN
+    RAISE NOTICE 'PASS:RET_ZERO_ROW_UPDATE_INTO';
+  ELSE
+    RAISE NOTICE 'FAIL:RET_ZERO_ROW_UPDATE_INTO rid=% rv=%', rid, rv;
+  END IF;
+END $$;
+
+-- G.3 DELETE ... RETURNING ... INTO.
+DO $$
+DECLARE rid int; rv text;
+BEGIN
+  DELETE FROM public.ob_ret WHERE id = 3 RETURNING id, v INTO rid, rv;
+  IF rid = 3 AND rv = 'm3' THEN
+    RAISE NOTICE 'PASS:RET_DELETE_INTO';
+  ELSE
+    RAISE NOTICE 'FAIL:RET_DELETE_INTO rid=% rv=%', rid, rv;
+  END IF;
+END $$;
+
+-- G.4 INSERT ... RETURNING ... INTO (pure-delta insert).
+DO $$
+DECLARE rid int; rv text;
+BEGIN
+  INSERT INTO public.ob_ret VALUES (10, 'new10') RETURNING id, v INTO rid, rv;
+  IF rid = 10 AND rv = 'new10' THEN
+    RAISE NOTICE 'PASS:RET_INSERT_INTO';
+  ELSE
+    RAISE NOTICE 'FAIL:RET_INSERT_INTO rid=% rv=%', rid, rv;
+  END IF;
+END $$;
+
+-- G.5 UPSERT DO UPDATE ... RETURNING ... INTO.
+DO $$
+DECLARE rid int; rv text;
+BEGIN
+  INSERT INTO public.ob_ret VALUES (10, 'upserted')
+    ON CONFLICT (id) DO UPDATE SET v = EXCLUDED.v
+    RETURNING id, v INTO rid, rv;
+  IF rid = 10 AND rv = 'upserted' THEN
+    RAISE NOTICE 'PASS:RET_UPSERT_INTO';
+  ELSE
+    RAISE NOTICE 'FAIL:RET_UPSERT_INTO rid=% rv=%', rid, rv;
+  END IF;
+END $$;
+
+-- G.6 Replayed tuple is the branch overlay post-image; the branch still owns
+--     its delta rows (writes landed in the delta, not MAIN): id=1 -> 'u1',
+--     id=3 tombstoned, id=10 -> 'upserted', so 5 visible rows (1,2,4,5,10).
+SELECT CASE WHEN count(*) = 5 THEN 'PASS:RET_OVERLAY_ROWS'
+            ELSE 'FAIL:RET_OVERLAY_ROWS got=' || count(*) END AS ret_overlay_rows
+FROM public.ob_ret;
+SELECT CASE WHEN NOT EXISTS (SELECT 1 FROM public.ob_ret WHERE id = 3)
+            THEN 'PASS:RET_OVERLAY_TOMBSTONE'
+            ELSE 'FAIL:RET_OVERLAY_TOMBSTONE' END AS ret_tombstone;
+SELECT CASE WHEN (SELECT v FROM public.ob_ret WHERE id = 10) = 'upserted'
+            THEN 'PASS:RET_OVERLAY_UPSERT'
+            ELSE 'FAIL:RET_OVERLAY_UPSERT' END AS ret_upsert;
+
+SELECT use_branch(NULL);
+SELECT discard_branch('ob_ret_b1');
+DROP TABLE public.ob_ret;
+
+-- ========== Part H: EXPLAIN ANALYZE drives the ModifyTable root node ====
+-- The write redirect short-circuits standard_ExecutorRun(), so nothing else
+-- runs the ModifyTable node's own instrumentation.  Before this fix the root
+-- node printed "(never executed)" because its instrumentation was never
+-- started; H.1..H.3 pin the stock "actual rows=N loops=1" figure (rows = the
+-- RETURNING cardinality, 0 without RETURNING).  TIMING / COSTS / SUMMARY OFF
+-- keep the diff stable.
+CREATE TABLE public.ob_expl (id int PRIMARY KEY, v text);
+INSERT INTO public.ob_expl SELECT g, 'm' || g FROM generate_series(1, 6) g;
+SELECT create_branch('ob_expl_b1');
+SELECT use_branch('ob_expl_b1');
+
+-- H.1 UPDATE: 0 rows without RETURNING, N rows with it.
+EXPLAIN (ANALYZE, TIMING OFF, SUMMARY OFF, COSTS OFF)
+  UPDATE public.ob_expl SET v = 'u' WHERE id <= 3;
+EXPLAIN (ANALYZE, TIMING OFF, SUMMARY OFF, COSTS OFF)
+  UPDATE public.ob_expl SET v = 'u2' WHERE id <= 3 RETURNING id;
+
+-- H.2 DELETE.
+EXPLAIN (ANALYZE, TIMING OFF, SUMMARY OFF, COSTS OFF)
+  DELETE FROM public.ob_expl WHERE id = 2;
+EXPLAIN (ANALYZE, TIMING OFF, SUMMARY OFF, COSTS OFF)
+  DELETE FROM public.ob_expl WHERE id = 4 RETURNING id;
+
+-- H.3 INSERT (pure-delta rows).
+EXPLAIN (ANALYZE, TIMING OFF, SUMMARY OFF, COSTS OFF)
+  INSERT INTO public.ob_expl VALUES (100, 'i1'), (101, 'i2');
+EXPLAIN (ANALYZE, TIMING OFF, SUMMARY OFF, COSTS OFF)
+  INSERT INTO public.ob_expl VALUES (102, 'i3') RETURNING id;
+
+SELECT use_branch(NULL);
+SELECT discard_branch('ob_expl_b1');
+DROP TABLE public.ob_expl;
+
+-- ========== Part I: DELETE→re-INSERT same PK (rebirth) applies as UPDATE ==
+-- The delta is keyed by (branch_id, relid, key), so re-INSERTing a PK the
+-- branch just deleted overwrites the tombstone.  That collapse must become an
+-- UPDATE carrying the deleted row's version token (op='U'); collapsing to a
+-- plain INSERT (op='I') loses the "this PK exists in MAIN" fact and makes
+-- apply report a spurious "MAIN row already present" conflict even though the
+-- branch itself deleted the row.  (See doc/internals.md §1.6.)
+CREATE TABLE public.ob_rebirth (id int PRIMARY KEY, v text);
+INSERT INTO public.ob_rebirth VALUES (1, 'm1'), (2, 'm2');
+SELECT create_branch('ob_rebirth_b1');
+SELECT use_branch('ob_rebirth_b1');
+
+-- I.1 Delete id=1 (an existing MAIN row) then re-insert the same PK.
+DELETE FROM public.ob_rebirth WHERE id = 1;
+INSERT INTO public.ob_rebirth VALUES (1, 'reborn');
+
+-- I.1a The overlay read shows the resurrected row.
+SELECT CASE WHEN (SELECT v FROM public.ob_rebirth WHERE id = 1) = 'reborn'
+            THEN 'PASS:REBIRTH_OVERLAY'
+            ELSE 'FAIL:REBIRTH_OVERLAY' END AS rebirth_overlay;
+-- I.1b The delta collapse kept the UPDATE shape (not a plain INSERT).
+SELECT CASE WHEN (SELECT op FROM overlay_branch.pg_branch_delta
+                   WHERE relid = 'public.ob_rebirth'::regclass
+                     AND key = '["1"]') = 'U'
+            THEN 'PASS:REBIRTH_DELTA_OP_U'
+            ELSE 'FAIL:REBIRTH_DELTA_OP_U' END AS rebirth_delta_op;
+
+SELECT use_branch(NULL);
+SELECT apply_branch('ob_rebirth_b1');
+-- I.1c Apply succeeds and MAIN reflects the resurrected image.
+SELECT CASE WHEN (SELECT v FROM public.ob_rebirth WHERE id = 1) = 'reborn'
+            THEN 'PASS:REBIRTH_MAIN_UPDATED'
+            ELSE 'FAIL:REBIRTH_MAIN_UPDATED' END AS rebirth_main;
+
+-- I.2 A concurrent MAIN change to the deleted row still conflicts: the
+--     version token the collapse preserved is exactly what detects it.
+SELECT create_branch('ob_rebirth_b2');
+SELECT use_branch('ob_rebirth_b2');
+DELETE FROM public.ob_rebirth WHERE id = 2;
+INSERT INTO public.ob_rebirth VALUES (2, 'reborn2');
+SELECT use_branch(NULL);
+UPDATE public.ob_rebirth SET v = 'raced' WHERE id = 2;
+DO $$
+BEGIN
+  PERFORM overlay_branch.apply_branch('ob_rebirth_b2');
+  RAISE NOTICE 'FAIL:REBIRTH_CONFLICT_EXPECTED';
+EXCEPTION WHEN OTHERS THEN
+  RAISE NOTICE 'PASS:REBIRTH_CONFLICT_DETECTED';
+END $$;
+-- I.2a MAIN keeps the concurrent value (the failed apply rolled back whole).
+SELECT CASE WHEN (SELECT v FROM public.ob_rebirth WHERE id = 2) = 'raced'
+            THEN 'PASS:REBIRTH_CONFLICT_MAIN_INTACT'
+            ELSE 'FAIL:REBIRTH_CONFLICT_MAIN_INTACT' END AS rebirth_conflict_main;
+SELECT discard_branch('ob_rebirth_b2');
+
+-- I.3 Pure-delta rebirth (the PK never existed in MAIN) stays a plain INSERT
+--     and materialises through the INSERT pass.
+SELECT create_branch('ob_rebirth_b3');
+SELECT use_branch('ob_rebirth_b3');
+INSERT INTO public.ob_rebirth VALUES (3, 'a');
+DELETE FROM public.ob_rebirth WHERE id = 3;
+INSERT INTO public.ob_rebirth VALUES (3, 'b');
+SELECT CASE WHEN (SELECT op FROM overlay_branch.pg_branch_delta
+                   WHERE relid = 'public.ob_rebirth'::regclass
+                     AND key = '["3"]') = 'I'
+            THEN 'PASS:REBIRTH_PURE_DELTA_OP_I'
+            ELSE 'FAIL:REBIRTH_PURE_DELTA_OP_I' END AS rebirth_pure_op;
+SELECT use_branch(NULL);
+SELECT apply_branch('ob_rebirth_b3');
+SELECT CASE WHEN (SELECT v FROM public.ob_rebirth WHERE id = 3) = 'b'
+            THEN 'PASS:REBIRTH_PURE_MAIN_INSERTED'
+            ELSE 'FAIL:REBIRTH_PURE_MAIN_INSERTED' END AS rebirth_pure_main;
+
+DROP TABLE public.ob_rebirth;
+
+-- ========== Final cleanup ==========
+DROP TABLE IF EXISTS public.t;
+DROP TABLE IF EXISTS public.bs_basic;
+DROP EXTENSION overlay_branch CASCADE;

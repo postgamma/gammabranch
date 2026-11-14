@@ -24,8 +24,10 @@ override CPPFLAGS += -I$(srcdir)/include
 # Temp instance shared-libs conf lives at root level (shared by both harnesses).
 REGRESS = \
   overlay_branch_basic \
+  overlay_branch_basic_scan \
   overlay_branch_user \
   overlay_branch_scan_pk \
+  overlay_branch_scan_read \
   overlay_branch_scan_type \
   overlay_branch_identity \
   overlay_branch_puredelta_mix \
@@ -34,8 +36,15 @@ REGRESS = \
   overlay_branch_puredelta \
   overlay_branch_mvcc_usage \
   overlay_branch_mvcc_bounds \
+  overlay_branch_mvcc_rescan \
   overlay_branch_mvcc_review \
+  overlay_branch_mvcc_apply \
   overlay_branch_rentry \
+  overlay_branch_scope \
+  overlay_branch_registry \
+  overlay_branch_typecanon \
+  overlay_branch_pktypes \
+  overlay_branch_index_rls \
   overlay_branch_view_unify \
   overlay_branch_planner_cost \
   overlay_branch_keyless \

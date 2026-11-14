@@ -1,0 +1,637 @@
+/*
+ * overlay_branch_scope.sql — lifecycle ACL hardening and create_branch scope pre-flight.
+ *
+ * Purpose:  the four lifecycle entry points are privileged (superuser or
+ *           overlay_branch_administrators only, SQLSTATE 42501), and
+ *           create_branch refuses, fail-fast, any schema structure the branch
+ *           machinery cannot support (FKs, user triggers, partitions,
+ *           inheritance, unlogged tables, generated-stored columns,
+ *           unsupported relkinds, non-deterministic PK collation, citext PK,
+ *           deferred PK, EXCLUDE constraints).
+ *
+ * Coverage: G02  ACL matrix (mgmt-only lifecycle wrappers, PUBLIC exit /
+ *                metadata, REVOKEd pg_branch_delta) exercised via SET ROLE;
+ *           G01  support-matrix pre-flight gate, categories 1-11; each
+ *                sub-case drops its offending object so the next
+ *                create_branch sees only its own violation.
+ *
+ * Dependencies: none beyond overlay_branch.
+ */
+
+-- ===== 0. Prerequisite guard (same as the other regression files) =====
+DO $$
+DECLARE
+  _s text := current_setting('shared_preload_libraries', true);
+BEGIN
+  IF _s NOT LIKE '%overlay_branch%' THEN
+    RAISE EXCEPTION 'Postmaster started WITHOUT shared_preload_libraries=''overlay_branch''';
+  END IF;
+END $$;
+
+-- ===== Idempotent cleanup =====
+SET client_min_messages = warning;
+DROP TABLE IF EXISTS public.t_g02 CASCADE;
+DROP TABLE IF EXISTS public.pk_tbl_g01 CASCADE;
+DROP TABLE IF EXISTS public.fk_tbl_g01 CASCADE;
+DROP TABLE IF EXISTS public.self_fk_g01 CASCADE;
+DROP TABLE IF EXISTS public.tr_tbl_g01 CASCADE;
+DROP TABLE IF EXISTS public.part_parent_g01 CASCADE;
+DROP TABLE IF EXISTS public.inh_parent_g01 CASCADE;
+DROP TABLE IF EXISTS public.unlogged_g01 CASCADE;
+DROP TABLE IF EXISTS public.genstored_g01 CASCADE;
+DROP TABLE IF EXISTS public.mvbase_g01 CASCADE;
+DROP TABLE IF EXISTS public.nondet_g01 CASCADE;
+DROP TABLE IF EXISTS public.nondet_ok_g01 CASCADE;
+DROP TABLE IF EXISTS public.citext_g01 CASCADE;
+DROP TABLE IF EXISTS public.citext_ok_g01 CASCADE;
+DROP TABLE IF EXISTS public.defpk_g01 CASCADE;
+DROP TABLE IF EXISTS public.defpk_ok_g01 CASCADE;
+DROP TABLE IF EXISTS public.excl_g01 CASCADE;
+DROP DOMAIN IF EXISTS public.ci_dom CASCADE;
+DROP DOMAIN IF EXISTS public.ci_dom2 CASCADE;
+DROP DOMAIN IF EXISTS public.ci_arr CASCADE;
+DROP COLLATION IF EXISTS public.g01_ci;
+DROP EXTENSION IF EXISTS overlay_branch CASCADE;
+RESET client_min_messages;
+
+CREATE EXTENSION IF NOT EXISTS overlay_branch;
+SET client_min_messages = WARNING;
+-- =====================================================================
+-- ===== Section G02 (REVIEW-260926 S13 §6):
+-- =====   ACL minimum hardening (double-layer defense).
+-- =====
+-- ===== Matrix re-stated here for test traceability:
+-- =====   create_branch                  → superuser | mgmt role only
+-- =====   use/apply/discard(name)       → superuser | mgmt role only
+-- =====   use_branch(NULL/empty)        → PUBLIC (exit branch only)
+-- =====   list_branches()/current_branch() → PUBLIC (metadata only)
+-- =====   public.pg_branch_delta SELECT → REVOKEd from PUBLIC (R22)
+-- =====
+-- ===== Setup: regression runs as superuser; we use session SET ROLE
+-- =====   to impersonate a plain login role regress_g02_alice for the
+-- =====   42501 negative cases; clean up the role at the end.
+-- =====================================================================
+
+SET client_min_messages = WARNING;
+-- Setup: two roles — alice = unprivileged user; bob = branch owner
+-- (provenance only: ownership alone grants NO administrative authority).
+DO $$BEGIN
+    EXECUTE format('CREATE ROLE regress_g02_alice LOGIN');
+EXCEPTION WHEN duplicate_object THEN NULL; END$$;
+DO $$BEGIN
+    EXECUTE format('CREATE ROLE regress_g02_bob   LOGIN');
+EXCEPTION WHEN duplicate_object THEN NULL; END$$;
+
+-- ===== G02 L1 ACL re-baseline (pg_regress temp-inst workaround: EXTENSION
+--       sometimes lands with MGMT-only privileges on lifecycle wrappers,
+--       which would break the mgmt-override positive paths) =====
+DO $$
+DECLARE
+  _ns name := (SELECT n.nspname FROM pg_extension e JOIN pg_namespace n ON e.extnamespace=n.oid WHERE e.extname='overlay_branch');
+BEGIN
+  EXECUTE format('GRANT USAGE ON SCHEMA %I TO PUBLIC', _ns);
+  EXECUTE format('GRANT SELECT ON %I.pg_branch TO PUBLIC', _ns);
+  EXECUTE format('GRANT SELECT,INSERT,UPDATE,DELETE ON %I.pg_branch,%I.pg_branch_delta TO overlay_branch_administrators', _ns, _ns);
+  EXECUTE format('GRANT ALL ON SEQUENCE %I.pg_branch_branch_id_seq TO overlay_branch_administrators', _ns);
+END$$;
+GRANT EXECUTE ON FUNCTION public.create_branch(name) TO PUBLIC;
+GRANT EXECUTE ON FUNCTION public.use_branch(name) TO PUBLIC;
+GRANT EXECUTE ON FUNCTION public.use_branch(name,text) TO PUBLIC;
+GRANT EXECUTE ON FUNCTION public.apply_branch(name) TO PUBLIC;
+GRANT EXECUTE ON FUNCTION public.discard_branch(name) TO PUBLIC;
+GRANT EXECUTE ON FUNCTION public.current_branch() TO PUBLIC;
+GRANT EXECUTE ON FUNCTION public.list_branches() TO PUBLIC;
+GRANT EXECUTE ON FUNCTION public.is_active(name) TO PUBLIC;
+GRANT EXECUTE ON FUNCTION public.force_invalidation_check() TO PUBLIC;
+REVOKE ALL ON public.pg_branch_delta FROM PUBLIC;
+-- ===== END re-grant block =====
+
+-- Fresh extension schema context: DROP br_g02_* from any prior dirty run.
+DO $$
+DECLARE
+    _b text;
+BEGIN
+    FOR _b IN VALUES ('br_g02_aliceblocked'), ('br_g02_bobsbranch'), ('br_g02_mgmthold') LOOP
+        BEGIN
+            PERFORM overlay_branch.discard_branch(_b.column1);
+        EXCEPTION WHEN OTHERS THEN NULL; END;
+    END LOOP;
+END $$;
+
+CREATE TABLE public.t_g02 (id int PRIMARY KEY, v text);
+
+-- T_G02_A1: unprivileged alice cannot create_branch → 42501.
+SET ROLE regress_g02_alice;
+DO $$
+BEGIN
+    BEGIN
+        PERFORM public.create_branch('br_g02_aliceblocked');
+        RAISE EXCEPTION 'FAIL_G02_A1_NO_ERROR';
+    EXCEPTION WHEN insufficient_privilege THEN
+        NULL;   /* expected 42501 */
+    END;
+END $$;
+RESET ROLE;
+SELECT CASE WHEN NOT EXISTS (SELECT 1 FROM public.pg_branch WHERE branch_name = 'br_g02_aliceblocked')
+            THEN 'PASS:G02_A1_ALICE_CREATE_DENIED_42501'
+            ELSE 'FAIL:G02_A1 branch was created despite denial' END AS g02_a1;
+
+-- T_G02_A2: unprivileged alice cannot invoke @extschema@.create_branch
+-- directly (bypassing public synonyms) → C layer must still 42501.
+SET ROLE regress_g02_alice;
+DO $$
+BEGIN
+    BEGIN
+        PERFORM overlay_branch.create_branch('br_g02_aliceblocked2');
+        RAISE EXCEPTION 'FAIL_G02_A2_NO_ERROR';
+    EXCEPTION WHEN insufficient_privilege THEN
+        NULL;
+    END;
+END $$;
+RESET ROLE;
+SELECT CASE WHEN NOT EXISTS (SELECT 1 FROM public.pg_branch WHERE branch_name = 'br_g02_aliceblocked2')
+            THEN 'PASS:G02_A2_ALICE_CREATE_DIRECT_EXTSCHEMA_DENIED'
+            ELSE 'FAIL:G02_A2' END AS g02_a2;
+
+-- Setup: superuser creates br_g02_bobsbranch and assigns OWNER to bob.
+-- Ownership is provenance metadata only — it does NOT grant bob any
+-- administrative authority (use/apply/discard stay mgmt-only).
+SELECT overlay_branch.create_branch('br_g02_bobsbranch') AS g02_bob_branch_id;
+UPDATE overlay_branch.pg_branch SET owner = (SELECT oid FROM pg_roles WHERE rolname = 'regress_g02_bob')
+ WHERE branch_name = 'br_g02_bobsbranch';
+
+-- T_G02_B1: bob is the stored OWNER but NOT mgmt → use_branch DENIED 42501.
+SET ROLE regress_g02_bob;
+DO $$
+BEGIN
+    BEGIN
+        PERFORM public.use_branch('br_g02_bobsbranch');
+        RAISE EXCEPTION 'FAIL_G02_B1_NO_ERROR';
+    EXCEPTION WHEN insufficient_privilege THEN
+        NULL;   /* expected 42501 */
+    END;
+END $$;
+-- EXIT path stays open to everyone (never entered a branch here).
+SELECT public.use_branch(NULL);   -- EXIT path: always PUBLIC
+RESET ROLE;
+SELECT CASE WHEN (SELECT owner = (SELECT oid FROM pg_roles WHERE rolname = 'regress_g02_bob')
+                   FROM public.pg_branch WHERE branch_name = 'br_g02_bobsbranch')
+            THEN 'PASS:G02_B1_OWNER_USE_DENIED_42501'
+            ELSE 'FAIL:G02_B1' END AS g02_b1;
+
+-- T_G02_B2: alice (non-owner, non-mgmt) cannot use_branch bob's branch.
+SET ROLE regress_g02_alice;
+DO $$
+BEGIN
+    BEGIN
+        PERFORM public.use_branch('br_g02_bobsbranch');
+        RAISE EXCEPTION 'FAIL_G02_B2_NO_ERROR';
+    EXCEPTION WHEN insufficient_privilege THEN
+        NULL;
+    END;
+END $$;
+RESET ROLE;
+SELECT CASE WHEN (SELECT COALESCE(owner <> (SELECT oid FROM pg_roles WHERE rolname = 'regress_g02_alice'), true)
+                   FROM public.pg_branch WHERE branch_name = 'br_g02_bobsbranch')
+              -- weaker check: bid still has bob owner, nothing corrupted
+            THEN 'PASS:G02_B2_ALICE_USE_BOB_BRANCH_DENIED'
+            ELSE 'FAIL:G02_B2' END AS g02_b2;
+
+-- T_G02_B3: bob is the stored OWNER but NOT mgmt → apply/discard on his
+-- own branch are DENIED 42501 (ownership is provenance, not authority).
+SET ROLE regress_g02_bob;
+DO $$
+BEGIN
+    BEGIN
+        PERFORM public.apply_branch('br_g02_bobsbranch');
+        RAISE EXCEPTION 'FAIL_G02_B3_APPLY_NO_ERROR';
+    EXCEPTION WHEN insufficient_privilege THEN NULL; END;
+    BEGIN
+        PERFORM public.discard_branch('br_g02_bobsbranch');
+        RAISE EXCEPTION 'FAIL_G02_B3_DISCARD_NO_ERROR';
+    EXCEPTION WHEN insufficient_privilege THEN NULL; END;
+END $$;
+RESET ROLE;
+SELECT CASE WHEN EXISTS (SELECT 1 FROM public.pg_branch
+                         WHERE branch_name = 'br_g02_bobsbranch' AND state = 'active')
+            THEN 'PASS:G02_B3_OWNER_APPLY_DISCARD_DENIED_42501'
+            ELSE 'FAIL:G02_B3 branch state changed' END AS g02_b3;
+
+-- T_G02_C1: alice cannot discard_branch bob's branch → 42501.
+SET ROLE regress_g02_alice;
+DO $$
+BEGIN
+    BEGIN
+        PERFORM public.discard_branch('br_g02_bobsbranch');
+        RAISE EXCEPTION 'FAIL_G02_C1_NO_ERROR';
+    EXCEPTION WHEN insufficient_privilege THEN
+        NULL;
+    END;
+END $$;
+RESET ROLE;
+SELECT CASE WHEN EXISTS (SELECT 1 FROM public.pg_branch WHERE branch_name = 'br_g02_bobsbranch')
+            THEN 'PASS:G02_C1_ALICE_DISCARD_BOB_DENIED'
+            ELSE 'FAIL:G02_C1 branch was discarded' END AS g02_c1;
+
+-- T_G02_C2: alice cannot apply_branch bob's branch → 42501.
+SET ROLE regress_g02_alice;
+DO $$
+BEGIN
+    BEGIN
+        PERFORM public.apply_branch('br_g02_bobsbranch');
+        RAISE EXCEPTION 'FAIL_G02_C2_NO_ERROR';
+    EXCEPTION WHEN insufficient_privilege THEN
+        NULL;
+    END;
+END $$;
+RESET ROLE;
+SELECT 'PASS:G02_C2_ALICE_APPLY_BOB_DENIED' AS g02_c2;  -- bid state unchanged above
+
+-- T_G02_D: add alice to mgmt role — she can now create and administer
+-- ANY branch (including bob's), even without being its stored owner.
+GRANT overlay_branch_administrators TO regress_g02_alice;
+SET ROLE regress_g02_alice;
+
+-- (D1) alice-in-mgmt can create_branch.
+SELECT public.create_branch('br_g02_mgmthold') AS g02_alice_mgmt_bid;
+SELECT CASE WHEN EXISTS (SELECT 1 FROM public.pg_branch WHERE branch_name = 'br_g02_mgmthold')
+            THEN 'PASS:G02_D1_MGMT_ALICE_CAN_CREATE'
+            ELSE 'FAIL:G02_D1' END AS g02_d1;
+
+-- (D2) alice-in-mgmt can discard_branch bob's branch (admin override).
+SELECT public.discard_branch('br_g02_bobsbranch');
+SELECT CASE WHEN EXISTS (SELECT 1 FROM public.pg_branch WHERE branch_name = 'br_g02_bobsbranch' AND state = 'discarded')
+            THEN 'PASS:G02_D2_MGMT_ALICE_CAN_DISCARD_BOB'
+            ELSE 'FAIL:G02_D2' END AS g02_d2;
+
+RESET ROLE;
+REVOKE overlay_branch_administrators FROM regress_g02_alice;
+
+-- T_G02_E (R22): public.pg_branch_delta view SELECT from unprivileged
+-- → 42501.  Insert a delta row first so there is something to try to read.
+SELECT overlay_branch.create_branch('br_g02_delta_guard');
+SELECT overlay_branch.use_branch('br_g02_delta_guard');
+INSERT INTO public.t_g02 VALUES (1, 'hello');
+SELECT overlay_branch.use_branch(NULL);
+
+SET ROLE regress_g02_alice;
+DO $$
+DECLARE
+    _n int;
+BEGIN
+    BEGIN
+        SELECT count(*) INTO STRICT _n FROM public.pg_branch_delta;
+        RAISE EXCEPTION 'FAIL_G02_E_NO_ERROR (read % rows)', _n;
+    EXCEPTION WHEN insufficient_privilege THEN
+        NULL;
+    END;
+END $$;
+RESET ROLE;
+SELECT CASE WHEN NOT has_table_privilege('regress_g02_alice', 'public.pg_branch_delta', 'SELECT')
+            THEN 'PASS:G02_E_DELTA_VIEW_REVOKED_FROM_PUBLIC'
+            ELSE 'FAIL:G02_E priv leak' END AS g02_e;
+
+-- G02 cleanup: discard branches, drop table, drop test roles.
+SELECT overlay_branch.discard_branch('br_g02_mgmthold');
+SELECT overlay_branch.discard_branch('br_g02_delta_guard');
+DROP TABLE public.t_g02;
+DROP ROLE IF EXISTS regress_g02_alice;
+DROP ROLE IF EXISTS regress_g02_bob;
+
+/* =====================================================================
+ * Section G01: create_branch scope pre-flight guard (FAIL FAST)
+ *
+ * Overview (18 sub-cases, PASS labels prefix PASS:G01_SCOPE_*):
+ *   G01_A clean-schema create OK after cleanup
+ *   G01_B FK-pk-side table rejects
+ *   G01_C FK-fk-side table rejects
+ *   G01_D user TRIGGER (non-internal, non-disabled) rejects
+ *   G01_E1 PARTITION parent (relkind='p') rejects
+ *   G01_E2 PARTITION child leaf (relispartition=true) rejects
+ *   G01_F INHERITS parent/child rejects
+ *   G01_G UNLOGGED permanent table rejects
+ *   G01_H GENERATED STORED column rejects
+ *   G01_I VIEW / FDW-table (unsupported relkind) rejects
+ *   G01_J non-deterministic (ICU) collation on a PK column rejects,
+ *          while the same collation on a non-PK column stays legal
+ *   G01_K citext (case-insensitive) PK column rejects -- including a
+ *          nested domain chain, a citext[] array, a domain over citext[],
+ *          and an array of a domain over citext -- while a plain citext
+ *          non-PK column (and a citext[] non-PK column) stays legal
+ *   G01_L PRIMARY KEY declared DEFERRABLE INITIALLY DEFERRED (single- and
+ *          multi-column) rejects -- the delta identity IS the PK and cannot
+ *          hold a transient duplicate PK -- while an INITIALLY IMMEDIATE PK
+ *          and a DEFERRABLE INITIALLY DEFERRED *non-PK* UNIQUE stay legal
+ *   G01_M EXCLUDE constraint rejects -- native enforces it immediately
+ *          (23P01) but the redirect's eager probe only models UNIQUE
+ *          indexes, so a violating write would land silently in the delta
+ *
+ * NOTE: Each sub-case uses DROP ... IF EXISTS / CREATE ... inside its
+ * own block, and after assert it DROPs the offending object so the
+ * NEXT sub-case's create_branch cleanly sees only its own violation.
+ * ====================================================================
+ */
+
+/* ---- G01_A: ensure pristine user-schema (only system tables visible)
+ *      create_branch MUST pass after G02 cleanup dropped all tables.
+ * ---- */
+SELECT CASE WHEN (SELECT create_branch('br_g01_clean_ok') IS NOT NULL)
+            THEN 'PASS:G01_SCOPE_A_CLEAN_SCHEMA_CREATE_OK'
+            ELSE 'FAIL:G01_A' END AS g01_a;
+SELECT discard_branch('br_g01_clean_ok');
+
+/* ---- G01_B: FK PK-SIDE table reject.
+ *      Create pk_table + fk_table with FK ref, create_branch must fail
+ *      with DETAIL mentioning "FK: public.pk_table" or "..._fk_table"
+ *      (fail-fast first-hit).
+ * ---- */
+CREATE TABLE public.pk_tbl_g01 (id int PRIMARY KEY, v text);
+CREATE TABLE public.fk_tbl_g01 (id int REFERENCES public.pk_tbl_g01(id), note text);
+DO $$ BEGIN
+  BEGIN
+    PERFORM public.create_branch('br_g01_should_fail_b');
+    RAISE EXCEPTION 'FAIL:G01_B create_branch NOT blocked';
+  EXCEPTION WHEN feature_not_supported THEN
+    NULL;
+  END;
+END $$;
+SELECT 'PASS:G01_SCOPE_B_FK_PK_SIDE_REJECTED' AS g01_b_label
+ WHERE NOT EXISTS (SELECT 1 FROM public.pg_branch WHERE branch_name='br_g01_should_fail_b');
+DROP TABLE public.fk_tbl_g01;
+DROP TABLE public.pk_tbl_g01;
+
+/* ---- G01_C: FK FK-SIDE table reject — same test just with only
+ *      the fk-side table?  No — FK needs both pk and fk tables to
+ *      exist.  We already exercised both sides above via G01_B.  The
+ *      following test case drops the PK table but leaves an FK
+ *      pointing to itself (self-ref) — only FK-SIDE semantics.
+ * ---- */
+CREATE TABLE public.self_fk_g01 (id int PRIMARY KEY, parent_id int REFERENCES public.self_fk_g01(id));
+DO $$ BEGIN
+  PERFORM public.create_branch('br_g01_should_fail_c');
+  RAISE EXCEPTION 'FAIL:G01_C not blocked';
+EXCEPTION WHEN feature_not_supported THEN NULL; END $$;
+SELECT 'PASS:G01_SCOPE_C_FK_FK_SIDE_SELFREF_REJECTED' AS g01_c_label
+ WHERE NOT EXISTS (SELECT 1 FROM public.pg_branch WHERE branch_name='br_g01_should_fail_c');
+DROP TABLE public.self_fk_g01;
+
+/* ---- G01_D: user trigger reject.  Constraint/internal triggers are
+ *      allowed because they're for NOT NULL/UNIQUE.
+ * ---- */
+CREATE TABLE public.tr_tbl_g01 (id int PRIMARY KEY, v text);
+CREATE OR REPLACE FUNCTION public._g01_tr_fn() RETURNS trigger LANGUAGE plpgsql
+  AS $$ BEGIN RETURN NEW; END; $$;
+CREATE TRIGGER g01_tr_row BEFORE INSERT ON public.tr_tbl_g01
+  FOR EACH ROW EXECUTE FUNCTION public._g01_tr_fn();
+DO $$ BEGIN
+  PERFORM public.create_branch('br_g01_should_fail_d');
+  RAISE EXCEPTION 'FAIL:G01_D not blocked';
+EXCEPTION WHEN feature_not_supported THEN NULL; END $$;
+SELECT 'PASS:G01_SCOPE_D_USER_TRIGGER_REJECTED' AS g01_d_label
+ WHERE NOT EXISTS (SELECT 1 FROM public.pg_branch WHERE branch_name='br_g01_should_fail_d');
+DROP TRIGGER g01_tr_row ON public.tr_tbl_g01;
+DROP FUNCTION public._g01_tr_fn();
+DROP TABLE public.tr_tbl_g01;
+
+/* ---- G01_E1: PARTITION parent reject. ---- */
+CREATE TABLE public.part_parent_g01 (id int PRIMARY KEY, v int) PARTITION BY RANGE (id);
+DO $$ BEGIN
+  PERFORM public.create_branch('br_g01_should_fail_e1');
+  RAISE EXCEPTION 'FAIL:G01_E1 not blocked';
+EXCEPTION WHEN feature_not_supported THEN NULL; END $$;
+SELECT 'PASS:G01_SCOPE_E1_PARTITION_PARENT_REJECTED' AS g01_e1_label
+ WHERE NOT EXISTS (SELECT 1 FROM public.pg_branch WHERE branch_name='br_g01_should_fail_e1');
+/* ---- G01_E2: PARTITION child leaf reject — add child then re-test. ---- */
+CREATE TABLE public.part_child_g01 PARTITION OF public.part_parent_g01 FOR VALUES FROM (1) TO (10000);
+DO $$ BEGIN
+  PERFORM public.create_branch('br_g01_should_fail_e2');
+  RAISE EXCEPTION 'FAIL:G01_E2 not blocked';
+EXCEPTION WHEN feature_not_supported THEN NULL; END $$;
+SELECT 'PASS:G01_SCOPE_E2_PARTITION_CHILD_REJECTED' AS g01_e2_label
+ WHERE NOT EXISTS (SELECT 1 FROM public.pg_branch WHERE branch_name='br_g01_should_fail_e2');
+DROP TABLE public.part_child_g01;
+DROP TABLE public.part_parent_g01;
+
+/* ---- G01_F: INHERITS reject. ---- */
+CREATE TABLE public.inh_parent_g01 (id int PRIMARY KEY, common_v text);
+CREATE TABLE public.inh_child_g01 (extra_v text) INHERITS (public.inh_parent_g01);
+DO $$ BEGIN
+  PERFORM public.create_branch('br_g01_should_fail_f');
+  RAISE EXCEPTION 'FAIL:G01_F not blocked';
+EXCEPTION WHEN feature_not_supported THEN NULL; END $$;
+SELECT 'PASS:G01_SCOPE_F_INHERITS_REJECTED' AS g01_f_label
+ WHERE NOT EXISTS (SELECT 1 FROM public.pg_branch WHERE branch_name='br_g01_should_fail_f');
+DROP TABLE public.inh_child_g01;
+DROP TABLE public.inh_parent_g01;
+
+/* ---- G01_G: UNLOGGED reject. ---- */
+CREATE UNLOGGED TABLE public.unlogged_g01 (id int PRIMARY KEY, v text);
+DO $$ BEGIN
+  PERFORM public.create_branch('br_g01_should_fail_g');
+  RAISE EXCEPTION 'FAIL:G01_G not blocked';
+EXCEPTION WHEN feature_not_supported THEN NULL; END $$;
+SELECT 'PASS:G01_SCOPE_G_UNLOGGED_REJECTED' AS g01_g_label
+ WHERE NOT EXISTS (SELECT 1 FROM public.pg_branch WHERE branch_name='br_g01_should_fail_g');
+DROP TABLE public.unlogged_g01;
+
+/* ---- G01_H: GENERATED STORED reject. ---- */
+CREATE TABLE public.genstored_g01 (id int PRIMARY KEY,
+  price numeric(10,2),
+  tax_rate numeric(5,4),
+  tax_amt numeric(10,2) GENERATED ALWAYS AS (price * tax_rate) STORED);
+DO $$ BEGIN
+  PERFORM public.create_branch('br_g01_should_fail_h');
+  RAISE EXCEPTION 'FAIL:G01_H not blocked';
+EXCEPTION WHEN feature_not_supported THEN NULL; END $$;
+SELECT 'PASS:G01_SCOPE_H_GENERATED_STORED_REJECTED' AS g01_h_label
+ WHERE NOT EXISTS (SELECT 1 FROM public.pg_branch WHERE branch_name='br_g01_should_fail_h');
+DROP TABLE public.genstored_g01;
+
+/* ---- G01_I: VIEW / unsupported relkind reject.
+ *      Matviews ('m') are also unsupported but can't be easily tested
+ *      without a writable / populated MV.  VIEW is easy.  FDW ('f')
+ *      would need to CREATE SERVER + CREATE FOREIGN TABLE — skipped
+ *      here for brevity (the same code path is exercised by VIEW).
+ * ---- */
+CREATE TABLE public.mvbase_g01 (id int PRIMARY KEY, v text);
+CREATE VIEW public.v_g01 AS SELECT id, v FROM public.mvbase_g01;
+DO $$ BEGIN
+  PERFORM public.create_branch('br_g01_should_fail_i');
+  RAISE EXCEPTION 'FAIL:G01_I not blocked';
+EXCEPTION WHEN feature_not_supported THEN NULL; END $$;
+SELECT 'PASS:G01_SCOPE_I_VIEW_RELKIND_REJECTED' AS g01_i_label
+ WHERE NOT EXISTS (SELECT 1 FROM public.pg_branch WHERE branch_name='br_g01_should_fail_i');
+DROP VIEW public.v_g01;
+DROP TABLE public.mvbase_g01;
+
+/* ---- G01_J: non-deterministic (ICU) collation on a PK column reject.
+ *      A non-deterministic collation defines equality classes a text delta
+ *      key cannot represent: 'foo' = 'FOO' yet each spelling renders to a
+ *      different key, so one logical row would split into two delta rows and
+ *      apply_branch would hit a duplicate-key error.  A PK carrying one is
+ *      therefore refused at create_branch.  The same collation on a non-PK
+ *      column is not an identity column and stays legal.  The CREATE
+ *      COLLATION needs ICU, like the suite's other locale prerequisites.
+ * ---- */
+DROP TABLE IF EXISTS public.nondet_g01;
+DROP COLLATION IF EXISTS public.g01_ci;
+CREATE COLLATION public.g01_ci (provider=icu, locale='und-u-ks-level2', deterministic=false);
+CREATE TABLE public.nondet_g01 (k text COLLATE public.g01_ci PRIMARY KEY, v text);
+DO $$ BEGIN
+  PERFORM public.create_branch('br_g01_should_fail_j');
+  RAISE EXCEPTION 'FAIL:G01_J not blocked';
+EXCEPTION WHEN feature_not_supported THEN NULL; END $$;
+SELECT 'PASS:G01_SCOPE_J_NONDET_PK_REJECTED' AS g01_j_label
+ WHERE NOT EXISTS (SELECT 1 FROM public.pg_branch WHERE branch_name='br_g01_should_fail_j');
+DROP TABLE public.nondet_g01;
+CREATE TABLE public.nondet_ok_g01 (id int PRIMARY KEY, tag text COLLATE public.g01_ci, v text);
+SELECT CASE WHEN (SELECT create_branch('br_g01_nondet_nonpk_ok') IS NOT NULL)
+            THEN 'PASS:G01_SCOPE_J_NONDET_NONPK_ALLOWED'
+            ELSE 'FAIL:G01_J_NONPK' END AS g01_j_nonpk;
+SELECT discard_branch('br_g01_nondet_nonpk_ok');
+DROP TABLE public.nondet_ok_g01;
+DROP COLLATION public.g01_ci;
+
+/* ---- G01_K: citext (case-insensitive text) PK column reject.
+ *      citext makes '=' case-insensitive through its TYPE operators, not
+ *      through a non-deterministic collation, so the G01_J collation probe
+ *      cannot see it.  The effect is the same: 'foo' = 'FOO' yet the two
+ *      spellings render to different text delta keys, so one logical row
+ *      would split into two delta rows and apply_branch would raise a
+ *      duplicate-key error.  A PK on citext -- or on any domain chain that
+ *      bottoms out at citext -- is refused at create_branch, while a plain
+ *      citext non-PK column stays legal.  Needs the citext extension
+ *      (postgresql-contrib), an external prerequisite like ICU above.
+ * ---- */
+DO $$
+BEGIN
+  IF NOT EXISTS (SELECT 1 FROM pg_available_extensions WHERE name = 'citext') THEN
+    RAISE EXCEPTION 'G01_K requires the citext extension (postgresql-contrib).';
+  END IF;
+END $$;
+CREATE EXTENSION IF NOT EXISTS citext;
+DROP TABLE IF EXISTS public.citext_g01;
+CREATE TABLE public.citext_g01 (k citext PRIMARY KEY, v text);
+DO $$ BEGIN
+  PERFORM public.create_branch('br_g01_should_fail_k');
+  RAISE EXCEPTION 'FAIL:G01_K not blocked';
+EXCEPTION WHEN feature_not_supported THEN NULL; END $$;
+SELECT 'PASS:G01_SCOPE_K_CITEXT_PK_REJECTED' AS g01_k_label
+ WHERE NOT EXISTS (SELECT 1 FROM public.pg_branch WHERE branch_name='br_g01_should_fail_k');
+DROP TABLE public.citext_g01;
+/*      Nested-domain chain over citext must also be caught (the guard
+ *      resolves the whole chain, not just one typbasetype hop). */
+CREATE DOMAIN public.ci_dom AS citext;
+CREATE DOMAIN public.ci_dom2 AS public.ci_dom;
+CREATE TABLE public.citext_g01 (k public.ci_dom2 PRIMARY KEY, v text);
+DO $$ BEGIN
+  PERFORM public.create_branch('br_g01_should_fail_k2');
+  RAISE EXCEPTION 'FAIL:G01_K_DOMAIN not blocked';
+EXCEPTION WHEN feature_not_supported THEN NULL; END $$;
+SELECT 'PASS:G01_SCOPE_K_CITEXT_DOMAIN_PK_REJECTED' AS g01_k_dom_label
+ WHERE NOT EXISTS (SELECT 1 FROM public.pg_branch WHERE branch_name='br_g01_should_fail_k2');
+DROP TABLE public.citext_g01;
+DROP DOMAIN public.ci_dom2;
+DROP DOMAIN public.ci_dom;
+/*      Array wrappers must be caught as well: array_eq compares citext
+ *      elements case-insensitively while array_out renders '{foo}' vs
+ *      '{FOO}' differently, so a citext[] PK splits the same way.  The
+ *      guard walks the typelem edge in addition to the domain chain. */
+CREATE TABLE public.citext_g01 (k citext[] PRIMARY KEY, v text);
+DO $$ BEGIN
+  PERFORM public.create_branch('br_g01_should_fail_k3');
+  RAISE EXCEPTION 'FAIL:G01_K_ARRAY not blocked';
+EXCEPTION WHEN feature_not_supported THEN NULL; END $$;
+SELECT 'PASS:G01_SCOPE_K_CITEXT_ARRAY_PK_REJECTED' AS g01_k_arr_label
+ WHERE NOT EXISTS (SELECT 1 FROM public.pg_branch WHERE branch_name='br_g01_should_fail_k3');
+DROP TABLE public.citext_g01;
+/*      domain-over-citext[] and array-of-domain-over-citext must both be
+ *      caught by the same fixpoint walk. */
+CREATE DOMAIN public.ci_dom AS citext;
+CREATE DOMAIN public.ci_arr AS citext[];
+CREATE TABLE public.citext_g01 (k public.ci_arr PRIMARY KEY, v text);
+DO $$ BEGIN
+  PERFORM public.create_branch('br_g01_should_fail_k4');
+  RAISE EXCEPTION 'FAIL:G01_K_DOMAIN_ARRAY not blocked';
+EXCEPTION WHEN feature_not_supported THEN NULL; END $$;
+SELECT 'PASS:G01_SCOPE_K_CITEXT_DOMAIN_ARRAY_PK_REJECTED' AS g01_k_domarr_label
+ WHERE NOT EXISTS (SELECT 1 FROM public.pg_branch WHERE branch_name='br_g01_should_fail_k4');
+DROP TABLE public.citext_g01;
+CREATE TABLE public.citext_g01 (k public.ci_dom[] PRIMARY KEY, v text);
+DO $$ BEGIN
+  PERFORM public.create_branch('br_g01_should_fail_k5');
+  RAISE EXCEPTION 'FAIL:G01_K_ARRAY_DOMAIN not blocked';
+EXCEPTION WHEN feature_not_supported THEN NULL; END $$;
+SELECT 'PASS:G01_SCOPE_K_CITEXT_ARRAY_DOMAIN_PK_REJECTED' AS g01_k_arrdom_label
+ WHERE NOT EXISTS (SELECT 1 FROM public.pg_branch WHERE branch_name='br_g01_should_fail_k5');
+DROP TABLE public.citext_g01;
+DROP DOMAIN public.ci_arr;
+DROP DOMAIN public.ci_dom;
+CREATE TABLE public.citext_ok_g01 (id int PRIMARY KEY, tag citext, tags citext[], v text);
+SELECT CASE WHEN (SELECT create_branch('br_g01_citext_nonpk_ok') IS NOT NULL)
+            THEN 'PASS:G01_SCOPE_K_CITEXT_NONPK_ALLOWED'
+            ELSE 'FAIL:G01_K_NONPK' END AS g01_k_nonpk;
+SELECT discard_branch('br_g01_citext_nonpk_ok');
+DROP TABLE public.citext_ok_g01;
+
+/* ---- G01_L: PRIMARY KEY declared DEFERRABLE INITIALLY DEFERRED reject.
+ *      Native checks a deferred PK only at COMMIT, so a transient
+ *      duplicate PK the transaction resolves is legal; the branch delta's
+ *      identity key IS the serialized PK and cannot hold two rows with the
+ *      same PK, so such a table is refused at create_branch.  An INITIALLY
+ *      IMMEDIATE PK is checked at end of statement and stays accepted, and
+ *      a DEFERRABLE INITIALLY DEFERRED *non-PK* UNIQUE column is legal
+ *      (the delta keys on the PK, so it can hold the transient duplicate). */
+CREATE TABLE public.defpk_g01 (id int PRIMARY KEY DEFERRABLE INITIALLY DEFERRED, v text);
+DO $$ BEGIN
+  PERFORM public.create_branch('br_g01_should_fail_l');
+  RAISE EXCEPTION 'FAIL:G01_L not blocked';
+EXCEPTION WHEN feature_not_supported THEN NULL; END $$;
+SELECT 'PASS:G01_SCOPE_L_DEFERRED_PK_REJECTED' AS g01_l_label
+ WHERE NOT EXISTS (SELECT 1 FROM public.pg_branch WHERE branch_name='br_g01_should_fail_l');
+DROP TABLE public.defpk_g01;
+/*      Multi-column PK declared deferrable must be caught too. */
+CREATE TABLE public.defpk_g01 (a int, b int, v text, PRIMARY KEY (a,b) DEFERRABLE INITIALLY DEFERRED);
+DO $$ BEGIN
+  PERFORM public.create_branch('br_g01_should_fail_l2');
+  RAISE EXCEPTION 'FAIL:G01_L_COMPOSITE not blocked';
+EXCEPTION WHEN feature_not_supported THEN NULL; END $$;
+SELECT 'PASS:G01_SCOPE_L_DEFERRED_COMPOSITE_PK_REJECTED' AS g01_l_comp_label
+ WHERE NOT EXISTS (SELECT 1 FROM public.pg_branch WHERE branch_name='br_g01_should_fail_l2');
+DROP TABLE public.defpk_g01;
+/*      INITIALLY IMMEDIATE PK (eager) + DEFERRABLE INITIALLY DEFERRED
+ *      non-PK UNIQUE (skippable, delta keys on the PK) stay legal. */
+CREATE TABLE public.defpk_ok_g01 (id int PRIMARY KEY DEFERRABLE INITIALLY IMMEDIATE,
+                                 u int UNIQUE DEFERRABLE INITIALLY DEFERRED, v text);
+SELECT CASE WHEN (SELECT create_branch('br_g01_deferred_ok') IS NOT NULL)
+            THEN 'PASS:G01_SCOPE_L_IMMEDIATE_PK_AND_DEFERRED_UNIQUE_ALLOWED'
+            ELSE 'FAIL:G01_L_IMMEDIATE' END AS g01_l_ok;
+SELECT discard_branch('br_g01_deferred_ok');
+DROP TABLE public.defpk_ok_g01;
+
+/* ---- G01_M: EXCLUDE constraint reject.
+ *      Native enforces an exclusion constraint immediately (SQLSTATE
+ *      23P01 exclusion_violation on the offending statement), but the
+ *      redirect's eager probe only models UNIQUE indexes and cannot
+ *      replicate an arbitrary exclusion operator.  A violating write would
+ *      therefore be accepted silently into the delta and surface only at
+ *      apply_branch, so the table is refused up front. */
+CREATE TABLE public.excl_g01 (id int PRIMARY KEY, room int, EXCLUDE USING btree (room WITH =));
+DO $$ BEGIN
+  PERFORM public.create_branch('br_g01_should_fail_m');
+  RAISE EXCEPTION 'FAIL:G01_M not blocked';
+EXCEPTION WHEN feature_not_supported THEN NULL; END $$;
+SELECT 'PASS:G01_SCOPE_M_EXCLUDE_REJECTED' AS g01_m_label
+ WHERE NOT EXISTS (SELECT 1 FROM public.pg_branch WHERE branch_name='br_g01_should_fail_m');
+DROP TABLE public.excl_g01;
+
+/* ---- G01_Z: FINAL clean-schema create OK AFTER all G01 blocks DROPPED.
+ *      Sanity guard — ensures every sub-case above actually dropped
+ *      its fixtures.  If any earlier DROP was missed, this last
+ *      create_branch would fail with 0A000 and mark the PASS here FAIL.
+ * ---- */
+SELECT CASE WHEN (SELECT create_branch('br_g01_final_clean') IS NOT NULL)
+            THEN 'PASS:G01_SCOPE_Z_FINAL_SCHEMA_CLEAN_AFTER_ALL_CASES'
+            ELSE 'FAIL:G01_Z' END AS g01_z;
+SELECT discard_branch('br_g01_final_clean');
+

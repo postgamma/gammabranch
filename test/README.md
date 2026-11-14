@@ -5,8 +5,8 @@ The extension is verified by three layers. Only **L1 + L3** are gates for
 
 | Layer | Harness | Count | Gate? | What it proves |
 |---|---|---|---|---|
-| L3 | `pg_regress` (`test/regress/`) | 23 suites | yes | Functional correctness of the public API, guards, overlay semantics, planner pushdown, error paths |
-| L1 | `pg_isolation_regress` (`test/isolation/`) | 15 specs | yes | Concurrency correctness — CAS mutex, applying-freeze, snapshot mode, invalidation kickout, cross-session ReScan, pure-delta, keyless |
+| L3 | `pg_regress` (`test/regress/`) | 32 suites | yes | Functional correctness of the public API, guards, overlay semantics, planner pushdown, error paths |
+| L1 | `pg_isolation_regress` (`test/isolation/`) | 16 specs | yes | Concurrency correctness — CAS mutex, applying-freeze, snapshot mode, invalidation kickout, cross-session ReScan, pure-delta, keyless |
 | L2 | `pgbench` (`test/bench/`) | manual | no | High-concurrency stress and reproducible performance baselines |
 
 ## Running
@@ -29,10 +29,12 @@ Each file is standalone-idempotent: it starts with
 
 | File | Focus |
 |---|---|
-| `overlay_branch_basic` | Engineering happy path across the four lifecycle steps; branch-context GUC semantics; guard and idempotency coverage |
+| `overlay_branch_basic` | Engineering happy path across the four lifecycle steps (Parts A-F); branch-context GUC semantics; delta physics; write redirect; guard and idempotency coverage |
+| `overlay_branch_basic_scan` | BranchScan transparent MAIN⊕delta merge, write-redirect RETURNING replay, EXPLAIN root-node instrumentation, DELETE→re-INSERT rebirth (Parts 6/G/H/I) |
 | `overlay_branch_user` | Clean user-facing end-to-end story (mirrors `doc/user_guide.md`) |
 | `overlay_branch_view_unify` | Read/write view unification: self-join with two BranchScan instances, same-CSS rescan |
-| `overlay_branch_scan_pk` | BranchScan P0/P1/P2 core paths: PK fast path, RETURNING, non-PK qual pushdown |
+| `overlay_branch_scan_pk` | BranchScan P0/P1/P2 core paths: PK fast path, RETURNING, non-PK qual pushdown (Sections A/B/C/E) |
+| `overlay_branch_scan_read` | BranchScan read-path: RD-8 shortcut/serialiser, RD-7 de-SPI heap scan, RD-6 streaming iterator, relaxed PK predicate pushdown (Sections F-J) |
 | `overlay_branch_scan_type` | PK type diversity (SMALLINT/BIGINT/NUMERIC/BPCHAR/VARCHAR/TIMESTAMPTZ/TEXT/UUID) and PK edge cases |
 | `overlay_branch_identity` | `GENERATED ... AS IDENTITY` columns across the lifecycle and apply (batch + per-row replay) |
 | `overlay_branch_pushdown` | Non-PK qual pushdown and Pass 2 orphan emission |
@@ -49,9 +51,16 @@ Each file is standalone-idempotent: it starts with
 | `overlay_branch_keyless` | Experimental keyless ctid identity (`overlay_branch.keyless_tables`) |
 | `overlay_branch_deltastats` | Branch delta size observability (`branch_delta_stats`) and the delta row-count warning GUC |
 | `overlay_branch_mvcc_usage` | MVCC basic usage, mode/threshold GUCs, invalidation DQL/DML split |
-| `overlay_branch_mvcc_bounds` | MVCC advanced boundaries: advisory-lock key equivalence, cross-branch isolation, API bounds |
-| `overlay_branch_mvcc_review` | API/versioning contracts and R15/R18 apply conflict detection |
-| `overlay_branch_rentry` | Entry drift-write hard interception and snapshot TTL |
+| `overlay_branch_mvcc_bounds` | MVCC advanced boundaries: advisory-lock key equivalence, cross-branch isolation, API bounds (Sections L-O) |
+| `overlay_branch_mvcc_rescan` | FR6 BranchScan rescan/rewind, T8 acceptance + FR7 GUC ABI, A4 10K-row performance fixture (Sections P/Q/A4) |
+| `overlay_branch_mvcc_review` | API/versioning contracts and R15/R18 apply conflict detection (Sections R-API/R-CTX/R-VERSION) |
+| `overlay_branch_mvcc_apply` | apply_branch replay paths: per-row (AP1) and set-based batch (AP2) conflict handling |
+| `overlay_branch_rentry` | Write-entry hard interception (drift-write, FOR UPDATE, system columns) + R19 snapshot TTL + G06 anti-leak + R21/R23 eager constraint gates |
+| `overlay_branch_scope` | Lifecycle ACL hardening (G02) and create_branch scope pre-flight (G01) |
+| `overlay_branch_registry` | Schema-epoch registry and DDL drift (A7), branch identity metadata (A9), live branch context (CTX) |
+| `overlay_branch_typecanon` | Eager non-PK UNIQUE probe (R24) and PK-identity canonicalization (R25-R27) |
+| `overlay_branch_pktypes` | PK identity across ARRAY / INTERVAL / RANGE-multirange / money / jsonb / json (R28-R33) |
+| `overlay_branch_index_rls` | INCLUDE and not-ready index gates, RLS, UPSERT clause and float-key identity (R34-R38) |
 
 ## L1 — `pg_isolation_regress` (`test/isolation/specs/`)
 
